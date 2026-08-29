@@ -1,0 +1,27 @@
+[package]
+name = "vmm"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+api.workspace = true
+kvm-bindings.workspace = true
+kvm-ioctls.workspace = true
+libc.workspace = true
+logger.workspace = true
+oneshot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+vm-superio.workspace = true
+vmm-sys-util.workspace = true
+
+[dev-dependencies]
+api.workspace = true
+libc.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+vmm-sys-util.workspace = true

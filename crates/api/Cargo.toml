@@ -1,0 +1,8 @@
+[package]
+name = "api"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+oneshot.workspace = true

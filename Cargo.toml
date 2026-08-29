@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = []
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Fuu <g.for.xyz@gmail.com>"]
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+api = { path = "crates/api" }
+clap = { version = "4.6.6", features = ["cargo", "derive"] }
+libc = "0.2.189"
+log = { version = "0.4.34", features = ["serde", "std"] }
+logger = { path = "crates/logger" }
+logger-backend = { path = "crates/logger-backend" }
+kvm-bindings = { version = "0.14.0", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25.0"
+names = { version = "0.14.0", default-features = false }
+oneshot = { version = "0.2.1", features = ["std", "async"] }
+rand = "0.8.8"
+rustix = { version = "1.1.4", features = [
+    "event",
+    "fs",
+    "process",
+    "stdio",
+    "thread",
+    "time",
+] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "net",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+] }
+virtio-queue = "0.18.0"
+vm-memory = { version = "0.18.0", features = [
+    "backend-atomic",
+    "backend-mmap",
+] }
+vm-superio = "0.8.1"
+vmm = { path = "crates/vmm" }
+vmm-sys-util = "0.15.0"
+
+[package]
+name = "dragonball-evolved"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+api.workspace = true
+clap.workspace = true
+libc.workspace = true
+logger.workspace = true
+logger-backend.workspace = true
+names.workspace = true
+oneshot.workspace = true
+rustix.workspace = true
+tokio.workspace = true
+vmm.workspace = true
+vmm-sys-util.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+
+[profile.release]
+strip = "none"
+debug = "full"
+lto = "fat"
+codegen-units = 1

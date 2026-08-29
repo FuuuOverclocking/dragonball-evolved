@@ -1,0 +1,10 @@
+# The `logger` crate decides which callsites are rate limited, so reaching for
+# `log` directly would quietly opt a guest-triggerable path out of that.
+disallowed-macros = [
+    { path = "log::error", reason = "use logger::error or logger::error_unrestricted" },
+    { path = "log::warn", reason = "use logger::warn or logger::warn_unrestricted" },
+    { path = "log::info", reason = "use logger::info or logger::info_unrestricted" },
+    { path = "log::debug", reason = "use logger::debug" },
+    { path = "log::trace", reason = "use logger::trace" },
+    { path = "log::log", reason = "use the level-specific logger macros" },
+]
