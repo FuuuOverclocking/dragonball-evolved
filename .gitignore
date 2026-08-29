@@ -1,0 +1,6 @@
+/target
+/dist
+
+# AI tools
+.claude/
+.qoder/

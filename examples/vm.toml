@@ -1,0 +1,8 @@
+extends = "./base-vm.toml"
+
+[dragonball]
+id = "fuu-vm"
+api_sock = "/tmp/fuu-vm/api.sock"
+kvm_dev = "/dev/my_kvm"
+
+[machine]

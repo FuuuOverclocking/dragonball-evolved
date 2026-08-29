@@ -1,0 +1,21 @@
+[package]
+name = "api"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+oneshot.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+# The wire shape of a request: serde for the channel-free command, plus the
+# adapter that turns one into a runnable request and an erased reply waiter.
+wire = ["dep:serde_json"]
