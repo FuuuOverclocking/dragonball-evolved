@@ -41,7 +41,7 @@ async fn read_request_moves_disk_contents_into_guest_memory() {
     contents.extend_from_slice(&[0xcd; SECTOR_SIZE]);
     let disk = TempDisk::new("read", &contents);
 
-    let (device, handle) = BlockDevice::new("poc-blk", disk.path(), false, None).unwrap();
+    let (device, handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -81,7 +81,7 @@ async fn read_request_moves_disk_contents_into_guest_memory() {
 async fn write_request_reaches_the_disk() {
     let disk = TempDisk::new("write", &vec![0; 2 * SECTOR_SIZE]);
 
-    let (device, handle) = BlockDevice::new("poc-blk", disk.path(), false, None).unwrap();
+    let (device, handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -121,7 +121,7 @@ async fn one_kick_drains_every_queued_request() {
     // assume one notification means one request.
     let disk = TempDisk::new("drain", &vec![0x11; 8 * SECTOR_SIZE]);
 
-    let (device, handle) = BlockDevice::new("poc-blk", disk.path(), false, None).unwrap();
+    let (device, handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -163,7 +163,7 @@ async fn rate_limit_spreads_requests_out_without_a_timerfd() {
     // One request per window, so each extra request has to wait for a refill.
     let window = Duration::from_millis(40);
     let (device, handle) =
-        BlockDevice::new("poc-blk", disk.path(), false, Some((1, window))).unwrap();
+        BlockDevice::new("test-blk", disk.path(), false, Some((1, window))).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -272,7 +272,7 @@ async fn a_device_the_guest_never_activated_still_stops_cleanly() {
     // back in this state. Here the task is simply parked on two awaits, one of
     // which is the stop signal.
     let disk = TempDisk::new("inactive", &vec![0; SECTOR_SIZE]);
-    let (device, _handle) = BlockDevice::new("poc-blk", disk.path(), false, None).unwrap();
+    let (device, _handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
@@ -289,7 +289,7 @@ async fn a_device_the_guest_never_activated_still_stops_cleanly() {
 async fn read_only_disk_refuses_writes() {
     let disk = TempDisk::new("readonly", &vec![0x33; 2 * SECTOR_SIZE]);
 
-    let (device, handle) = BlockDevice::new("poc-blk", disk.path(), true, None).unwrap();
+    let (device, handle) = BlockDevice::new("test-blk", disk.path(), true, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();

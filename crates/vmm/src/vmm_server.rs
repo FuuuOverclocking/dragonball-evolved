@@ -9,24 +9,14 @@ use tokio::sync::mpsc;
 use crate::{InstanceInfo, VmmExitStatus};
 
 /// The vmm thread's end of the request channel.
-///
-/// A tokio channel rather than a std channel plus an eventfd. Clients do live on
-/// other threads, but `UnboundedSender::send` is a synchronous, lock-free push
-/// that wakes the vmm task directly, so the handover needs no descriptor. The
-/// eventfd that used to sit alongside the channel only ever carried the wakeup,
-/// and having both left two sources of truth for one queue: the channel's
-/// contents and the descriptor's counter had to be reasoned about together, even
-/// though only the channel could actually answer "is there work?".
-pub(crate) struct VmmServer {
-    pub(crate) rx: mpsc::UnboundedReceiver<VmmRequest>,
-}
+pub(crate) struct Requests(pub(crate) mpsc::UnboundedReceiver<VmmRequest>);
 
-impl VmmServer {
+impl Requests {
     /// Wait for the next request, or `None` once every client has gone away.
     ///
     /// Cancel-safe, so it can sit directly in a `select!` arm.
     pub(crate) async fn next(&mut self) -> Option<VmmRequest> {
-        self.rx.recv().await
+        self.0.recv().await
     }
 }
 

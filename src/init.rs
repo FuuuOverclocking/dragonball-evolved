@@ -3,7 +3,7 @@ use std::os::fd::RawFd;
 use std::{io, panic};
 
 use anyhow::{Context, Result};
-use logger::{LevelFilter, error_unrestricted, info_unrestricted};
+use logger::{error_unrestricted, info_unrestricted};
 use logger_backend::FlushGuard;
 use rustix::event::{EventfdFlags, eventfd};
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
@@ -12,12 +12,12 @@ use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 use vmm_sys_util::terminal::Terminal;
 
-use crate::cli::CliOps;
+use crate::cli::Cli;
 
 // Size the fd table is pre-expanded to, big enough for most use cases.
 const FDTABLE_SIZE: u64 = 4096;
 
-pub fn init(cli: &impl CliOps) -> Result<(FlushGuard, impl Future<Output = ()> + Send + 'static)> {
+pub fn init(cli: &Cli) -> Result<(FlushGuard, impl Future<Output = ()> + Send + 'static)> {
     // Ensure all created files (e.g. sockets) are only accessible by this user.
     umask(0o077.into());
 
@@ -27,14 +27,7 @@ pub fn init(cli: &impl CliOps) -> Result<(FlushGuard, impl Future<Output = ()> +
     expand_fdtable().context("pre-expand fd table")?;
 
     // Setup logger. This also installs the crash log handlers.
-    let flush_guard = logger_backend::init(logger_backend::Config {
-        id: Some(cli.id().to_owned()),
-        level: Some(LevelFilter::Info),
-        show_tid: Some(true),
-        show_id: Some(true),
-        ..Default::default()
-    })
-    .context("setup logger")?;
+    let flush_guard = logger_backend::init(cli.logger_config().clone()).context("setup logger")?;
 
     // Setup panic hook.
     setup_panic_hook();

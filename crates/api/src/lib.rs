@@ -23,7 +23,6 @@
 //! types a variant carries, not in the plumbing that delivers them.
 
 use std::fmt;
-use std::path::PathBuf;
 
 /// A request the vmm thread will answer.
 pub enum VmmRequest {
@@ -32,8 +31,6 @@ pub enum VmmRequest {
     Shutdown(Reply<()>),
     /// What the vmm is currently doing.
     Status(Reply<VmmStatus>),
-    /// Run the deliberately small KVM proof of concept.
-    StartPoc(PocConfig, Reply<Result<PocReport, PocError>>),
 }
 
 impl VmmRequest {
@@ -42,7 +39,6 @@ impl VmmRequest {
         match self {
             Self::Shutdown(_) => "Shutdown",
             Self::Status(_) => "Status",
-            Self::StartPoc(_, _) => "StartPoc",
         }
     }
 }
@@ -57,43 +53,7 @@ impl fmt::Debug for VmmRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmmStatus {
     pub devices_running: usize,
-    pub vcpu_running: bool,
-    pub memory_bytes: u64,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PocConfig {
-    pub disk_path: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PocReport {
-    pub used_index: u16,
-    pub request_status: u8,
-    pub data: Vec<u8>,
-    pub interrupt_status: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PocError {
-    pub message: String,
-}
-
-impl PocError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for PocError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for PocError {}
 
 /// The channel a request is answered on.
 ///

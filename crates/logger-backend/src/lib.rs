@@ -21,6 +21,7 @@ use std::io::{self, BufWriter};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Mutex, OnceLock};
@@ -59,11 +60,37 @@ pub enum Format {
     Json,
 }
 
+impl FromStr for Format {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            _ => Err(ParseError("`text` or `json`")),
+        }
+    }
+}
+
 /// Where lines go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Stderr,
     File(PathBuf),
+}
+
+/// Spelled as a kind, and for `file` a path behind a comma. Only the first comma
+/// separates the two, so a path may contain one.
+impl FromStr for Target {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.split_once('=') {
+            None if s == "stderr" => Ok(Self::Stderr),
+            Some(("file", path)) if !path.is_empty() => Ok(Self::File(PathBuf::from(path))),
+            _ => Err(ParseError("`stderr` or `file=<path>`")),
+        }
+    }
 }
 
 /// Where crash records go.
@@ -80,8 +107,32 @@ pub enum CrashTarget {
     Own(Target),
 }
 
+impl FromStr for CrashTarget {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "same_as_log" {
+            return Ok(Self::SameAsLog);
+        }
+
+        // An own target is spelled like any other target, so the reason a value
+        // was refused has to name all three spellings rather than just two.
+        s.parse()
+            .map(Self::Own)
+            .map_err(|_| ParseError("`same_as_log`, `stderr` or `file=<path>`"))
+    }
+}
+
+/// A value that does not match how the configuration spells it.
+///
+/// It names what would have been accepted and leaves out the value itself: every
+/// caller parses a string it already has, and prints it in its own words.
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
+#[displaydoc("expected {0}")]
+pub struct ParseError(&'static str);
+
 /// A logger configuration. `None` leaves the current value alone.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Instance id. Only [`init`] honours it; it cannot be changed later.
     pub id: Option<String>,
@@ -96,25 +147,25 @@ pub struct Config {
     pub show_id: Option<bool>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub enum Error {
-    #[error("logger is already initialised")]
+    /// logger is already initialised
     AlreadyInitialised,
 
-    #[error("logger is not initialised")]
+    /// logger is not initialised
     NotInitialised,
 
-    #[error("open log target {path}")]
+    /// open log target {path}
     OpenTarget {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
 
-    #[error("spawn the writer thread")]
+    /// spawn the writer thread
     Spawn(#[source] io::Error),
 
-    #[error("install the crash log")]
+    /// install the crash log
     Crash(#[source] io::Error),
 }
 
@@ -325,5 +376,66 @@ impl Log for Frontend {
 
     fn flush(&self) {
         flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_spellings_the_configuration_uses() {
+        assert_eq!("stderr".parse::<Target>().unwrap(), Target::Stderr);
+        assert_eq!(
+            "file=/tmp/logs.txt".parse::<Target>().unwrap(),
+            Target::File("/tmp/logs.txt".into())
+        );
+        assert_eq!(
+            "same_as_log".parse::<CrashTarget>().unwrap(),
+            CrashTarget::SameAsLog
+        );
+        assert_eq!(
+            "file=/tmp/crash.txt".parse::<CrashTarget>().unwrap(),
+            CrashTarget::Own(Target::File("/tmp/crash.txt".into()))
+        );
+        assert_eq!("text".parse::<Format>().unwrap(), Format::Text);
+        assert_eq!("json".parse::<Format>().unwrap(), Format::Json);
+    }
+
+    #[test]
+    fn leaves_a_comma_in_a_path_alone() {
+        assert_eq!(
+            "file=/tmp/a,b.txt".parse::<Target>().unwrap(),
+            Target::File("/tmp/a,b.txt".into())
+        );
+    }
+
+    #[test]
+    fn refuses_a_kind_without_its_path_and_a_path_without_its_kind() {
+        for s in [
+            "file",
+            "file=",
+            "stderr,x",
+            "/tmp/logs.txt",
+            "same_as_log",
+            "",
+        ] {
+            assert!(s.parse::<Target>().is_err(), "`{s}` should not parse");
+        }
+        for s in ["file", "nope", ""] {
+            assert!(s.parse::<CrashTarget>().is_err(), "`{s}` should not parse");
+        }
+        for s in ["yaml", ""] {
+            assert!(s.parse::<Format>().is_err(), "`{s}` should not parse");
+        }
+    }
+
+    #[test]
+    fn spells_out_what_a_refused_value_should_have_been() {
+        let e = "nope".parse::<CrashTarget>().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "expected `same_as_log`, `stderr` or `file=<path>`"
+        );
     }
 }

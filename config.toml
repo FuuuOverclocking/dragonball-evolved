@@ -1,0 +1,11 @@
+[dragonball]
+id = "fuu-vm"
+api_sock = "/tmp/fuu-vm/api.sock"
+kvm_dev = "/dev/kvm"
+
+logger.level = "info"
+logger.target = "file=/tmp/fuu-vm/logs.txt"
+logger.crash_target = "same_as_log"
+logger.format = "text"
+
+[machine]

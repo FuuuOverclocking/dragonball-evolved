@@ -15,6 +15,7 @@ use std::time::Duration;
 use std::{future, io};
 
 use anyhow::{Context, Result, bail};
+use displaydoc::Display;
 use logger::{info_unrestricted, warn};
 use thiserror::Error;
 use tokio::select;
@@ -65,25 +66,28 @@ unsafe impl ByteValued for RequestHeader {}
 /// These are per-request faults reported to the driver through the status byte,
 /// not device faults: a malformed chain is a guest bug and must not take the vmm
 /// down with it.
-#[derive(Debug, Error)]
+#[derive(Debug, Display, Error)]
 enum RequestError {
-    #[error("descriptor chain is empty")]
+    /// descriptor chain is empty
     EmptyChain,
-    #[error("chain does not start with a readable {HEADER_LEN}-byte header")]
+    // `{HEADER_LEN}` would go through displaydoc's `Display` shorthand, which only
+    // reaches destructured fields; a constant has to take the `{:?}` path, which
+    // prints an integer the same way.
+    /// chain does not start with a readable {HEADER_LEN:?}-byte header
     MalformedHeader,
-    #[error("chain does not end with a writable status byte")]
+    /// chain does not end with a writable status byte
     MalformedStatus,
-    #[error("payload descriptor has the wrong direction for this request type")]
+    /// payload descriptor has the wrong direction for this request type
     WrongPayloadDirection,
-    #[error("request at sector {sector} of {len} bytes is out of bounds")]
+    /// request at sector {sector} of {len} bytes is out of bounds
     OutOfBounds { sector: u64, len: u32 },
-    #[error("write to a read-only disk")]
+    /// write to a read-only disk
     ReadOnly,
-    #[error("unsupported request type {0}")]
+    /// unsupported request type {0}
     Unsupported(u32),
-    #[error("guest memory access failed")]
+    /// guest memory access failed
     Memory(#[from] GuestMemoryError),
-    #[error("disk I/O failed")]
+    /// disk I/O failed
     Io(#[from] io::Error),
 }
 

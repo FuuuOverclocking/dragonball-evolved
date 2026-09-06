@@ -14,11 +14,11 @@ bin crate  ─→ logger-backend   log::Log 实现 + 写入线程 + crash handle
 
 ### 宏
 
-| 宏 | 限流 | 用途 |
-| --- | --- | --- |
-| `error!` `warn!` `info!` | 有 | 默认。guest 可触发的路径必须用这组 |
-| `error_unrestricted!` `warn_unrestricted!` `info_unrestricted!` | 无 | 仅 host 路径:启动、配置、快照 |
-| `debug!` `trace!` | 无 | 透传 `log` |
+| 宏                                                              | 限流 | 用途                               |
+| --------------------------------------------------------------- | ---- | ---------------------------------- |
+| `error!` `warn!` `info!`                                        | 有   | 默认。guest 可触发的路径必须用这组 |
+| `error_unrestricted!` `warn_unrestricted!` `info_unrestricted!` | 无   | 仅 host 路径:启动、配置、快照      |
+| `debug!` `trace!`                                               | 无   | 透传 `log`                         |
 
 `clippy.toml` 的 `disallowed-macros` 禁止直接调用 `log::error!` 等,把这张表变成强制的。
 
@@ -77,10 +77,10 @@ message 必须在调用线程落地 —— `Record` 借的是调用方栈上的 
 
 配置变更作为控制消息走同一条 mpsc,顺序因此天然确定:变更前入队的记录仍按旧配置渲染。
 
-| 项 | 取值 |
-| --- | --- |
-| target | `stderr`、`file(path)` |
-| format | `text`、`json` |
+| 项     | 取值                                                                   |
+| ------ | ---------------------------------------------------------------------- |
+| target | `stderr`、`file(path)`                                                 |
+| format | `text`、`json`                                                         |
 | fields | `show_tid` `show_thread_name` `show_target` `show_file_line` `show_id` |
 
 `show_id` 指实例 id,由 bin crate 在 init 时一次性写入 `OnceLock`。打开文件在调用线程完成,失败要能返回给调用方(API),送进队列的是已打开的 `File`。

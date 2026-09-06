@@ -94,13 +94,13 @@ DragonballProcess
    └─ physical device DMA / interrupts
 ```
 
-| 执行位置 | 主要职责 | 不应承担 |
-|---|---|---|
-| main | CLI、API、TUI、信号处理 | VM 内部状态和设备数据面 |
-| vmm-main | 生命周期、请求分发、异步设备、vhost-user 控制面 | 阻塞 `KVM_RUN` |
-| vcpu-N | `KVM_RUN`、同步 MMIO/PIO exit | 异步设备 I/O |
-| vhost-user process | 外部 virtqueue 数据面 | VM 全局生命周期 |
-| kernel/hardware | irqfd、ioeventfd、VFIO DMA/中断 | userspace 策略 |
+| 执行位置           | 主要职责                                        | 不应承担                |
+| ------------------ | ----------------------------------------------- | ----------------------- |
+| main               | CLI、API、TUI、信号处理                         | VM 内部状态和设备数据面 |
+| vmm-main           | 生命周期、请求分发、异步设备、vhost-user 控制面 | 阻塞 `KVM_RUN`          |
+| vcpu-N             | `KVM_RUN`、同步 MMIO/PIO exit                   | 异步设备 I/O            |
+| vhost-user process | 外部 virtqueue 数据面                           | VM 全局生命周期         |
+| kernel/hardware    | irqfd、ioeventfd、VFIO DMA/中断                 | userspace 策略          |
 
 ## 核心数据结构
 
@@ -109,6 +109,8 @@ struct KvmContext {
     kvm: Kvm,
     capabilities: KvmCapabilities,
     supported_cpuid: CpuId,
+    msr_index_list: MsrIndexList,     // KVM_GET_MSR_INDEX_LIST
+    msr_features: MsrFeatureList,     // KVM_GET_MSR_FEATURE_INDEX_LIST + KVM_GET_MSRS
 }
 
 async fn run_vmm(mut requests: VmmServer, kvm: Arc<KvmContext>) -> VmmExitStatus {
@@ -155,7 +157,10 @@ struct MachineModel {
 }
 ```
 
-- `KvmContext`：宿主能力与 VM 工厂。
+- `KvmContext`：宿主能力与 VM 工厂。CPUID 与两类 MSR 元数据都是 process scope，打开 `/dev/kvm` 时查一次：
+  - `msr_index_list` 决定 vCPU 能保存和恢复哪些 MSR，是快照 `VcpuState` 的 MSR 集合来源，避免硬编码一张随内核版本失效的列表。
+  - `msr_features` 与 `supported_cpuid` 同类，是 `validate` 和 CPU template 的输入。
+  - scope 的依据、VM-scope 能力为何不放这里、`Arc` 与打开时机见 [kvm-context-design.md](kvm-context-design.md)，该文为准。
 - `run_vmm`：长生命周期控制循环；协调变量直接保存在栈帧。
 - `MachineModel`：可比较、可验证、可序列化的纯数据。
 - `Machine`：真正的领域聚合对象，包含 model 与运行时资源。
@@ -499,16 +504,16 @@ enum DeviceSnapshot {
 }
 ```
 
-| 组件 | 保存内容 | 不保存 |
-|---|---|---|
-| `MachineModel` | 状态、配置、稳定拓扑和资源布局 | runtime handle |
-| RAM | region 元数据、全量页或 dirty pages | 当前 HVA |
-| KVM VM | clock、irqchip、PIT、路由状态 | `VmFd` |
-| vCPU | regs、sregs、MSR、LAPIC、events、MP state | `VcpuFd` / thread |
-| emulated device | feature、config、queue index、backend state | eventfd / task |
-| vhost-user | negotiated feature、vring、inflight/backend migration state | socket / kickfd / callfd |
-| VFIO | VFIO migration blob 与兼容性标识 | device fd / DMA mapping |
-| DAX | window 布局、mapping 元数据或重建策略 | window 页面 dump / HVA |
+| 组件            | 保存内容                                                    | 不保存                   |
+| --------------- | ----------------------------------------------------------- | ------------------------ |
+| `MachineModel`  | 状态、配置、稳定拓扑和资源布局                              | runtime handle           |
+| RAM             | region 元数据、全量页或 dirty pages                         | 当前 HVA                 |
+| KVM VM          | clock、irqchip、PIT、路由状态                               | `VmFd`                   |
+| vCPU            | regs、sregs、MSR、LAPIC、events、MP state                   | `VcpuFd` / thread        |
+| emulated device | feature、config、queue index、backend state                 | eventfd / task           |
+| vhost-user      | negotiated feature、vring、inflight/backend migration state | socket / kickfd / callfd |
+| VFIO            | VFIO migration blob 与兼容性标识                            | device fd / DMA mapping  |
+| DAX             | window 布局、mapping 元数据或重建策略                       | window 页面 dump / HVA   |
 
 ```text
 SnapshotBundle
@@ -533,6 +538,7 @@ SnapshotBundle
 格式规则：
 
 - section 独立版本化；未知必需 section 直接拒绝。
+- `VcpuState` 保存的 MSR 索引集合属于 `required_capabilities`；目标宿主的 `msr_index_list` 不覆盖它时在验证阶段拒绝，不留给 `KVM_SET_MSRS` 失败。
 - snapshot 中的 machine state 规范化为 `Paused`，不保存 `Saving` 等瞬态状态。
 - diff snapshot 引用不可变 base digest，不依赖可变文件路径。
 - 数据先写临时目标并校验，manifest 最后原子发布。
@@ -541,12 +547,12 @@ SnapshotBundle
 
 Quiesce 完成表示：不再接受新请求；in-flight I/O 已完成或已序列化；queue index 和 guest memory 不再变化。
 
-| 数据路径 | Quiesce / 保存方式 |
-|---|---|
-| emulated backend | task 停在安全点，保存 queue 与 in-flight state |
-| vhost-user | suspend vring，读取 backend/inflight migration state |
-| VFIO | 进入设备 migration `STOP_COPY`，读取 migration stream |
-| DAX | 阻止 map/unmap；保存映射元数据或选择空窗口重建 |
+| 数据路径         | Quiesce / 保存方式                                    |
+| ---------------- | ----------------------------------------------------- |
+| emulated backend | task 停在安全点，保存 queue 与 in-flight state        |
+| vhost-user       | suspend vring，读取 backend/inflight migration state  |
+| VFIO             | 进入设备 migration `STOP_COPY`，读取 migration stream |
+| DAX              | 阻止 map/unmap；保存映射元数据或选择空窗口重建        |
 
 - 每个设备声明 `Migratable`、`Restartable` 或 `NonMigratable`。
 - vhost-user backend 不支持所需迁移协议时，拒绝在线 snapshot。
@@ -859,13 +865,16 @@ sequenceDiagram
 
 ## 当前代码映射
 
+现有代码只覆盖控制面骨架与设备模型，KVM 侧已全部移除，等待按本文重写。
+
 ```text
-Vmm 的协调字段 -> run_vmm 栈上变量
-Vm             -> KvmVm
-GuestRam     -> MachineMemory
-Vcpu         -> VcpuRunner
-PocMachine   -> PocBuilder / PocRuntime
-DeviceManager 中的 task 管理 -> LocalTaskSet
+Vmm 的协调字段            -> run_vmm 栈上变量
+VmmServer / VmmClient     -> requests: VmmServer
+VmmRequest + Reply<T>     -> MachineCommand + typed reply
+DeviceManager 的 task 管理 -> LocalTaskSet
+BlockDevice / Serial      -> EmulatedVirtio 的 backend task、legacy 设备
 ```
 
-当前 POC 仅验证单 vCPU、单内存槽和单进程内 virtio-blk；固定 guest 与 virtqueue 布局只属于 POC。当前 POC 与参考 Firecracker 均未实现 DAX，上述内容是目标边界。
+尚不存在：`KvmContext`、`KvmVm`、`MachineMemory`、`VcpuManager`、`AddressSpace`、`InterruptManager`、reducer/effect 分层、snapshot/restore。参考 Firecracker 亦未实现 DAX，上述内容是目标边界而非现状。
+
+按设计问题展开的系列文章见 [blog/README.md](blog/README.md)。

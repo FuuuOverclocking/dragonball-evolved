@@ -21,7 +21,7 @@ pub enum Budget {
 /// A token bucket over operation counts.
 ///
 /// Bandwidth limiting has exactly this shape with the cost measured in bytes;
-/// only IOPS is modelled here to keep the proof of concept small.
+/// only IOPS is modelled so far.
 #[derive(Debug)]
 pub struct TokenBucket {
     /// Tokens replenished every `refill_time`, and the maximum burst size.

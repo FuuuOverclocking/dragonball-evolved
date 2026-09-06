@@ -19,7 +19,7 @@ pub struct TempDisk {
 impl TempDisk {
     pub fn new(name: &str, contents: &[u8]) -> Self {
         let path =
-            std::env::temp_dir().join(format!("dragonball-poc-{}-{name}", std::process::id()));
+            std::env::temp_dir().join(format!("dragonball-test-{}-{name}", std::process::id()));
         fs::write(&path, contents).expect("write temp disk");
         Self { path }
     }

@@ -15,10 +15,10 @@ test:
 	cargo test --workspace
 
 fmt:
-	cargo fmt --all
+	cargo +nightly fmt --all
 
 fmt-check:
-	cargo fmt --all -- --check
+	cargo +nightly fmt --all -- --check
 
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings

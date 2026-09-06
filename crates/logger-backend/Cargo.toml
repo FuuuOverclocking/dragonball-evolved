@@ -5,6 +5,7 @@ authors.workspace = true
 edition.workspace = true
 
 [dependencies]
+displaydoc.workspace = true
 libc.workspace = true
 log.workspace = true
 logger.workspace = true

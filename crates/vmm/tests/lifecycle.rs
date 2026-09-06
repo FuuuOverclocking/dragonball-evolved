@@ -1,12 +1,8 @@
 //! The vmm thread's async main loop and its request dispatch.
 
-mod common;
-
-use std::fs::OpenOptions;
 use std::time::Duration;
 
-use api::{PocConfig, VmmRequest, VmmStatus};
-use common::TempDisk;
+use api::{VmmRequest, VmmStatus};
 use vmm::{VmmClient, VmmExitStatus};
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,50 +48,9 @@ fn a_query_answers_with_the_type_its_request_asked_for() {
         .request_timeout(VmmRequest::Status, REPLY_TIMEOUT)
         .expect("status request should be answered");
     assert_eq!(status.devices_running, 0);
-    assert!(!status.vcpu_running);
-    assert_eq!(status.memory_bytes, 0);
 
     // A non-terminal request leaves the loop serving, so shutdown still works.
     assert!(matches!(shutdown(&client), VmmExitStatus::Ok));
-}
-
-#[test]
-fn real_kvm_guest_drives_the_async_block_device() {
-    if OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_err()
-    {
-        eprintln!("skipping KVM POC: /dev/kvm is unavailable");
-        return;
-    }
-
-    let disk = TempDisk::new("kvm-poc", &[0x5a; 512]);
-    let client = start("kvm-poc");
-    let report = client
-        .request_timeout(
-            |reply| {
-                VmmRequest::StartPoc(
-                    PocConfig {
-                        disk_path: disk.path().to_owned(),
-                    },
-                    reply,
-                )
-            },
-            REPLY_TIMEOUT,
-        )
-        .expect("POC reply channel")
-        .expect("run KVM POC");
-
-    assert_eq!(report.used_index, 1);
-    assert_eq!(report.request_status, 0);
-    assert_eq!(report.data, vec![0x5a; 16]);
-    assert_eq!(report.interrupt_status & 1, 1);
-    assert!(matches!(
-        client.join_vmm_thread().expect("join vmm thread"),
-        VmmExitStatus::Ok
-    ));
 }
 
 #[test]
