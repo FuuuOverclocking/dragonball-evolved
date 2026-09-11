@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 use crate::devices::{DeviceExit, DeviceManager};
 pub use crate::exit_status::VmmExitStatus;
 pub use crate::instance_info::InstanceInfo;
-use crate::vmm_server::Requests;
 pub use crate::vmm_server::VmmClient;
+use crate::vmm_server::VmmServer;
 
 pub fn start(id: String) -> Result<VmmClient> {
     let instance_info = Arc::new(InstanceInfo { id });
@@ -29,7 +29,7 @@ pub fn start(id: String) -> Result<VmmClient> {
                 .enable_all()
                 .build_local(Default::default())
                 .expect("Failed building the tokio runtime for vmm-main")
-                .block_on(vmm_main(Requests(rx)))
+                .block_on(vmm_main(VmmServer(rx)))
         })
         .context("spawn vmm-main thread")?;
 
@@ -41,7 +41,7 @@ pub fn start(id: String) -> Result<VmmClient> {
 }
 
 /// The vmm's main loop.
-async fn vmm_main(mut requests: Requests) -> VmmExitStatus {
+async fn vmm_main(mut server: VmmServer) -> VmmExitStatus {
     let mut devices = DeviceManager::new();
 
     let (status, shutdown_reply) = loop {
@@ -52,7 +52,7 @@ async fn vmm_main(mut requests: Requests) -> VmmExitStatus {
         // still borrowing fields of `self`.
         let event = select! {
             biased;
-            request = requests.next() => Event::Request(request),
+            request = server.next_request() => Event::Request(request),
             Some(exit) = devices.next_exit() => Event::DeviceExit(exit),
         };
 
@@ -152,7 +152,7 @@ mod tests {
         drop(tx);
 
         // Nothing will ever arrive, so the loop has to notice rather than wait.
-        let status = vmm_main(Requests(rx)).await;
+        let status = vmm_main(VmmServer(rx)).await;
         assert!(
             matches!(status, VmmExitStatus::Ok),
             "unexpected exit status: {status:?}"

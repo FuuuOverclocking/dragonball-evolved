@@ -1,6 +1,4 @@
 [dragonball]
-id = "fuu-vm"
-api_sock = "/tmp/fuu-vm/api.sock"
 kvm_dev = "/dev/kvm"
 
 logger.level = "info"

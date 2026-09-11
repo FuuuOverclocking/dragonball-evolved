@@ -1,34 +1,33 @@
-mod build;
-pub mod cli;
-pub mod init;
 mod config;
+mod init;
 
 use anyhow::{Context, Result};
 use logger::{error_unrestricted, info_unrestricted};
 use vmm::VmmClient;
 
-pub use crate::build::*;
-use crate::cli::{Cli, SubCommand};
+use crate::config::SubCommand;
 use crate::init::init;
 
-#[tokio::main(flavor = "local")]
+pub const VERSION: &str = env!("VERSION");
+pub const VERSION_LONG: &str = env!("VERSION_LONG");
+pub const COMMIT: &str = env!("GIT_SHORT_HASH");
+
 pub async fn main() -> Result<()> {
     // Parse CLI arguments.
-    // let cfg = config::parse_cli();
-    let cli = Cli::parse_custom();
+    let (cfg, subcommand) = config::parse_cli().context("parse config from cli")?;
 
     // Run subcommands that do not require starting a VMM.
-    if let Some(cmd) = cli.subcommand() {
+    if let Some(cmd) = subcommand {
         return run_subcommand(cmd).await;
     }
 
     // Setup environment, including signal handling, logging, etc.
-    let (_flush_guard, shutdown_signal) = init(&cli).context("init vmm environment")?;
+    let (_flush_guard, shutdown_signal) = init(&cfg).context("init vmm environment")?;
 
-    info_unrestricted!("Dragonball starting, version = {VERSION_LONG}, cli = {cli}");
+    info_unrestricted!("Dragonball starting, version = {VERSION_LONG}, config = {cfg:?}");
 
     // Spawn a new thread to start vmm.
-    let vmm_client = vmm::start(cli.id().into()).context("start vmm")?;
+    let vmm_client = vmm::start(cfg.dragonball.id().into()).context("start vmm")?;
 
     // Shutdown vmm when receiving SIGINT or SIGTERM.
     shutdown_on_signal(shutdown_signal, vmm_client.clone());
@@ -60,6 +59,6 @@ fn shutdown_on_signal(
     });
 }
 
-async fn run_subcommand(_cmd: &SubCommand) -> Result<()> {
+async fn run_subcommand(_cmd: SubCommand) -> Result<()> {
     Ok(())
 }

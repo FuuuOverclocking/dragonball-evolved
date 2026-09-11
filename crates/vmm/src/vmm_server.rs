@@ -9,13 +9,13 @@ use tokio::sync::mpsc;
 use crate::{InstanceInfo, VmmExitStatus};
 
 /// The vmm thread's end of the request channel.
-pub(crate) struct Requests(pub(crate) mpsc::UnboundedReceiver<VmmRequest>);
+pub(crate) struct VmmServer(pub(crate) mpsc::UnboundedReceiver<VmmRequest>);
 
-impl Requests {
+impl VmmServer {
     /// Wait for the next request, or `None` once every client has gone away.
     ///
     /// Cancel-safe, so it can sit directly in a `select!` arm.
-    pub(crate) async fn next(&mut self) -> Option<VmmRequest> {
+    pub(crate) async fn next_request(&mut self) -> Option<VmmRequest> {
         self.0.recv().await
     }
 }

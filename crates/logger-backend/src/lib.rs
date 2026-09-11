@@ -25,7 +25,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
+use std::{fmt, thread};
 
 use log::{LevelFilter, Log, Metadata, Record};
 
@@ -72,6 +72,15 @@ impl FromStr for Format {
     }
 }
 
+impl fmt::Display for Format {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Format::Text => write!(f, "text"),
+            Format::Json => write!(f, "json"),
+        }
+    }
+}
+
 /// Where lines go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -89,6 +98,15 @@ impl FromStr for Target {
             None if s == "stderr" => Ok(Self::Stderr),
             Some(("file", path)) if !path.is_empty() => Ok(Self::File(PathBuf::from(path))),
             _ => Err(ParseError("`stderr` or `file=<path>`")),
+        }
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Target::Stderr => write!(f, "stderr"),
+            Target::File(p) => write!(f, "file={}", p.display()),
         }
     }
 }
@@ -120,6 +138,15 @@ impl FromStr for CrashTarget {
         s.parse()
             .map(Self::Own)
             .map_err(|_| ParseError("`same_as_log`, `stderr` or `file=<path>`"))
+    }
+}
+
+impl fmt::Display for CrashTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CrashTarget::SameAsLog => write!(f, "same_as_log"),
+            CrashTarget::Own(target) => target.fmt(f),
+        }
     }
 }
 

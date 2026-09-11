@@ -11,7 +11,7 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1.0.104"
 api = { path = "crates/api" }
-clap = { version = "4.6.6", features = ["cargo", "derive"] }
+clap = { version = "4.6.6", features = ["cargo", "derive", "env"] }
 displaydoc = "0.2.7"
 libc = "0.2.189"
 log = { version = "0.4.34", features = ["serde", "std"] }
@@ -19,7 +19,6 @@ logger = { path = "crates/logger" }
 logger-backend = { path = "crates/logger-backend" }
 names = { version = "0.14.0", default-features = false }
 oneshot = { version = "0.2.1", features = ["std", "async"] }
-rand = "0.8.8"
 rustix = { version = "1.1.4", features = [
     "event",
     "fs",
@@ -28,6 +27,8 @@ rustix = { version = "1.1.4", features = [
     "thread",
     "time",
 ] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = [
     "macros",
@@ -37,6 +38,7 @@ tokio = { version = "1.53.1", features = [
     "sync",
     "time",
 ] }
+toml = "1.1.5"
 virtio-queue = "0.18.0"
 vm-memory = { version = "0.18.0", features = [
     "backend-atomic",
@@ -61,7 +63,10 @@ logger-backend.workspace = true
 names.workspace = true
 oneshot.workspace = true
 rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true
 vmm.workspace = true
 vmm-sys-util.workspace = true
 

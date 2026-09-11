@@ -12,12 +12,12 @@ use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 use vmm_sys_util::terminal::Terminal;
 
-use crate::cli::Cli;
+use crate::config::Config;
 
 // Size the fd table is pre-expanded to, big enough for most use cases.
 const FDTABLE_SIZE: u64 = 4096;
 
-pub fn init(cli: &Cli) -> Result<(FlushGuard, impl Future<Output = ()> + Send + 'static)> {
+pub fn init(cfg: &Config) -> Result<(FlushGuard, impl Future<Output = ()> + Send + 'static)> {
     // Ensure all created files (e.g. sockets) are only accessible by this user.
     umask(0o077.into());
 
@@ -27,7 +27,9 @@ pub fn init(cli: &Cli) -> Result<(FlushGuard, impl Future<Output = ()> + Send + 
     expand_fdtable().context("pre-expand fd table")?;
 
     // Setup logger. This also installs the crash log handlers.
-    let flush_guard = logger_backend::init(cli.logger_config().clone()).context("setup logger")?;
+    let mut logger_config: logger_backend::Config = cfg.dragonball.logger().clone().into();
+    logger_config.id = Some(cfg.dragonball.id().to_owned());
+    let flush_guard = logger_backend::init(logger_config).context("setup logger")?;
 
     // Setup panic hook.
     setup_panic_hook();
