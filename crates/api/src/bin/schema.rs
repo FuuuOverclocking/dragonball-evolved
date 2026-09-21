@@ -1,7 +1,7 @@
-use api::metadata::ops;
+use api::metadata::METADATA;
 
 fn main() {
-    let ops = ops();
+    let ops = &*METADATA;
     println!("{:#}", ops[0].request.as_value());
     println!();
     println!();

@@ -19,9 +19,14 @@ macro_rules! define_schema {
         pub mod metadata {
             use super::*;
 
+            #[allow(unused)]
+            use $crate::helpers::metadata::ResponseSchema as _;
             pub use $crate::helpers::metadata::{Op, Route};
 
-            pub fn ops() -> Vec<Op> {
+            pub static METADATA: ::std::sync::LazyLock<Vec<Op>> =
+                ::std::sync::LazyLock::new(ops);
+
+            fn ops() -> Vec<Op> {
                 vec![$($crate::helpers::macros::define_schema!(
                     @metadata $op -> $reply { $($properties)* }
                 )),*]
@@ -41,10 +46,7 @@ macro_rules! define_schema {
                 path: concat!($("/", stringify!($segment), $("-", stringify!($suffix),)*)+),
             })))?,
             request: ::schemars::schema_for!($op),
-            response: {
-                use $crate::helpers::metadata::ResponseSchema as _;
-                ::core::marker::PhantomData::<$reply>.response_schema()
-            },
+            response: ::core::marker::PhantomData::<$reply>.response_schema(),
         }
     };
 }
