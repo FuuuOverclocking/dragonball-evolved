@@ -1,2 +1,1 @@
-现在还缺少 resp 对应的 schema 描述.
-增加 ApiResult, 实现 serde 和 schema
+生成的 JSON Schema 里还缺少 dragonball 字段的内容, 以及顶层的 $schema.

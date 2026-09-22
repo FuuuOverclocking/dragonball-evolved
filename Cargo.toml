@@ -10,7 +10,7 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1.0.104"
 api = { path = "crates/api" }
-clap = { version = "4.6.6", features = ["cargo", "derive", "env"] }
+clap = { version = "4.6.7", features = ["cargo", "derive", "env"] }
 displaydoc = "0.2.7"
 libc = "0.2.189"
 log = { version = "0.4.34", features = ["serde", "std"] }
@@ -18,7 +18,7 @@ logger = { path = "crates/logger" }
 logger-backend = { path = "crates/logger-backend" }
 names = { version = "0.14.0", default-features = false }
 oneshot = { version = "0.2.1", features = ["std", "async"] }
-rustix = { version = "1.1.4", features = [
+rustix = { version = "1.1.5", features = [
     "event",
     "fs",
     "process",
@@ -38,13 +38,13 @@ tokio = { version = "1.53.1", features = [
     "sync",
     "time",
 ] }
-toml = "1.1.5"
+toml = "1.1.6"
 virtio-queue = "0.18.0"
 vm-memory = { version = "0.18.0", features = [
     "backend-atomic",
     "backend-mmap",
 ] }
-vm-superio = "0.8.1"
+vm-superio = "0.8.2"
 vmm = { path = "crates/vmm" }
 vmm-sys-util = "0.15.0"
 
@@ -69,11 +69,6 @@ tokio.workspace = true
 toml.workspace = true
 vmm.workspace = true
 vmm-sys-util.workspace = true
-
-[features]
-# The api's wire surface: serializable commands, and prepared requests whose
-# replies come back as JSON. Off by default, so the vmm builds without it.
-wire = ["api/wire"]
 
 [build-dependencies]
 anyhow.workspace = true

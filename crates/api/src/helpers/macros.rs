@@ -16,6 +16,70 @@ macro_rules! define_schema {
             $($op($op, M::Reply<$reply>),)*
         }
 
+        impl ::serde::Serialize for $name<$crate::op_mode::Command> {
+            fn serialize<S: ::serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> ::core::result::Result<S::Ok, S::Error> {
+                #[derive(::serde::Serialize)]
+                #[serde(rename_all = "kebab-case")]
+                enum Parameters<'a> {
+                    $($op(&'a $op),)*
+                }
+
+                let parameters = match self {
+                    $(Self::$op(parameters, ()) => Parameters::$op(parameters),)*
+                };
+                ::serde::Serialize::serialize(&parameters, serializer)
+            }
+        }
+
+        impl<'de> ::serde::Deserialize<'de> for $name<$crate::op_mode::Command> {
+            fn deserialize<D: ::serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> ::core::result::Result<Self, D::Error> {
+                #[derive(::serde::Deserialize)]
+                #[serde(rename_all = "kebab-case")]
+                enum Parameters {
+                    $($op($op),)*
+                }
+
+                let parameters = <Parameters as ::serde::Deserialize>::deserialize(deserializer)?;
+                Ok(match parameters {
+                    $(Parameters::$op(parameters) => Self::$op(parameters, ()),)*
+                })
+            }
+        }
+
+        pub mod config {
+            use super::*;
+
+            static BINDINGS: ::std::sync::LazyLock<
+                $crate::helpers::config::Config<$name<$crate::op_mode::Command>>,
+            > = ::std::sync::LazyLock::new(|| bindings().expect("Failed making bindings for api config"));
+
+            fn bindings() -> ::anyhow::Result<
+                $crate::helpers::config::Config<$name<$crate::op_mode::Command>>,
+            > {
+                $crate::helpers::config::Config::new([
+                    $($crate::helpers::macros::define_schema!(
+                        @binding $name $op { $($properties)* }
+                    )),*
+                ].into_iter().flatten())
+            }
+
+            /// Parse merged operation configuration, with process settings already removed.
+            pub fn parse(value: ::serde_json::Value) -> ::anyhow::Result<
+                Vec<$name<$crate::op_mode::Command>>,
+            > {
+                BINDINGS.parse(value)
+            }
+
+            pub fn schema() -> ::schemars::Schema {
+                BINDINGS.schema()
+            }
+        }
+
         pub mod metadata {
             use super::*;
 
@@ -32,6 +96,18 @@ macro_rules! define_schema {
                 )),*]
             }
         }
+    };
+    (@binding $name:ident $op:ident { config: $path:literal; $($rest:tt)* }) => {
+        Some($crate::helpers::config::Binding {
+            path: $path,
+            parse: |value| ::serde_json::from_value::<$op>(value)
+                .map(|parameters| $name::<$crate::op_mode::Command>::$op(parameters, ()))
+                .map_err(::anyhow::Error::from),
+            schema: |generator| generator.subschema_for::<$op>(),
+        })
+    };
+    (@binding $name:ident $op:ident { $($properties:tt)* }) => {
+        None
     };
     (@metadata $op:ident -> $reply:ty {
         $(config: $config:literal;)?
