@@ -1,3 +1,4 @@
+"$schema" = "../dist/schema/vm.schema.json"
 extends = "./base-vm.toml"
 
 [dragonball]
@@ -6,3 +7,5 @@ api_sock = "/tmp/fuu-vm/api.sock"
 kvm_dev = "/dev/my_kvm"
 
 [machine]
+
+[[machine.disks]]

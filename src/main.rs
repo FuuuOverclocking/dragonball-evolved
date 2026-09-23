@@ -1,10 +1,60 @@
-use std::process::ExitCode;
+use anyhow::{Context, Result};
+use api::{Shutdown, VmmRequest};
+use dragonball_evolved::cli::{self, SubCommand};
+use dragonball_evolved::{VERSION_LONG, init};
+use logger::{error_unlimited, info_unlimited};
+use vmm::VmmClient;
 
-fn main() -> ExitCode {
-    if let Err(e) = dragonball_evolved::main() {
-        // `{:?}` includes backtraces if available. Set RUST_BACKTRACE=1 to see them.
-        eprintln!("Error: {e:?}");
-        return ExitCode::FAILURE;
+#[tokio::main(flavor = "local")]
+async fn main() -> Result<()> {
+    // Parse CLI arguments.
+    let (cfg, subcommand) = cli::parse().context("parse config from cli")?;
+
+    // Run subcommands that do not require starting a VMM.
+    if let Some(cmd) = subcommand {
+        return run_subcommand(cmd).await;
     }
-    ExitCode::SUCCESS
+
+    // Setup environment, including signal handling, logging, etc.
+    let (_flush_guard, shutdown_signal) = init::init(&cfg).context("init vmm environment")?;
+
+    info_unlimited!("Dragonball starting, version = {VERSION_LONG}, config = {cfg:?}");
+
+    // Spawn a new thread to start vmm.
+    let vmm_client = vmm::start(cfg.dragonball.id().into()).context("start vmm")?;
+
+    // Shutdown vmm when receiving SIGINT or SIGTERM.
+    shutdown_on_signal(shutdown_signal, vmm_client.clone());
+
+    // Configure the VM, then boot or restore if required.
+
+    // Start API server if the API socket path is provided.
+
+    // Wait for the VMM thread to finish.
+    match vmm_client.async_join_vmm_thread().await {
+        Ok(exit_status) => exit_status.print_log(),
+        Err(e) => error_unlimited!("failed to join vmm thread: {e:?}"),
+    }
+
+    // Gracefully shutdown the API server if it was started.
+
+    // Flush metrics.
+
+    Ok(())
+}
+
+fn shutdown_on_signal(
+    shutdown_signal: impl Future<Output = ()> + Send + 'static,
+    vmm_client: VmmClient,
+) {
+    tokio::task::spawn_local(async move {
+        shutdown_signal.await;
+        let _ = vmm_client
+            .request_async(|reply| VmmRequest::Shutdown(Shutdown {}, reply))
+            .await;
+    });
+}
+
+async fn run_subcommand(_cmd: SubCommand) -> Result<()> {
+    Ok(())
 }

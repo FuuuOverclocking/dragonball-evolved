@@ -16,6 +16,15 @@ macro_rules! define_schema {
             $($op($op, M::Reply<$reply>),)*
         }
 
+        impl<M: $crate::op_mode::OpMode> ::core::fmt::Debug for $name<M> {
+            fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                match self {
+                    $(Self::$op(parameters, _) => formatter.debug_tuple(stringify!($op))
+                        .field(parameters).finish(),)*
+                }
+            }
+        }
+
         impl ::serde::Serialize for $name<$crate::op_mode::Command> {
             fn serialize<S: ::serde::Serializer>(
                 &self,
@@ -75,8 +84,8 @@ macro_rules! define_schema {
                 BINDINGS.parse(value)
             }
 
-            pub fn schema() -> ::schemars::Schema {
-                BINDINGS.schema()
+            pub fn schema(generator: &mut ::schemars::SchemaGenerator) -> ::schemars::Schema {
+                BINDINGS.schema(generator)
             }
         }
 
@@ -121,8 +130,8 @@ macro_rules! define_schema {
                 method: stringify!($method),
                 path: concat!($("/", stringify!($segment), $("-", stringify!($suffix),)*)+),
             })))?,
-            request: ::schemars::schema_for!($op),
-            response: ::core::marker::PhantomData::<$reply>.response_schema(),
+            request: |generator| generator.subschema_for::<$op>(),
+            response: |generator| ::core::marker::PhantomData::<$reply>.response_schema(generator),
         }
     };
 }

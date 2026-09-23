@@ -174,6 +174,45 @@ pub struct Config {
     pub show_id: Option<bool>,
 }
 
+impl Config {
+    pub fn from_api(config: api::logger::UpdateLogger, id: Option<String>) -> Self {
+        let api::logger::UpdateLogger {
+            level,
+            target,
+            crash_target,
+            format,
+            show_tid,
+            show_thread_name,
+            show_target,
+            show_file_line,
+            show_id,
+        } = config;
+        let convert_target = |target| match target {
+            api::logger::Target::Stderr => Target::Stderr,
+            api::logger::Target::File(path) => Target::File(path),
+        };
+
+        Self {
+            id,
+            level,
+            target: target.map(convert_target),
+            crash_target: crash_target.map(|target| match target {
+                api::logger::CrashTarget::SameAsLog => CrashTarget::SameAsLog,
+                api::logger::CrashTarget::Own(target) => CrashTarget::Own(convert_target(target)),
+            }),
+            format: format.map(|format| match format {
+                api::logger::Format::Text => Format::Text,
+                api::logger::Format::Json => Format::Json,
+            }),
+            show_tid,
+            show_thread_name,
+            show_target,
+            show_file_line,
+            show_id,
+        }
+    }
+}
+
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub enum Error {
     /// logger is already initialised

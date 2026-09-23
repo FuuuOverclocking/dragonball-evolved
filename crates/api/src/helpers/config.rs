@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 
-use schemars::generate::SchemaSettings;
+use anyhow::{Error, Result, anyhow};
 use schemars::{Schema, SchemaGenerator, json_schema};
 use serde_json::{Map, Value};
-use anyhow::{Result, Error};
 
 pub(crate) struct Binding<C> {
     pub path: &'static str,
@@ -37,9 +36,9 @@ impl<C> Config<C> {
         for binding in bindings {
             let path = binding.path.strip_suffix("[]").unwrap_or(binding.path);
             let many = path != binding.path;
-            let segments = path.strip_prefix('.').ok_or_else(|| {
-                Error::msg(format!("config binding must start with '.': {path}"))
-            })?;
+            let segments = path
+                .strip_prefix('.')
+                .ok_or_else(|| anyhow!("config binding must start with '.': {path}"))?;
             let mut node = &mut config.root;
             for segment in segments.split('.') {
                 if segment.is_empty()
@@ -100,17 +99,8 @@ impl<C> Config<C> {
         Ok(commands)
     }
 
-    pub(crate) fn schema(&self) -> Schema {
-        let mut generator = SchemaSettings::draft2020_12().into_generator();
-        let mut schema = self.node_schema(&self.root, &mut generator);
-        if let Some(meta_schema) = &generator.settings().meta_schema {
-            schema.insert("$schema".into(), meta_schema.as_ref().into());
-        }
-        let definitions = generator.take_definitions(false);
-        if !definitions.is_empty() {
-            schema.insert("$defs".into(), definitions.into());
-        }
-        schema
+    pub(crate) fn schema(&self, generator: &mut SchemaGenerator) -> Schema {
+        self.node_schema(&self.root, generator)
     }
 
     fn node_schema(&self, node: &Node, generator: &mut SchemaGenerator) -> Schema {

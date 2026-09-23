@@ -3,17 +3,28 @@ CARGO_BIN  := target/release/$(BIN)
 DIST       := dist
 DIST_BIN   := $(DIST)/$(BIN)
 DIST_DEBUG := $(DIST_BIN).debug
+SCHEMA_DIR ?= $(DIST)/schema
+CONFIG     ?= examples/vm.toml
+PYTHON     ?= python3
 
-.PHONY: all build release test fmt fmt-check clippy lint clean distclean help
+.PHONY: all build schema-export schema-check schema-verify release test fmt fmt-check clippy lint clean distclean help
 
 all: build
 
 build:
 	cargo build
 
+schema-export:
+	cargo run --offline --no-default-features --features schema --bin schema -- export --output-dir "$(SCHEMA_DIR)"
+
+schema-check:
+	cargo run --offline --no-default-features --features schema --bin schema -- check "$(CONFIG)"
+
+schema-verify: schema-export
+	"$(PYTHON)" scripts/verify-schema.py "$(SCHEMA_DIR)"
+
 test:
 	cargo test --workspace
-
 
 fmt:
 	cargo +nightly fmt --all
@@ -46,6 +57,9 @@ distclean: clean
 
 help:
 	@echo 'build          cargo build (debug)'
+	@echo 'schema-export  export vm.schema.json and openapi.yaml into SCHEMA_DIR'
+	@echo 'schema-check   parse CONFIG and print process settings and commands'
+	@echo 'schema-verify  export and validate OpenAPI 3.1 + JSON Schema (PYTHON selects environment)'
 	@echo 'release        build, split debuginfo into a standalone file'
 	@echo 'test           cargo test --workspace'
 	@echo 'lint           fmt-check + clippy -D warnings'

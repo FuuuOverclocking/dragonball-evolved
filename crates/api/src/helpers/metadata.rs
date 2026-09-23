@@ -1,16 +1,12 @@
 use std::marker::PhantomData;
 
-use schemars::generate::SchemaSettings;
-use schemars::{JsonSchema, Schema};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 
 pub(crate) trait ResponseSchema: Sized {
     type Body: JsonSchema;
 
-    fn response_schema(self) -> Schema {
-        SchemaSettings::default()
-            .for_serialize()
-            .into_generator()
-            .into_root_schema_for::<Self::Body>()
+    fn response_schema(self, generator: &mut SchemaGenerator) -> Schema {
+        generator.subschema_for::<Self::Body>()
     }
 }
 
@@ -28,8 +24,8 @@ pub struct Op {
     pub name: &'static str,
     pub config: Option<&'static str>,
     pub route: Option<Route>,
-    pub request: Schema,
-    pub response: Schema,
+    pub request: fn(&mut SchemaGenerator) -> Schema,
+    pub response: fn(&mut SchemaGenerator) -> Schema,
 }
 
 /// One operation's HTTP binding.
