@@ -6,7 +6,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-api.workspace = true
+api = { workspace = true, features = ["request"] }
 displaydoc.workspace = true
 libc.workspace = true
 logger.workspace = true

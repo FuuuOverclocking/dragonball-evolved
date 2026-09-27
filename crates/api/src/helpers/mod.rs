@@ -1,5 +1,7 @@
+#[cfg(feature = "serde")]
 pub(crate) mod config;
 pub(crate) mod macros;
-pub mod metadata;
-pub mod op_mode;
-pub mod result;
+#[cfg(feature = "metadata")]
+pub(crate) mod metadata;
+pub(crate) mod op_mode;
+pub(crate) mod result;

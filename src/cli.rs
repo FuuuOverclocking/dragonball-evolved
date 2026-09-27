@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use api::Config;
 use api::logger::{CrashTarget, Format, Target};
 use clap::{Arg, ArgMatches, Command, value_parser};
 
 use crate::VERSION_LONG;
-use crate::config::{self, Config};
 
 #[derive(Debug)]
 pub enum SubCommand {}
@@ -15,7 +15,7 @@ pub fn parse() -> Result<(Config, Option<SubCommand>)> {
     let mut config = matches
         .remove_one::<PathBuf>("config")
         .as_deref()
-        .map(config::load)
+        .map(Config::load)
         .transpose()
         .context("parse config file")?
         .unwrap_or_default();
@@ -165,15 +165,30 @@ fn apply_defaults(cfg: &mut Config) {
 mod tests {
     use std::path::Path;
 
+    use api::ProcessConfig;
     use api::logger::UpdateLogger;
 
     use super::*;
-    use crate::config::DragonballConfig;
+
+    #[test]
+    fn command_is_valid() {
+        command().debug_assert();
+    }
+
+    #[test]
+    fn schema_command_is_not_available() {
+        assert!(
+            command()
+                .mut_args(|arg| arg.env(None::<&str>))
+                .try_get_matches_from(["dragonball-evolved", "schema", "export"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn cli_patch_defaults_and_accessors_work_together() {
         let mut config = Config {
-            dragonball: DragonballConfig {
+            dragonball: ProcessConfig {
                 id: Some("from-file".into()),
                 api_sock: None,
                 kvm_dev: None,

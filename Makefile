@@ -15,10 +15,10 @@ build:
 	cargo build
 
 schema-export:
-	cargo run --offline --no-default-features --features schema --bin schema -- export --output-dir "$(SCHEMA_DIR)"
+	cargo run -p api-schema -- export --output-dir "$(SCHEMA_DIR)"
 
 schema-check:
-	cargo run --offline --no-default-features --features schema --bin schema -- check "$(CONFIG)"
+	cargo run -p api-schema -- check "$(CONFIG)"
 
 schema-verify: schema-export
 	"$(PYTHON)" scripts/verify-schema.py "$(SCHEMA_DIR)"

@@ -5,9 +5,14 @@ authors.workspace = true
 edition.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-log.workspace = true
-oneshot.workspace = true
-schemars.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+anyhow = { workspace = true, optional = true }
+oneshot = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+request = ["dep:oneshot"]
+serde = ["dep:serde", "dep:anyhow", "dep:serde_json"]
+metadata = ["serde", "dep:schemars"]

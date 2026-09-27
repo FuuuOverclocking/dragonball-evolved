@@ -1,20 +1,12 @@
 use std::path::PathBuf;
 
-use log::LevelFilter;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
 /// Update the logger configuration. Omitted fields leave their current values unchanged.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
 pub struct UpdateLogger {
     /// Lowest enabled log level: off, error, warn, info, debug or trace (case-insensitive).
-    #[schemars(
-        with = "Option<String>",
-        regex(
-            pattern = "^([Oo][Ff][Ff]|[Ee][Rr][Rr][Oo][Rr]|[Ww][Aa][Rr][Nn]|[Ii][Nn][Ff][Oo]|[Dd][Ee][Bb][Uu][Gg]|[Tt][Rr][Aa][Cc][Ee])$"
-        )
-    )]
     pub level: Option<LevelFilter>,
     /// Where normal log records are written.
     pub target: Option<Target>,
@@ -34,9 +26,51 @@ pub struct UpdateLogger {
     pub show_id: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(rename_all = "lowercase", try_from = "String")
+)]
+#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "metadata",
+    schemars(
+        with = "String",
+        extend("pattern" = "^([Oo][Ff][Ff]|[Ee][Rr][Rr][Oo][Rr]|[Ww][Aa][Rr][Nn]|[Ii][Nn][Ff][Oo]|[Dd][Ee][Bb][Uu][Gg]|[Tt][Rr][Aa][Cc][Ee])$")
+    )
+)]
+pub enum LevelFilter {
+    #[default]
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl TryFrom<String> for LevelFilter {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, &'static str> {
+        match value.as_str() {
+            value if value.eq_ignore_ascii_case("off") => Ok(Self::Off),
+            value if value.eq_ignore_ascii_case("error") => Ok(Self::Error),
+            value if value.eq_ignore_ascii_case("warn") => Ok(Self::Warn),
+            value if value.eq_ignore_ascii_case("info") => Ok(Self::Info),
+            value if value.eq_ignore_ascii_case("debug") => Ok(Self::Debug),
+            value if value.eq_ignore_ascii_case("trace") => Ok(Self::Trace),
+            _ => Err("expected `off`, `error`, `warn`, `info`, `debug` or `trace`"),
+        }
+    }
+}
+
 /// How a line is laid out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
 pub enum Format {
     #[default]
     Text,
@@ -44,9 +78,14 @@ pub enum Format {
 }
 
 /// Where lines go: `stderr` or `file=<path>`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(try_from = "String")]
-#[schemars(with = "String", extend("pattern" = r"^(stderr|file=[\s\S]+)$"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "String"))]
+#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "metadata",
+    schemars(with = "String", extend("pattern" = r"^(stderr|file=[\s\S]+)$"))
+)]
 pub enum Target {
     Stderr,
     File(PathBuf),
@@ -67,7 +106,8 @@ impl TryFrom<String> for Target {
     }
 }
 
-impl Serialize for Target {
+#[cfg(feature = "serde")]
+impl serde::Serialize for Target {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Stderr => serializer.serialize_str("stderr"),
@@ -83,11 +123,16 @@ impl Serialize for Target {
 }
 
 /// Where crash records go: `same_as_log`, `stderr` or `file=<path>`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, JsonSchema)]
-#[serde(try_from = "String")]
-#[schemars(
-    with = "String",
-    extend("pattern" = r"^(same_as_log|stderr|file=[\s\S]+)$")
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "String"))]
+#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "metadata",
+    schemars(
+        with = "String",
+        extend("pattern" = r"^(same_as_log|stderr|file=[\s\S]+)$")
+    )
 )]
 pub enum CrashTarget {
     /// Track whatever the normal log target is.
@@ -111,11 +156,54 @@ impl TryFrom<String> for CrashTarget {
     }
 }
 
-impl Serialize for CrashTarget {
+#[cfg(feature = "serde")]
+impl serde::Serialize for CrashTarget {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::SameAsLog => serializer.serialize_str("same_as_log"),
             Self::Own(target) => target.serialize(serializer),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_accept_all_ascii_casings() {
+        for (name, expected) in [
+            ("off", LevelFilter::Off),
+            ("error", LevelFilter::Error),
+            ("warn", LevelFilter::Warn),
+            ("info", LevelFilter::Info),
+            ("debug", LevelFilter::Debug),
+            ("trace", LevelFilter::Trace),
+        ] {
+            for mask in 0..(1 << name.len()) {
+                let spelling: String = name
+                    .chars()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if mask & (1 << i) != 0 {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                assert_eq!(LevelFilter::try_from(spelling), Ok(expected));
+            }
+        }
+        assert_eq!(LevelFilter::default(), LevelFilter::Off);
+    }
+
+    #[test]
+    fn levels_reject_unknown_names_and_whitespace() {
+        for value in [
+            "", "warning", "fatal", " info", "info ", "info\n", "0", "İnfo",
+        ] {
+            assert!(LevelFilter::try_from(value.to_owned()).is_err());
         }
     }
 }

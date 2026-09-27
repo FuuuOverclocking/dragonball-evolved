@@ -1,16 +1,12 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Error, Result, anyhow};
-#[cfg(feature = "metadata")]
 use schemars::{Schema, SchemaGenerator, json_schema};
-#[cfg(feature = "metadata")]
-use serde_json::Map;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub(crate) struct Binding<C> {
     pub path: &'static str,
     pub parse: fn(Value) -> Result<C>,
-    #[cfg(feature = "metadata")]
     pub schema: fn(&mut SchemaGenerator) -> Schema,
 }
 
@@ -26,12 +22,12 @@ struct Node {
     children: BTreeMap<&'static str, Node>,
 }
 
-pub(crate) struct ConfigBindings<C> {
+pub(crate) struct Config<C> {
     root: Node,
     entries: Vec<Entry<C>>,
 }
 
-impl<C> ConfigBindings<C> {
+impl<C> Config<C> {
     pub(crate) fn new(bindings: impl IntoIterator<Item = Binding<C>>) -> Result<Self> {
         let mut config = Self {
             root: Node::default(),
@@ -103,12 +99,10 @@ impl<C> ConfigBindings<C> {
         Ok(commands)
     }
 
-    #[cfg(feature = "metadata")]
     pub(crate) fn schema(&self, generator: &mut SchemaGenerator) -> Schema {
         self.node_schema(&self.root, generator)
     }
 
-    #[cfg(feature = "metadata")]
     fn node_schema(&self, node: &Node, generator: &mut SchemaGenerator) -> Schema {
         if let Some(index) = node.binding {
             let entry = &self.entries[index];
@@ -159,97 +153,5 @@ impl Node {
             child.collect(value, &path, values)?;
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    fn binding(path: &'static str) -> Binding<u64> {
-        Binding {
-            path,
-            parse: |value| serde_json::from_value(value).map_err(Error::from),
-            #[cfg(feature = "metadata")]
-            schema: |generator| generator.subschema_for::<u64>(),
-        }
-    }
-
-    #[test]
-    fn parsing_preserves_binding_order_and_array_order() {
-        let config = ConfigBindings::new([binding(".z"), binding(".machine.disks[]")]).unwrap();
-        assert_eq!(
-            config
-                .parse(json!({ "machine": { "disks": [2, 1] }, "z": 3 }))
-                .unwrap(),
-            [3, 2, 1]
-        );
-        assert!(config.parse(json!({})).unwrap().is_empty());
-        assert!(
-            config
-                .parse(json!({ "machine": { "disks": [] } }))
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn invalid_configuration_reports_the_field_path() {
-        let config = ConfigBindings::new([binding(".machine.disks[]")]).unwrap();
-        for (value, message) in [
-            (json!(null), ".: expected an object"),
-            (json!({ "machine": null }), ".machine: expected an object"),
-            (
-                json!({ "machine": { "unknown": 1 } }),
-                "unknown config field: .machine.unknown",
-            ),
-            (
-                json!({ "machine": { "disks": {} } }),
-                ".machine.disks: expected an array",
-            ),
-            (
-                json!({ "machine": { "disks": ["invalid"] } }),
-                ".machine.disks[0]:",
-            ),
-        ] {
-            assert!(
-                config
-                    .parse(value)
-                    .unwrap_err()
-                    .to_string()
-                    .contains(message)
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_bindings_are_rejected() {
-        for paths in [
-            vec!["machine.disks"],
-            vec![".machine..disks"],
-            vec![".machine.disks", ".machine.disks"],
-            vec![".machine", ".machine.disks"],
-            vec![".machine.disks", ".machine"],
-        ] {
-            assert!(ConfigBindings::new(paths.into_iter().map(binding)).is_err());
-        }
-    }
-
-    #[cfg(feature = "metadata")]
-    #[test]
-    fn schema_preserves_object_and_array_shapes() {
-        let config = ConfigBindings::new([binding(".machine.disks[]"), binding(".z")]).unwrap();
-        let mut generator = SchemaGenerator::default();
-        let schema = config.schema(&mut generator).to_value();
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["additionalProperties"], false);
-        let machine = &schema["properties"]["machine"];
-        assert_eq!(machine["additionalProperties"], false);
-        assert_eq!(machine["properties"]["disks"]["type"], "array");
-        let integer = generator.subschema_for::<u64>().to_value();
-        assert_eq!(machine["properties"]["disks"]["items"], integer);
-        assert_eq!(schema["properties"]["z"], integer);
     }
 }

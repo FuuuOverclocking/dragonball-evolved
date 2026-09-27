@@ -2,18 +2,30 @@ macro_rules! define_schema {
     ($name:ident { $($entries:tt)* }) => {
         $crate::helpers::macros::define_schema!(@entries $name [] $($entries)*);
     };
-    (@entries $name:ident [$($parsed:tt)*] $op:ident -> $reply:ty; $($rest:tt)*) => {
-        $crate::helpers::macros::define_schema!(@entries $name
-            [$($parsed)* ($op -> $reply {})] $($rest)*);
+    (@entries $name:ident [$($parsed:tt)*] $head:ident $($rest:tt)*) => {
+        $crate::helpers::macros::define_schema!(
+            @request $name [$($parsed)*] [] $head $($rest)*
+        );
     };
-    (@entries $name:ident [$($parsed:tt)*]
-        $op:ident -> $reply:ty { $($properties:tt)* } $($rest:tt)*) => {
-        $crate::helpers::macros::define_schema!(@entries $name
-            [$($parsed)* ($op -> $reply { $($properties)* })] $($rest)*);
+    (@request $name:ident [$($parsed:tt)*]
+        [$($prefix:tt)*] $head:ident :: $next:ident $($rest:tt)*) => {
+        $crate::helpers::macros::define_schema!(
+            @request $name [$($parsed)*] [$($prefix)* $head ::] $next $($rest)*
+        );
     };
-    (@entries $name:ident [$(($op:ident -> $reply:ty { $($properties:tt)* }))*]) => {
+    (@request $name:ident [$($parsed:tt)*]
+        [$($prefix:tt)*] $op:ident -> $reply:ty; $($rest:tt)*) => {
+        $crate::helpers::macros::define_schema!(@entries $name
+            [$($parsed)* ($op [$($prefix)* $op] -> $reply {})] $($rest)*);
+    };
+    (@request $name:ident [$($parsed:tt)*]
+        [$($prefix:tt)*] $op:ident -> $reply:ty { $($properties:tt)* } $($rest:tt)*) => {
+        $crate::helpers::macros::define_schema!(@entries $name
+            [$($parsed)* ($op [$($prefix)* $op] -> $reply { $($properties)* })] $($rest)*);
+    };
+    (@entries $name:ident [$(($op:ident [$request:path] -> $reply:ty { $($properties:tt)* }))*]) => {
         pub enum $name<M: $crate::op_mode::OpMode> {
-            $($op($op, M::Reply<$reply>),)*
+            $($op($request, M::Reply<$reply>),)*
         }
 
         impl<M: $crate::op_mode::OpMode> ::core::fmt::Debug for $name<M> {
@@ -25,6 +37,7 @@ macro_rules! define_schema {
             }
         }
 
+        #[cfg(feature = "serde")]
         impl ::serde::Serialize for $name<$crate::op_mode::Command> {
             fn serialize<S: ::serde::Serializer>(
                 &self,
@@ -33,7 +46,7 @@ macro_rules! define_schema {
                 #[derive(::serde::Serialize)]
                 #[serde(rename_all = "kebab-case")]
                 enum Parameters<'a> {
-                    $($op(&'a $op),)*
+                    $($op(&'a $request),)*
                 }
 
                 let parameters = match self {
@@ -43,6 +56,7 @@ macro_rules! define_schema {
             }
         }
 
+        #[cfg(feature = "serde")]
         impl<'de> ::serde::Deserialize<'de> for $name<$crate::op_mode::Command> {
             fn deserialize<D: ::serde::Deserializer<'de>>(
                 deserializer: D,
@@ -50,7 +64,7 @@ macro_rules! define_schema {
                 #[derive(::serde::Deserialize)]
                 #[serde(rename_all = "kebab-case")]
                 enum Parameters {
-                    $($op($op),)*
+                    $($op($request),)*
                 }
 
                 let parameters = <Parameters as ::serde::Deserialize>::deserialize(deserializer)?;
@@ -60,35 +74,7 @@ macro_rules! define_schema {
             }
         }
 
-        pub mod config {
-            use super::*;
-
-            static BINDINGS: ::std::sync::LazyLock<
-                $crate::helpers::config::Config<$name<$crate::op_mode::Command>>,
-            > = ::std::sync::LazyLock::new(|| bindings().expect("Failed making bindings for api config"));
-
-            fn bindings() -> ::anyhow::Result<
-                $crate::helpers::config::Config<$name<$crate::op_mode::Command>>,
-            > {
-                $crate::helpers::config::Config::new([
-                    $($crate::helpers::macros::define_schema!(
-                        @binding $name $op { $($properties)* }
-                    )),*
-                ].into_iter().flatten())
-            }
-
-            /// Parse merged operation configuration, with process settings already removed.
-            pub fn parse(value: ::serde_json::Value) -> ::anyhow::Result<
-                Vec<$name<$crate::op_mode::Command>>,
-            > {
-                BINDINGS.parse(value)
-            }
-
-            pub fn schema(generator: &mut ::schemars::SchemaGenerator) -> ::schemars::Schema {
-                BINDINGS.schema(generator)
-            }
-        }
-
+        #[cfg(feature = "metadata")]
         pub mod metadata {
             use super::*;
 
@@ -96,29 +82,45 @@ macro_rules! define_schema {
             use $crate::helpers::metadata::ResponseSchema as _;
             pub use $crate::helpers::metadata::{Op, Route};
 
-            pub static METADATA: ::std::sync::LazyLock<Vec<Op>> =
+            pub(crate) static CONFIG_BINDINGS: ::std::sync::LazyLock<
+                $crate::helpers::config::ConfigBindings<$name<$crate::op_mode::Command>>,
+            > = ::std::sync::LazyLock::new(|| {
+                config_bindings().expect("Failed making bindings for api config")
+            });
+
+            fn config_bindings() -> ::anyhow::Result<
+                $crate::helpers::config::ConfigBindings<$name<$crate::op_mode::Command>>,
+            > {
+                $crate::helpers::config::ConfigBindings::new([
+                    $($crate::helpers::macros::define_schema!(
+                        @binding $name $op [$request] { $($properties)* }
+                    )),*
+                ].into_iter().flatten())
+            }
+
+            pub static OPERATIONS: ::std::sync::LazyLock<Vec<Op>> =
                 ::std::sync::LazyLock::new(ops);
 
             fn ops() -> Vec<Op> {
                 vec![$($crate::helpers::macros::define_schema!(
-                    @metadata $op -> $reply { $($properties)* }
+                    @metadata $op [$request] -> $reply { $($properties)* }
                 )),*]
             }
         }
     };
-    (@binding $name:ident $op:ident { config: $path:literal; $($rest:tt)* }) => {
+    (@binding $name:ident $op:ident [$request:path] { config: $path:literal; $($rest:tt)* }) => {
         Some($crate::helpers::config::Binding {
             path: $path,
-            parse: |value| ::serde_json::from_value::<$op>(value)
+            parse: |value| ::serde_json::from_value::<$request>(value)
                 .map(|parameters| $name::<$crate::op_mode::Command>::$op(parameters, ()))
                 .map_err(::anyhow::Error::from),
-            schema: |generator| generator.subschema_for::<$op>(),
+            schema: |generator| generator.subschema_for::<$request>(),
         })
     };
-    (@binding $name:ident $op:ident { $($properties:tt)* }) => {
+    (@binding $name:ident $op:ident [$request:path] { $($properties:tt)* }) => {
         None
     };
-    (@metadata $op:ident -> $reply:ty {
+    (@metadata $op:ident [$request:path] -> $reply:ty {
         $(config: $config:literal;)?
         $(route: $method:ident / $($segment:ident $(- $suffix:ident)*)/+;)?
         $(cli: $cli:path;)?
@@ -130,10 +132,113 @@ macro_rules! define_schema {
                 method: stringify!($method),
                 path: concat!($("/", stringify!($segment), $("-", stringify!($suffix),)*)+),
             })))?,
-            request: |generator| generator.subschema_for::<$op>(),
+            request: |generator| generator.subschema_for::<$request>(),
             response: |generator| ::core::marker::PhantomData::<$reply>.response_schema(generator),
         }
     };
 }
 
 pub(crate) use define_schema;
+
+#[cfg(all(test, feature = "metadata"))]
+mod tests {
+    use schemars::{JsonSchema, SchemaGenerator};
+    use serde::{Deserialize, Serialize};
+    use serde_json::json;
+
+    use crate::op_mode;
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    pub struct Plain {}
+
+    mod requests {
+        pub mod nested {
+            pub use crate::block::AddDisk;
+        }
+    }
+
+    define_schema! {
+        TestOp {
+            Plain -> ();
+            requests::nested::AddDisk -> Result<(), String> {
+                config: ".machine.disks[]";
+                route: PUT /v1/disks;
+            }
+            crate::logger::UpdateLogger -> ();
+        }
+    }
+
+    #[test]
+    fn request_paths_preserve_variant_names_and_wire_format() {
+        for (key, name) in [
+            ("plain", "Plain"),
+            ("add-disk", "AddDisk"),
+            ("update-logger", "UpdateLogger"),
+        ] {
+            let command: TestOp<op_mode::Command> =
+                serde_json::from_value(json!({ (key): {} })).unwrap();
+            assert!(format!("{command:?}").starts_with(&format!("{name}(")));
+            let serialized = serde_json::to_value(&command).unwrap();
+            let roundtrip: TestOp<op_mode::Command> =
+                serde_json::from_value(serialized.clone()).unwrap();
+            assert_eq!(serde_json::to_value(roundtrip).unwrap(), serialized);
+            assert_eq!(serialized.as_object().unwrap().len(), 1);
+            assert!(serialized.get(key).is_some());
+        }
+    }
+
+    #[test]
+    fn config_bindings_are_reused_without_retaining_parse_state() {
+        let first = ::std::sync::LazyLock::force(&crate::metadata::CONFIG_BINDINGS);
+        let second = ::std::sync::LazyLock::force(&crate::metadata::CONFIG_BINDINGS);
+        assert!(::std::ptr::eq(first, second));
+        assert_eq!(
+            first
+                .parse(json!({ "machine": { "disks": [{}, {}] } }))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(second.parse(json!({})).unwrap().is_empty());
+        assert_eq!(
+            second
+                .parse(json!({ "machine": { "disks": [{}] } }))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn request_paths_preserve_metadata_and_config_bindings() {
+        let operations = &metadata::OPERATIONS;
+        assert_eq!(
+            operations.iter().map(|op| op.name).collect::<Vec<_>>(),
+            ["Plain", "AddDisk", "UpdateLogger"]
+        );
+        let disk = &operations[1];
+        assert_eq!(disk.config, Some(".machine.disks[]"));
+        let route: metadata::Route = disk.route.unwrap();
+        assert_eq!((route.method, route.path), ("PUT", "/v1/disks"));
+        let mut generator = SchemaGenerator::default();
+        assert_eq!(
+            (disk.request)(&mut generator),
+            generator.subschema_for::<crate::block::AddDisk>()
+        );
+        assert_eq!(
+            (disk.response)(&mut generator),
+            generator.subschema_for::<()>()
+        );
+
+        let bindings = &metadata::CONFIG_BINDINGS;
+        let commands = bindings
+            .parse(json!({ "machine": { "disks": [{}] } }))
+            .unwrap();
+        assert!(matches!(commands.as_slice(), [TestOp::AddDisk(_, ())]));
+        let schema = bindings.schema(&mut generator);
+        assert_eq!(
+            schema.as_value()["properties"]["machine"]["properties"]["disks"]["type"],
+            "array"
+        );
+    }
+}

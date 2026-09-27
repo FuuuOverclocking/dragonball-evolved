@@ -1,15 +1,40 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
-use api::logger::UpdateLogger;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
+
+use crate::VmmCommand;
+use crate::logger::UpdateLogger;
+
+static BINDINGS: LazyLock<crate::helpers::config::Config<VmmCommand>> = LazyLock::new(|| {
+    crate::metadata::config_bindings().expect("Failed making bindings for api config")
+});
+
+/// Parse merged operation configuration, with process settings already removed.
+fn parse_vmm_commands(value: serde_json::Value) -> Result<Vec<VmmCommand>> {
+    BINDINGS.parse(value)
+}
+
+pub fn schema(generator: &mut SchemaGenerator) -> Schema {
+    BINDINGS.schema(generator)
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct Config {
-    pub dragonball: DragonballConfig,
-    pub commands: Vec<api::VmmCommand>,
+    pub dragonball: ProcessConfig,
+    pub commands: Vec<VmmCommand>,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let value = parse_config_internal(path, &mut Default::default())?;
+        serde_json::from_value(value)
+            .with_context(|| format!("interpret config fields from {}", path.display()))
+    }
 }
 
 impl<'de> Deserialize<'de> for Config {
@@ -20,9 +45,9 @@ impl<'de> Deserialize<'de> for Config {
         let mut object = Map::<String, Value>::deserialize(deserializer)?;
         let dragonball = match object.remove("dragonball") {
             Some(value) => serde_json::from_value(value).map_err(D::Error::custom)?,
-            None => DragonballConfig::default(),
+            None => ProcessConfig::default(),
         };
-        let commands = api::config::parse(Value::Object(object)).map_err(D::Error::custom)?;
+        let commands = crate::config::parse_vmm_commands(Value::Object(object)).map_err(D::Error::custom)?;
         Ok(Self {
             dragonball,
             commands,
@@ -31,33 +56,26 @@ impl<'de> Deserialize<'de> for Config {
 }
 
 /// Process-level config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
-pub struct DragonballConfig {
+pub struct ProcessConfig {
     /// The ID of the dragonball instance, default to a random string.
-    pub(crate) id: Option<String>,
+    pub id: Option<String>,
 
     /// Launch an API server and specify the path to the api socket.
-    pub(crate) api_sock: Option<PathBuf>,
+    pub api_sock: Option<PathBuf>,
 
     /// Specify the path to the KVM device.
-    pub(crate) kvm_dev: Option<PathBuf>,
+    pub kvm_dev: Option<PathBuf>,
 
     /// Initial logger configuration. Omitted fields use the process defaults.
-    pub(crate) logger: UpdateLogger,
+    pub logger: UpdateLogger,
 }
 
-impl DragonballConfig {
+impl ProcessConfig {
     pub fn id(&self) -> &str {
         self.id.as_deref().unwrap()
     }
-}
-
-pub fn load(path: &Path) -> Result<Config> {
-    let value = parse_config_internal(path, &mut Default::default())?;
-    serde_json::from_value::<Config>(value)
-        .with_context(|| format!("interpret config fields from {}", path.display()))
 }
 
 fn parse_config_internal(path: &Path, visited: &mut HashSet<PathBuf>) -> Result<serde_json::Value> {
@@ -167,6 +185,80 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn config_preserves_dragonball_key_and_commands() {
+        let config: Config = serde_json::from_value(json!({
+            "dragonball": { "id": "from-file", "logger": { "show_tid": false } },
+            "machine": { "disks": [{}] }
+        }))
+        .unwrap();
+
+        assert_eq!(config.dragonball.id(), "from-file");
+        assert_eq!(config.dragonball.logger.show_tid, Some(false));
+        assert!(config.dragonball.api_sock.is_none());
+        assert!(config.dragonball.kvm_dev.is_none());
+        assert!(config.dragonball.logger.level.is_none());
+        assert!(matches!(
+            config.commands.as_slice(),
+            [VmmCommand::AddDisk(_, ())]
+        ));
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["dragonball"]["id"], "from-file");
+        assert!(serialized.get("process").is_none());
+        assert_eq!(serialized["commands"], json!([{ "add-disk": {} }]));
+    }
+
+    #[test]
+    fn config_defaults_do_not_apply_runtime_settings() {
+        let config: Config = serde_json::from_value(json!({})).unwrap();
+        assert!(config.dragonball.id.is_none());
+        assert!(config.dragonball.kvm_dev.is_none());
+        assert!(config.dragonball.logger.level.is_none());
+        assert!(config.commands.is_empty());
+    }
+
+    #[test]
+    fn config_rejects_unknown_and_invalid_process_settings() {
+        for value in [
+            json!({ "process": {} }),
+            json!({ "dragonball": { "unknown": true } }),
+            json!({ "dragonball": { "id": 1 } }),
+            json!({ "dragonball": { "logger": { "target": "invalid" } } }),
+        ] {
+            assert!(serde_json::from_value::<Config>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn config_load_preserves_inheritance_and_metadata() {
+        let dir = TestDir::new();
+        fs::write(
+            dir.join("base.toml"),
+            "[dragonball]\nid = 'parent'\nkvm_dev = '/dev/custom-kvm'\n[[machine.disks]]\n",
+        )
+        .unwrap();
+        let child = dir.join("child.json");
+        fs::write(
+            &child,
+            r#"{
+                "$schema": "unused.schema.json",
+                "extends": "base.toml",
+                "dragonball": {"id": "child"},
+                "machine": {"disks": []}
+            }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&child).unwrap();
+        assert_eq!(config.dragonball.id(), "child");
+        assert_eq!(
+            config.dragonball.kvm_dev.as_deref(),
+            Some(Path::new("/dev/custom-kvm"))
+        );
+        assert!(config.commands.is_empty());
     }
 
     #[test]

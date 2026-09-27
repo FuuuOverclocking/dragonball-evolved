@@ -1,17 +1,18 @@
 use std::error::Error as StdError;
 use std::{fmt, ops};
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
 pub type ApiResult<T, E = ApiError> = std::result::Result<T, E>;
 
 /// An API error containing the original error's display message, not its source chain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
 pub struct ApiError(Message);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
 struct Message {
     error: String,
 }
@@ -86,5 +87,43 @@ impl From<ApiError> for Box<dyn StdError + Send + 'static> {
 impl From<ApiError> for Box<dyn StdError + 'static> {
     fn from(error: ApiError) -> Self {
         Box::new(error.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_conversion_preserves_the_message() {
+        let error = ApiError::from(std::io::Error::other("failure"));
+        assert_eq!(error, ApiError::msg("failure"));
+        assert_eq!(error.to_string(), "failure");
+        let boxed: Box<dyn StdError + Send + Sync> = error.into();
+        assert_eq!(boxed.to_string(), "failure");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn error_wire_format_is_transparent() {
+        let error = ApiError::msg("failure");
+        let value = serde_json::json!({ "error": "failure" });
+        assert_eq!(serde_json::to_value(&error).unwrap(), value);
+        assert_eq!(serde_json::from_value::<ApiError>(value).unwrap(), error);
+        assert!(serde_json::from_value::<ApiError>(serde_json::json!({})).is_err());
+        assert!(serde_json::from_value::<ApiError>(serde_json::json!({ "error": 1 })).is_err());
+    }
+
+    #[cfg(feature = "metadata")]
+    #[test]
+    fn error_schema_preserves_the_message_shape() {
+        let schema = schemars::schema_for!(ApiError).to_value();
+        let reference = schema["$ref"].as_str().unwrap();
+        let message = schema
+            .pointer(reference.strip_prefix('#').unwrap())
+            .unwrap();
+        assert_eq!(message["type"], "object");
+        assert_eq!(message["properties"]["error"]["type"], "string");
+        assert_eq!(message["required"], serde_json::json!(["error"]));
     }
 }
