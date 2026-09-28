@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use api::{Shutdown, VmmRequest};
 use dragonball_evolved::cli::{self, SubCommand};
-use dragonball_evolved::{VERSION_LONG, init};
+use dragonball_evolved::{VERSION_LONG, config, init};
 use logger::{error_unlimited, info_unlimited};
 use vmm::VmmClient;
 
@@ -55,6 +55,12 @@ fn shutdown_on_signal(
     });
 }
 
-async fn run_subcommand(_cmd: SubCommand) -> Result<()> {
+async fn run_subcommand(cmd: SubCommand) -> Result<()> {
+    match cmd {
+        SubCommand::CheckConfig { path } => {
+            let config = config::load(&path)?;
+            println!("{}", serde_json::to_string_pretty(&config)?);
+        }
+    }
     Ok(())
 }

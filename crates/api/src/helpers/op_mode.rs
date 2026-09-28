@@ -38,7 +38,7 @@ mod tests {
     #[test]
     fn command_does_not_need_a_reply_channel() {
         let command: crate::VmmCommand = crate::VmmCommand::AddDisk(Default::default(), ());
-        assert!(matches!(command, crate::VmmCommand::AddDisk(_, ())));
+        assert!(matches!(command.clone(), crate::VmmCommand::AddDisk(_, ())));
     }
 
     #[cfg(feature = "request")]

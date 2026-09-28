@@ -3,8 +3,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use api::ProcessConfig;
 use api::metadata::OPERATIONS;
-use api::{Config, ProcessConfig};
 use clap::{Parser, Subcommand};
 use heck::ToLowerCamelCase;
 use schemars::generate::SchemaSettings;
@@ -12,7 +12,7 @@ use schemars::{Schema, SchemaGenerator};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
-#[command(about = "Export API documents or validate a configuration without starting a VMM")]
+#[command(about = "Export API JSON Schema and OpenAPI documents")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -24,29 +24,18 @@ enum Command {
         #[arg(long, default_value = "dist/schema")]
         output_dir: PathBuf,
     },
-    Check {
-        path: PathBuf,
-    },
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
-        Command::Export { output_dir } => {
-            let documents = generate()?;
-            let schema = serde_json::to_string_pretty(&documents.schema)? + "\n";
-            let openapi = serde_yaml::to_string(&documents.openapi)?;
-            fs::create_dir_all(&output_dir)
-                .with_context(|| format!("create {}", output_dir.display()))?;
-            for (name, content) in [("vm.schema.json", schema), ("openapi.yaml", openapi)] {
-                let path = output_dir.join(name);
-                fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
-                println!("{}", path.display());
-            }
-        }
-        Command::Check { path } => {
-            let config = Config::load(&path)?;
-            println!("{}", serde_json::to_string_pretty(&config)?);
-        }
+    let Command::Export { output_dir } = Cli::parse().command;
+    let documents = generate()?;
+    let schema = serde_json::to_string_pretty(&documents.schema)? + "\n";
+    let openapi = serde_yaml::to_string(&documents.openapi)?;
+    fs::create_dir_all(&output_dir).with_context(|| format!("create {}", output_dir.display()))?;
+    for (name, content) in [("vm.schema.json", schema), ("openapi.yaml", openapi)] {
+        let path = output_dir.join(name);
+        fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+        println!("{}", path.display());
     }
     Ok(())
 }
@@ -249,20 +238,16 @@ mod tests {
     }
 
     #[test]
-    fn command_parses_export_and_check() {
+    fn command_parses_export() {
         for (args, expected) in [
             (vec!["api-schema", "export"], "dist/schema"),
             (
                 vec!["api-schema", "export", "--output-dir", "output directory"],
                 "output directory",
             ),
-            (vec!["api-schema", "check", "missing.toml"], "missing.toml"),
         ] {
-            let path = match Cli::try_parse_from(args).unwrap().command {
-                Command::Export { output_dir } => output_dir,
-                Command::Check { path } => path,
-            };
-            assert_eq!(path, PathBuf::from(expected));
+            let Command::Export { output_dir } = Cli::try_parse_from(args).unwrap().command;
+            assert_eq!(output_dir, PathBuf::from(expected));
         }
     }
 
@@ -271,6 +256,7 @@ mod tests {
         for args in [
             vec!["api-schema"],
             vec!["api-schema", "check"],
+            vec!["api-schema", "check", "vm.toml"],
             vec!["api-schema", "export", "--output-dir"],
             vec!["api-schema", "unknown"],
             vec!["api-schema", "--config", "missing.toml", "export"],

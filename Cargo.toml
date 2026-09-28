@@ -58,14 +58,15 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-api = { workspace = true, features = ["request"] }
-clap = { workspace = true, features = ["env"] }
+api = { workspace = true, features = ["request", "serde"] }
+clap = { workspace = true, features = ["derive", "env"] }
 logger.workspace = true
 logger-backend.workspace = true
 names.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true
 vmm.workspace = true
 vmm-sys-util.workspace = true
 

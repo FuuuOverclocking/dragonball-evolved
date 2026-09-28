@@ -1,16 +1,17 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Error, Result, anyhow};
-#[cfg(feature = "metadata")]
+#[cfg(feature = "schema")]
 use schemars::{Schema, SchemaGenerator, json_schema};
-#[cfg(feature = "metadata")]
+use serde::de::Error as _;
+use serde::de::value::Error;
+#[cfg(feature = "schema")]
 use serde_json::Map;
 use serde_json::Value;
 
 pub(crate) struct Binding<C> {
     pub path: &'static str,
-    pub parse: fn(Value) -> Result<C>,
-    #[cfg(feature = "metadata")]
+    pub parse: fn(Value) -> Result<C, Error>,
+    #[cfg(feature = "schema")]
     pub schema: fn(&mut SchemaGenerator) -> Schema,
 }
 
@@ -32,7 +33,7 @@ pub(crate) struct ConfigBindings<C> {
 }
 
 impl<C> ConfigBindings<C> {
-    pub(crate) fn new(bindings: impl IntoIterator<Item = Binding<C>>) -> Result<Self> {
+    pub(crate) fn new(bindings: impl IntoIterator<Item = Binding<C>>) -> Result<Self, Error> {
         let mut config = Self {
             root: Node::default(),
             entries: Vec::new(),
@@ -40,9 +41,9 @@ impl<C> ConfigBindings<C> {
         for binding in bindings {
             let path = binding.path.strip_suffix("[]").unwrap_or(binding.path);
             let many = path != binding.path;
-            let segments = path
-                .strip_prefix('.')
-                .ok_or_else(|| anyhow!("config binding must start with '.': {path}"))?;
+            let segments = path.strip_prefix('.').ok_or_else(|| {
+                Error::custom(format_args!("config binding must start with '.': {path}"))
+            })?;
             let mut node = &mut config.root;
             for segment in segments.split('.') {
                 if segment.is_empty()
@@ -50,18 +51,20 @@ impl<C> ConfigBindings<C> {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
                 {
-                    return Err(Error::msg(format!(
+                    return Err(Error::custom(format_args!(
                         "invalid config binding: {}",
                         binding.path
                     )));
                 }
                 if node.binding.is_some() {
-                    return Err(Error::msg(format!("overlapping config binding: {path}")));
+                    return Err(Error::custom(format_args!(
+                        "overlapping config binding: {path}"
+                    )));
                 }
                 node = node.children.entry(segment).or_default();
             }
             if node.binding.is_some() || !node.children.is_empty() {
-                return Err(Error::msg(format!(
+                return Err(Error::custom(format_args!(
                     "duplicate or overlapping config binding: {path}"
                 )));
             }
@@ -75,7 +78,7 @@ impl<C> ConfigBindings<C> {
         Ok(config)
     }
 
-    pub(crate) fn parse(&self, value: Value) -> Result<Vec<C>> {
+    pub(crate) fn parse(&self, value: Value) -> Result<Vec<C>, Error> {
         let mut values = vec![None; self.entries.len()];
         self.root.collect(value, "", &mut values)?;
 
@@ -86,29 +89,32 @@ impl<C> ConfigBindings<C> {
             };
             if entry.many {
                 let Value::Array(items) = value else {
-                    return Err(Error::msg(format!("{}: expected an array", entry.path)));
+                    return Err(Error::custom(format_args!(
+                        "{}: expected an array",
+                        entry.path
+                    )));
                 };
                 for (index, item) in items.into_iter().enumerate() {
                     commands.push((entry.binding.parse)(item).map_err(|error| {
-                        Error::msg(format!("{}[{index}]: {error}", entry.path))
+                        Error::custom(format_args!("{}[{index}]: {error}", entry.path))
                     })?);
                 }
             } else {
                 commands.push(
                     (entry.binding.parse)(value)
-                        .map_err(|error| Error::msg(format!("{}: {error}", entry.path)))?,
+                        .map_err(|error| Error::custom(format_args!("{}: {error}", entry.path)))?,
                 );
             }
         }
         Ok(commands)
     }
 
-    #[cfg(feature = "metadata")]
+    #[cfg(feature = "schema")]
     pub(crate) fn schema(&self, generator: &mut SchemaGenerator) -> Schema {
         self.node_schema(&self.root, generator)
     }
 
-    #[cfg(feature = "metadata")]
+    #[cfg(feature = "schema")]
     fn node_schema(&self, node: &Node, generator: &mut SchemaGenerator) -> Schema {
         if let Some(index) = node.binding {
             let entry = &self.entries[index];
@@ -139,13 +145,13 @@ impl<C> ConfigBindings<C> {
 }
 
 impl Node {
-    fn collect(&self, value: Value, path: &str, values: &mut [Option<Value>]) -> Result<()> {
+    fn collect(&self, value: Value, path: &str, values: &mut [Option<Value>]) -> Result<(), Error> {
         if let Some(index) = self.binding {
             values[index] = Some(value);
             return Ok(());
         }
         let Value::Object(object) = value else {
-            return Err(Error::msg(format!(
+            return Err(Error::custom(format_args!(
                 "{}: expected an object",
                 if path.is_empty() { "." } else { path },
             )));
@@ -155,7 +161,7 @@ impl Node {
             let child = self
                 .children
                 .get(key.as_str())
-                .ok_or_else(|| Error::msg(format!("unknown config field: {path}")))?;
+                .ok_or_else(|| Error::custom(format_args!("unknown config field: {path}")))?;
             child.collect(value, &path, values)?;
         }
         Ok(())
@@ -171,8 +177,8 @@ mod tests {
     fn binding(path: &'static str) -> Binding<u64> {
         Binding {
             path,
-            parse: |value| serde_json::from_value(value).map_err(Error::from),
-            #[cfg(feature = "metadata")]
+            parse: |value| serde_json::from_value(value).map_err(Error::custom),
+            #[cfg(feature = "schema")]
             schema: |generator| generator.subschema_for::<u64>(),
         }
     }
@@ -197,7 +203,7 @@ mod tests {
 
     #[test]
     fn invalid_configuration_reports_the_field_path() {
-        let config = ConfigBindings::new([binding(".machine.disks[]")]).unwrap();
+        let config = ConfigBindings::new([binding(".machine.disks[]"), binding(".z")]).unwrap();
         for (value, message) in [
             (json!(null), ".: expected an object"),
             (json!({ "machine": null }), ".machine: expected an object"),
@@ -211,16 +217,14 @@ mod tests {
             ),
             (
                 json!({ "machine": { "disks": ["invalid"] } }),
-                ".machine.disks[0]:",
+                ".machine.disks[0]: invalid type: string \"invalid\", expected u64",
+            ),
+            (
+                json!({ "z": "invalid" }),
+                ".z: invalid type: string \"invalid\", expected u64",
             ),
         ] {
-            assert!(
-                config
-                    .parse(value)
-                    .unwrap_err()
-                    .to_string()
-                    .contains(message)
-            );
+            assert_eq!(config.parse(value).unwrap_err().to_string(), message);
         }
     }
 
@@ -237,7 +241,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "metadata")]
+    #[cfg(feature = "schema")]
     #[test]
     fn schema_preserves_object_and_array_shapes() {
         let config = ConfigBindings::new([binding(".machine.disks[]"), binding(".z")]).unwrap();

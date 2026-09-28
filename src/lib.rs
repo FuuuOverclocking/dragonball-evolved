@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod config;
 pub mod init;
 
 pub const VERSION: &str = env!("VERSION");

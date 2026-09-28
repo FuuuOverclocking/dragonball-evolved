@@ -26,10 +26,8 @@ pub fn init(cfg: &Config) -> Result<(FlushGuard, impl Future<Output = ()> + Send
     expand_fdtable().context("pre-expand fd table")?;
 
     // Setup logger. This also installs the crash log handlers.
-    let logger_config = logger_backend::Config::from_api(
-        cfg.dragonball.logger.clone(),
-        Some(cfg.dragonball.id().to_owned()),
-    );
+    let logger_config =
+        logger_backend::Config::from_api(cfg.dragonball.logger.clone(), cfg.dragonball.id.clone());
     let flush_guard = logger_backend::init(logger_config).context("setup logger")?;
 
     // Setup panic hook.

@@ -7,7 +7,7 @@ SCHEMA_DIR ?= $(DIST)/schema
 CONFIG     ?= examples/vm.toml
 PYTHON     ?= python3
 
-.PHONY: all build schema-export schema-check schema-verify release test fmt fmt-check clippy lint clean distclean help
+.PHONY: all build schema-export schema-check schema-verify release test api-features fmt fmt-check clippy lint clean distclean help
 
 all: build
 
@@ -18,13 +18,24 @@ schema-export:
 	cargo run -p api-schema -- export --output-dir "$(SCHEMA_DIR)"
 
 schema-check:
-	cargo run -p api-schema -- check "$(CONFIG)"
+	cargo run -p dragonball-evolved -- check-config "$(CONFIG)"
 
 schema-verify: schema-export
 	"$(PYTHON)" scripts/verify-schema.py "$(SCHEMA_DIR)"
 
 test:
 	cargo test --workspace
+
+api-features:
+	@set -eu; \
+	for request in '' request; do \
+	for serde in '' serde; do \
+	for schema in '' schema; do \
+		features="$$request $$serde $$schema"; \
+		printf '\nAPI features: [%s]\n' "$$features"; \
+		cargo clippy -p api --no-default-features --features "$$features" --all-targets -- -D warnings; \
+		cargo test -p api --no-default-features --features "$$features"; \
+	done; done; done
 
 fmt:
 	cargo +nightly fmt --all
@@ -62,6 +73,7 @@ help:
 	@echo 'schema-verify  export and validate OpenAPI 3.1 + JSON Schema (PYTHON selects environment)'
 	@echo 'release        build, split debuginfo into a standalone file'
 	@echo 'test           cargo test --workspace'
+	@echo 'api-features   clippy + test all 8 API feature combinations'
 	@echo 'lint           fmt-check + clippy -D warnings'
 	@echo 'clean          cargo clean'
 	@echo 'distclean      clean + remove $(DIST)/'

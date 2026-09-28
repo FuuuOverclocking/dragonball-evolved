@@ -194,7 +194,14 @@ impl Config {
 
         Self {
             id,
-            level,
+            level: level.map(|level| match level {
+                api::logger::LevelFilter::Off => LevelFilter::Off,
+                api::logger::LevelFilter::Error => LevelFilter::Error,
+                api::logger::LevelFilter::Warn => LevelFilter::Warn,
+                api::logger::LevelFilter::Info => LevelFilter::Info,
+                api::logger::LevelFilter::Debug => LevelFilter::Debug,
+                api::logger::LevelFilter::Trace => LevelFilter::Trace,
+            }),
             target: target.map(convert_target),
             crash_target: crash_target.map(|target| match target {
                 api::logger::CrashTarget::SameAsLog => CrashTarget::SameAsLog,

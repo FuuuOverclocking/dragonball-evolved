@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
-#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateLogger {
     /// Lowest enabled log level: off, error, warn, info, debug or trace (case-insensitive).
     pub level: Option<LevelFilter>,
@@ -32,9 +32,9 @@ pub struct UpdateLogger {
     feature = "serde",
     serde(rename_all = "lowercase", try_from = "String")
 )]
-#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(
-    feature = "metadata",
+    feature = "schema",
     schemars(
         with = "String",
         extend("pattern" = "^([Oo][Ff][Ff]|[Ee][Rr][Rr][Oo][Rr]|[Ww][Aa][Rr][Nn]|[Ii][Nn][Ff][Oo]|[Dd][Ee][Bb][Uu][Gg]|[Tt][Rr][Aa][Cc][Ee])$")
@@ -70,7 +70,7 @@ impl TryFrom<String> for LevelFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum Format {
     #[default]
     Text,
@@ -81,9 +81,9 @@ pub enum Format {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String"))]
-#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(
-    feature = "metadata",
+    feature = "schema",
     schemars(with = "String", extend("pattern" = r"^(stderr|file=[\s\S]+)$"))
 )]
 pub enum Target {
@@ -126,9 +126,9 @@ impl serde::Serialize for Target {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String"))]
-#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(
-    feature = "metadata",
+    feature = "schema",
     schemars(
         with = "String",
         extend("pattern" = r"^(same_as_log|stderr|file=[\s\S]+)$")

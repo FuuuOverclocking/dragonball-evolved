@@ -1,8 +1,10 @@
 mod helpers;
 
 pub mod block;
+pub mod config;
 pub mod logger;
 
+pub use crate::config::{Config, ProcessConfig};
 use crate::helpers::macros::define_schema;
 use crate::helpers::op_mode;
 #[cfg(feature = "request")]

@@ -1,7 +1,10 @@
+#[cfg(feature = "schema")]
 use std::marker::PhantomData;
 
+#[cfg(feature = "schema")]
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 
+#[cfg(feature = "schema")]
 pub(crate) trait ResponseSchema: Sized {
     type Body: JsonSchema;
 
@@ -11,10 +14,12 @@ pub(crate) trait ResponseSchema: Sized {
 }
 
 // Autoref provides the ordinary-type fallback without overlapping the Result implementation.
+#[cfg(feature = "schema")]
 impl<T: JsonSchema> ResponseSchema for &PhantomData<T> {
     type Body = T;
 }
 
+#[cfg(feature = "schema")]
 impl<T: JsonSchema, E> ResponseSchema for PhantomData<Result<T, E>> {
     type Body = T;
 }
@@ -24,7 +29,9 @@ pub struct Op {
     pub name: &'static str,
     pub config: Option<&'static str>,
     pub route: Option<Route>,
+    #[cfg(feature = "schema")]
     pub request: fn(&mut SchemaGenerator) -> Schema,
+    #[cfg(feature = "schema")]
     pub response: fn(&mut SchemaGenerator) -> Schema,
 }
 

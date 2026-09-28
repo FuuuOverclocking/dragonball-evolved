@@ -7,12 +7,12 @@ pub type ApiResult<T, E = ApiError> = std::result::Result<T, E>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
-#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ApiError(Message);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "metadata", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct Message {
     error: String,
 }
@@ -114,7 +114,7 @@ mod tests {
         assert!(serde_json::from_value::<ApiError>(serde_json::json!({ "error": 1 })).is_err());
     }
 
-    #[cfg(feature = "metadata")]
+    #[cfg(feature = "schema")]
     #[test]
     fn error_schema_preserves_the_message_shape() {
         let schema = schemars::schema_for!(ApiError).to_value();
