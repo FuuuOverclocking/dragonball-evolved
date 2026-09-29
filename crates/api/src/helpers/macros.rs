@@ -28,6 +28,22 @@ macro_rules! define_schema {
             $($op($request, M::Reply<$reply>),)*
         }
 
+        #[cfg(all(feature = "request", feature = "serde"))]
+        impl $name<$crate::op_mode::Command> {
+            pub fn into_request(self) -> ($name<$crate::op_mode::Request>, $crate::ReplyWaiter) {
+                use core::marker::PhantomData;
+                use $crate::helpers::op_mode::{SerializeReply as _, into_request};
+
+                match self {
+                    $(Self::$op(parameters, ()) => into_request(
+                        parameters,
+                        $name::$op,
+                        |reply| PhantomData::<$reply>.serialize_reply(reply),
+                    ),)*
+                }
+            }
+        }
+
         impl ::core::clone::Clone for $name<$crate::op_mode::Command> {
             fn clone(&self) -> Self {
                 match self {
@@ -83,66 +99,63 @@ macro_rules! define_schema {
         }
 
         pub mod metadata {
-            #[cfg(feature = "serde")]
+            #![allow(unused)]
+
+            use core::marker::PhantomData;
+
             use super::*;
-
+            #[cfg(feature = "serde")]
+            use crate::helpers::config;
             #[cfg(feature = "schema")]
-            #[allow(unused)]
-            use $crate::helpers::metadata::ResponseSchema as _;
-            pub use $crate::helpers::metadata::{Op, Route};
+            use crate::helpers::metadata::ResponseSchema as _;
+            pub use crate::helpers::metadata::Route;
+            use crate::helpers::{metadata as meta, op_mode};
+
+            pub type Op = meta::Op<super::$name<$crate::op_mode::Command>>;
+
+            pub static OPERATIONS: &[Op] = &[
+                $($crate::helpers::macros::define_schema!(
+                    @metadata $name $op [$request] -> $reply { $($properties)* }
+                )),*
+            ];
+
+            const _: () = meta::validate(OPERATIONS);
 
             #[cfg(feature = "serde")]
-            pub(crate) static CONFIG_BINDINGS: ::std::sync::LazyLock<
-                $crate::helpers::config::ConfigBindings<$name<$crate::op_mode::Command>>,
-            > = ::std::sync::LazyLock::new(|| {
-                $crate::helpers::config::ConfigBindings::new([
-                    $($crate::helpers::macros::define_schema!(
-                        @binding $name $op [$request] { $($properties)* }
-                    )),*
-                ].into_iter().flatten()).expect("Failed making bindings for api config")
-            });
-
-            pub static OPERATIONS: ::std::sync::LazyLock<Vec<Op>> =
-                ::std::sync::LazyLock::new(ops);
-
-            fn ops() -> Vec<Op> {
-                vec![$($crate::helpers::macros::define_schema!(
-                    @metadata $op [$request] -> $reply { $($properties)* }
-                )),*]
-            }
+            pub(crate) static CONFIG_BINDINGS: config::ConfigBindings<
+                $name<op_mode::Command>,
+                { config::node_count(OPERATIONS) },
+            > = config::ConfigBindings::new(OPERATIONS);
         }
     };
-    (@binding $name:ident $op:ident [$request:path] { config: $path:literal; $($rest:tt)* }) => {
-        Some($crate::helpers::config::Binding {
-            path: $path,
-            parse: |value| ::serde_json::from_value::<$request>(value)
-                .map(|parameters| $name::<$crate::op_mode::Command>::$op(parameters, ()))
-                .map_err(::serde::de::Error::custom),
-            #[cfg(feature = "schema")]
-            schema: |generator| generator.subschema_for::<$request>(),
-        })
-    };
-    (@binding $name:ident $op:ident [$request:path] { $($properties:tt)* }) => {
-        None
-    };
-    (@metadata $op:ident [$request:path] -> $reply:ty {
+    (@metadata $name:ident $op:ident [$request:path] -> $reply:ty {
         $(config: $config:literal;)?
         $(route: $method:ident / $($segment:ident $(- $suffix:ident)*)/+;)?
         $(cli: $cli:path;)?
     }) => {
-        $crate::helpers::metadata::Op {
+        Op {
             name: stringify!($op),
-            config: None $(.or(Some($config)))?,
-            route: None $(.or(Some($crate::helpers::metadata::Route {
-                method: stringify!($method),
-                path: concat!($("/", stringify!($segment), $("-", stringify!($suffix),)*)+),
-            })))?,
+            config: $crate::helpers::macros::define_schema!(@option $($config)?),
+            route: $crate::helpers::macros::define_schema!(@option $(
+                Route {
+                    method: stringify!($method),
+                    path: concat!($("/", stringify!($segment), $("-", stringify!($suffix),)*)+),
+                }
+            )?),
+            #[cfg(feature = "serde")]
+            parse: |input| input.deserialize::<$request>()
+                .map(|parameters| $name::<op_mode::Command>::$op(parameters, ()))
+                .map_err(serde::de::Error::custom),
+            #[cfg(not(feature = "serde"))]
+            _command: PhantomData,
             #[cfg(feature = "schema")]
             request: |generator| generator.subschema_for::<$request>(),
             #[cfg(feature = "schema")]
-            response: |generator| ::core::marker::PhantomData::<$reply>.response_schema(generator),
+            response: |generator| PhantomData::<$reply>.response_schema(generator),
         }
     };
+    (@option) => { None };
+    (@option $value:expr) => { Some($value) };
 }
 
 pub(crate) use define_schema;
@@ -204,8 +217,8 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn config_bindings_are_reused_without_retaining_parse_state() {
-        let first = ::std::sync::LazyLock::force(&metadata::CONFIG_BINDINGS);
-        let second = ::std::sync::LazyLock::force(&metadata::CONFIG_BINDINGS);
+        let first = &metadata::CONFIG_BINDINGS;
+        let second = &metadata::CONFIG_BINDINGS;
         assert!(::std::ptr::eq(first, second));
         assert_eq!(
             first
@@ -238,6 +251,32 @@ mod tests {
         ];
         for (command, op) in commands.iter().zip(operations.iter()) {
             assert!(format!("{:?}", command.clone()).starts_with(op.name));
+            #[cfg(feature = "serde")]
+            {
+                let parsed = (op.parse)(json!({}).into()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(parsed).unwrap(),
+                    serde_json::to_value(command).unwrap()
+                );
+                assert!((op.parse)(json!(null).into()).is_err());
+            }
+            #[cfg(all(feature = "request", feature = "serde"))]
+            {
+                let (request, _waiter) = command.clone().into_request();
+                assert!(format!("{request:?}").starts_with(op.name));
+            }
+        }
+        #[cfg(feature = "serde")]
+        {
+            let parsed =
+                (operations[2].parse)(json!({ "level": "warn", "show_tid": false }).into())
+                    .unwrap();
+            let TestOp::UpdateLogger(parameters, ()) = parsed else {
+                panic!("expected UpdateLogger");
+            };
+            assert_eq!(parameters.level, Some(crate::logger::LevelFilter::Warn));
+            assert_eq!(parameters.show_tid, Some(false));
+            assert!((operations[2].parse)(json!({ "unknown": true }).into()).is_err());
         }
         assert_eq!(operations[0].config, None);
         assert_eq!(operations[0].route, None);
@@ -259,7 +298,7 @@ mod tests {
             );
             assert_eq!(
                 (disk.response)(&mut generator),
-                generator.subschema_for::<()>()
+                generator.subschema_for::<Result<(), String>>()
             );
 
             let bindings = &metadata::CONFIG_BINDINGS;

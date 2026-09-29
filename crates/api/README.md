@@ -1,6 +1,6 @@
 # API 代码生成
 
-> 声明: 本文为古法制造!
+> 声明: 本文为古法编制!
 
 这个 crate 将展示通过 API 的编译时反射, 生成 1) 自描述的 metadata, 2) 配置文件 schema, 3) RESTful API 和 4) CLI/REPL.
 

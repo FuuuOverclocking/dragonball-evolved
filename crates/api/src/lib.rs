@@ -6,9 +6,13 @@ pub mod logger;
 
 pub use crate::config::{Config, ProcessConfig};
 use crate::helpers::macros::define_schema;
+#[cfg(feature = "serde")]
+pub use crate::helpers::metadata::ParseInput;
 use crate::helpers::op_mode;
 #[cfg(feature = "request")]
 pub use crate::helpers::op_mode::Reply;
+#[cfg(all(feature = "request", feature = "serde"))]
+pub use crate::helpers::op_mode::ReplyWaiter;
 pub use crate::helpers::result::{ApiError, ApiResult};
 
 #[cfg(feature = "request")]

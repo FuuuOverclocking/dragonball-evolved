@@ -3,9 +3,7 @@
     - dbcli
 - api server
     - http server 本体: hyper-uds (外部)
-    - 擦除后的 reply waiter
 - op /metadata
 - main
     - 重排和调整 vmm commands, 然后执行
-杂项
-    - 把更多工作放到编译时
+- README 改名 technical.md, 然后增加一篇真正的 README, 并说明新添加 api 时的注意事项
