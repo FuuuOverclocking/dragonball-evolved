@@ -11,21 +11,22 @@ pub struct Config {
 }
 
 #[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for Config {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+impl Config {
+    pub fn parse(value: serde_json::Value) -> Result<Self, serde::de::value::Error> {
         use serde::de::Error as _;
-        use serde_json::{Map, Value};
+        use serde::de::value::Error;
+        use serde_json::Value;
 
-        let mut object = Map::<String, Value>::deserialize(deserializer)?;
+        let Value::Object(mut object) = value else {
+            return Err(Error::custom("expected a config object"));
+        };
         let dragonball = match object.remove("dragonball") {
             Some(value) => serde_json::from_value(value).map_err(|error| {
-                D::Error::custom(format_args!("parse process config (.dragonball): {error}"))
+                Error::custom(format_args!("parse process config (.dragonball): {error}"))
             })?,
             None => ProcessConfig::default(),
         };
-        let commands = crate::metadata::CONFIG_BINDINGS
-            .parse(Value::Object(object))
-            .map_err(D::Error::custom)?;
+        let commands = crate::metadata::CONFIG_BINDINGS.parse(Value::Object(object))?;
         Ok(Self {
             dragonball,
             commands,

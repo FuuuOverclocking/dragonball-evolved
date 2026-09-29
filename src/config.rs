@@ -7,8 +7,7 @@ use api::Config;
 
 pub fn load(path: &Path) -> Result<Config> {
     let value = parse_config_internal(path, &mut Default::default())?;
-    serde_json::from_value(value)
-        .with_context(|| format!("interpret config fields from {}", path.display()))
+    Config::parse(value).with_context(|| format!("interpret config fields from {}", path.display()))
 }
 
 fn parse_config_internal(path: &Path, visited: &mut HashSet<PathBuf>) -> Result<serde_json::Value> {
