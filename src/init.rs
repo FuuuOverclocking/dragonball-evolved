@@ -35,7 +35,9 @@ pub fn init(cfg: &Config) -> Result<(FlushGuard, impl Future<Output = ()> + Send
 
     // Install signal handlers and return a future that will resolve
     // when a SIGINT or SIGTERM is received.
-    Ok((flush_guard, setup_signal_handlers()?))
+    let shutdown_signal = setup_signal_handlers()?;
+
+    Ok((flush_guard, shutdown_signal))
 }
 
 fn setup_panic_hook() {

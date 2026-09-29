@@ -6,11 +6,11 @@ use anyhow::{Context, Result, bail};
 use api::Config;
 
 pub fn load(path: &Path) -> Result<Config> {
-    let value = parse_config_internal(path, &mut Default::default())?;
+    let value = load_config_value(path, &mut Default::default())?;
     Config::parse(value).with_context(|| format!("interpret config fields from {}", path.display()))
 }
 
-fn parse_config_internal(path: &Path, visited: &mut HashSet<PathBuf>) -> Result<serde_json::Value> {
+fn load_config_value(path: &Path, visited: &mut HashSet<PathBuf>) -> Result<serde_json::Value> {
     let path = path
         .canonicalize()
         .with_context(|| format!("canonicalize config path {}", path.display()))?;
@@ -46,7 +46,7 @@ fn parse_config_internal(path: &Path, visited: &mut HashSet<PathBuf>) -> Result<
 
         let parent_dir = path.parent().unwrap_or(Path::new(""));
         let base_path = parent_dir.join(extends_str);
-        let mut base_value = parse_config_internal(&base_path, visited).with_context(|| {
+        let mut base_value = load_config_value(&base_path, visited).with_context(|| {
             format!(
                 "parse base config {} extended by {}",
                 base_path.display(),
