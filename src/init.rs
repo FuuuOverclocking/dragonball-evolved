@@ -3,7 +3,7 @@ use std::os::fd::RawFd;
 use std::{io, panic};
 
 use anyhow::{Context, Result};
-use api::Config;
+use api::config::Config;
 use logger::{error_unlimited, info_unlimited};
 use logger_backend::FlushGuard;
 use rustix::event::{EventfdFlags, eventfd};

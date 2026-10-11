@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use api::{Shutdown, VmmRequest};
-use dragonball_evolved::cli::{self, SubCommand};
-use dragonball_evolved::{VERSION_LONG, config, init};
+use api::VmmRequest;
+use api::instance_info::InstanceInfo;
+use dragonball_evolved::cli::ParsedConfig;
+use dragonball_evolved::{VERSION, VERSION_LONG, cli, cmds, init};
 use logger::{error_unlimited, info_unlimited};
 use vmm::VmmClient;
 
@@ -12,7 +13,7 @@ async fn main() -> Result<()> {
 
     // Run subcommands that do not require starting a VMM.
     if let Some(cmd) = subcommand {
-        return run_subcommand(cmd).await;
+        return cmds::run_subcommand(cmd).await;
     }
 
     // Setup environment, including signal handling, logging, etc.
@@ -21,7 +22,12 @@ async fn main() -> Result<()> {
     info_unlimited!("Dragonball starting, version = {VERSION_LONG}, config = {cfg:?}");
 
     // Spawn a new thread to start vmm.
-    let vmm_client = vmm::start(cfg.dragonball.id().into()).context("start vmm")?;
+    let vmm_client = vmm::start(InstanceInfo {
+        id: cfg.id().into(),
+        version: VERSION.into(),
+        ..Default::default()
+    })
+    .context("start vmm")?;
 
     // Shutdown vmm when receiving SIGINT or SIGTERM.
     shutdown_on_signal(shutdown_signal, vmm_client.clone());
@@ -29,6 +35,9 @@ async fn main() -> Result<()> {
     // Configure the VM, then boot or restore if required.
 
     // Start API server if the API socket path is provided.
+    if let Some(sock) = &cfg.dragonball.api_sock {
+        info_unlimited!("API server started, listening on {}", sock.display());
+    }
 
     // Wait for the VMM thread to finish.
     match vmm_client.async_join_vmm_thread().await {
@@ -49,18 +58,8 @@ fn shutdown_on_signal(
 ) {
     tokio::task::spawn_local(async move {
         shutdown_signal.await;
-        let _ = vmm_client
-            .request_async(|reply| VmmRequest::Shutdown(Shutdown {}, reply))
-            .await;
+        // let _ = vmm_client
+        //     .request_async(|reply| VmmRequest::Shutdown(Shutdown {}, reply))
+        //     .await;
     });
-}
-
-async fn run_subcommand(cmd: SubCommand) -> Result<()> {
-    match cmd {
-        SubCommand::CheckConfig { path } => {
-            let config = config::load(&path)?;
-            println!("{}", serde_json::to_string_pretty(&config)?);
-        }
-    }
-    Ok(())
 }

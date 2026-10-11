@@ -3,7 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use api::{Answer, InstanceInfo, Reply, VmmRequest};
+use api::{RawVmmOp, VmmRequest};
 use tokio::sync::mpsc;
 
 use crate::VmmExitStatus;
@@ -20,19 +20,29 @@ impl VmmServer {
     }
 }
 
+/// Cloneable VMM request sender; clones share a single-use join handle and keep the request channel open.
 #[derive(Clone)]
 pub struct VmmClient {
     pub(crate) thread_handle: Arc<Mutex<Option<thread::JoinHandle<VmmExitStatus>>>>,
-    pub(crate) instance_info: Arc<InstanceInfo>,
     pub(crate) tx: mpsc::UnboundedSender<VmmRequest>,
 }
 
 impl VmmClient {
+    fn take_thread_handle(&self) -> Result<thread::JoinHandle<VmmExitStatus>> {
+        self.thread_handle
+            .lock()
+            .map_err(|e| anyhow!("lock vmm thread handle: {e}"))?
+            .take()
+            .context("vmm thread handle was already taken")
+    }
+
+    /// Blocks for exit without requesting shutdown; errors on a poisoned/taken handle or a panicked VMM thread.
     pub fn join_vmm_thread(&self) -> Result<VmmExitStatus> {
         let handle = self.take_thread_handle()?;
         handle.join().map_err(|_| anyhow!("vmm thread panicked"))
     }
 
+    /// Like [`Self::join_vmm_thread`] via Tokio's blocking pool; once started, cancellation forfeits the result.
     pub async fn async_join_vmm_thread(&self) -> Result<VmmExitStatus> {
         let handle = self.take_thread_handle()?;
         tokio::task::spawn_blocking(move || {
@@ -42,71 +52,202 @@ impl VmmClient {
         .context("join tokio blocking task")?
     }
 
-    pub fn instance_info(&self) -> &InstanceInfo {
-        &self.instance_info
-    }
-
     /// Hand a request that already carries its own reply channel to the vmm thread.
     ///
     /// Success says the request was queued and nothing more: whether the operation
     /// ran, and what it produced, is still only what its reply says. An error means
     /// the vmm is gone, so the request it took with it will never be answered.
-    pub fn enqueue(&self, request: VmmRequest) -> Result<()> {
+    pub fn send(&self, request: VmmRequest) -> Result<()> {
         self.tx
             .send(request)
             .map_err(|_| anyhow!("vmm server is no longer running"))
     }
 
-    /// Send a request and block until the vmm answers.
-    ///
-    /// The closure builds the request around the reply channel created here, which
-    /// is what ties the answer's type to the operation:
-    /// `client.request(|reply| VmmRequest::Status(Status {}, reply))` yields a
-    /// `VmmStatus`, and nothing else can come back.
-    ///
-    /// These three methods stay generic rather than growing a typed wrapper per
-    /// request, so a request enum with dozens of variants does not turn into
-    /// dozens of near-identical client methods.
-    pub fn request<T>(&self, request: impl FnOnce(Reply<T>) -> VmmRequest) -> Result<T> {
-        self.send(request)?
-            .recv()
-            .context("vmm dropped the reply channel")
+    /// Blocks for a typed reply; channel failures are outer errors, while operation results stay in `Resp`.
+    pub fn call<Req, Resp>(&self, request: Req) -> Result<Resp>
+    where
+        Req: RawVmmOp<Response = Resp>,
+    {
+        let (op, rx) = request.into_vmm_request();
+        self.send(op)?;
+        rx.recv().context("receive vmm reply")
     }
 
-    pub fn request_timeout<T>(
-        &self,
-        request: impl FnOnce(Reply<T>) -> VmmRequest,
-        timeout: Duration,
-    ) -> Result<T> {
-        self.send(request)?
-            .recv_timeout(timeout)
-            .context("recv vmm reply")
+    /// Like [`Self::call`], but limits reply waiting after enqueueing; timeout does not cancel the operation.
+    pub fn call_timeout<Req, Resp>(&self, request: Req, timeout: Duration) -> Result<Resp>
+    where
+        Req: RawVmmOp<Response = Resp>,
+    {
+        let (op, rx) = request.into_vmm_request();
+        self.send(op)?;
+        rx.recv_timeout(timeout).context("receive vmm reply")
     }
 
-    pub async fn request_async<T>(
-        &self,
-        request: impl FnOnce(Reply<T>) -> VmmRequest,
-    ) -> Result<T> {
-        self.send(request)?
-            .await
-            .context("vmm dropped the reply channel")
+    /// Like [`Self::call`] without blocking; dropping its future after enqueueing does not cancel the operation.
+    pub async fn call_async<Req, Resp>(&self, request: Req) -> Result<Resp>
+    where
+        Req: RawVmmOp<Response = Resp>,
+    {
+        let (op, rx) = request.into_vmm_request();
+        self.send(op)?;
+        rx.await.context("receive vmm reply")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use api::block::AddDisk;
+    use api::instance_info::{GetInstanceInfo, InstanceInfo, VmState};
+
+    use super::*;
+
+    fn client_server() -> (VmmClient, VmmServer) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            VmmClient {
+                thread_handle: Arc::new(Mutex::new(None)),
+                tx,
+            },
+            VmmServer(rx),
+        )
     }
 
-    /// Hand a request to the vmm thread and return the channel its reply arrives
-    /// on.
-    ///
-    /// Safe to call from any thread, and it neither blocks nor needs a runtime.
-    fn send<T>(&self, request: impl FnOnce(Reply<T>) -> VmmRequest) -> Result<Answer<T>> {
-        let (reply, answer) = api::reply_channel();
-        self.enqueue(request(reply))?;
-        Ok(answer)
+    fn instance_info() -> InstanceInfo {
+        InstanceInfo {
+            id: "test-vm".into(),
+            version: "1.0".into(),
+            state: VmState::Running,
+        }
     }
 
-    fn take_thread_handle(&self) -> Result<thread::JoinHandle<VmmExitStatus>> {
-        self.thread_handle
-            .lock()
-            .map_err(|e| anyhow!("lock vmm thread handle: {e}"))?
-            .take()
-            .context("vmm thread handle was already taken")
+    fn respond(request: VmmRequest) {
+        match request {
+            VmmRequest::GetInstanceInfo(_, reply) => reply.send(instance_info()),
+            VmmRequest::AddDisk(_, reply) => reply.send(Err(api::ApiError::msg("disk failed"))),
+            _ => panic!("unexpected request"),
+        }
+    }
+
+    #[test]
+    fn sync_calls_preserve_responses_and_operation_errors() {
+        for with_timeout in [false, true] {
+            let (client, mut server) = client_server();
+            let worker = thread::spawn(move || {
+                respond(server.0.blocking_recv().unwrap());
+                respond(server.0.blocking_recv().unwrap());
+            });
+            let info = if with_timeout {
+                client.call_timeout(GetInstanceInfo, Duration::from_secs(5))
+            } else {
+                client.call(GetInstanceInfo)
+            };
+            assert_eq!(info.unwrap(), instance_info());
+            let result = if with_timeout {
+                client.call_timeout(AddDisk {}, Duration::from_secs(5))
+            } else {
+                client.call(AddDisk {})
+            };
+            assert_eq!(result.unwrap(), Err(api::ApiError::msg("disk failed")));
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_calls_preserve_responses_and_operation_errors() {
+        let (client, mut server) = client_server();
+        let worker = tokio::spawn(async move {
+            respond(server.next_request().await.unwrap());
+            respond(server.next_request().await.unwrap());
+        });
+        assert_eq!(
+            client.call_async(GetInstanceInfo).await.unwrap(),
+            instance_info()
+        );
+        assert_eq!(
+            client.call_async(AddDisk {}).await.unwrap(),
+            Err(api::ApiError::msg("disk failed"))
+        );
+        worker.await.unwrap();
+    }
+
+    #[test]
+    fn sync_calls_reject_a_stopped_server() {
+        let (client, server) = client_server();
+        drop(server);
+        for result in [
+            client.call(GetInstanceInfo),
+            client.call_timeout(GetInstanceInfo, Duration::ZERO),
+        ] {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "vmm server is no longer running"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_calls_reject_a_stopped_server() {
+        let (client, server) = client_server();
+        drop(server);
+        let error = client.call_async(GetInstanceInfo).await.unwrap_err();
+        assert_eq!(error.to_string(), "vmm server is no longer running");
+    }
+
+    #[test]
+    fn sync_calls_report_a_dropped_reply() {
+        for with_timeout in [false, true] {
+            let (client, mut server) = client_server();
+            let worker = thread::spawn(move || drop(server.0.blocking_recv().unwrap()));
+            let error = if with_timeout {
+                client.call_timeout(GetInstanceInfo, Duration::from_secs(5))
+            } else {
+                client.call(GetInstanceInfo)
+            }
+            .unwrap_err();
+            if with_timeout {
+                assert_eq!(
+                    error.downcast_ref::<oneshot::RecvTimeoutError>(),
+                    Some(&oneshot::RecvTimeoutError::Disconnected)
+                );
+            } else {
+                assert!(error.is::<oneshot::RecvError>());
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_calls_report_a_dropped_reply() {
+        let (client, mut server) = client_server();
+        let worker = tokio::spawn(async move { drop(server.next_request().await.unwrap()) });
+        let error = client.call_async(GetInstanceInfo).await.unwrap_err();
+        assert!(error.is::<oneshot::RecvError>());
+        worker.await.unwrap();
+    }
+
+    #[test]
+    fn sync_timeout_keeps_the_request_queued_and_tolerates_a_late_reply() {
+        for timeout in [Duration::ZERO, Duration::from_millis(10)] {
+            let (client, mut server) = client_server();
+            let error = client.call_timeout(GetInstanceInfo, timeout).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<oneshot::RecvTimeoutError>(),
+                Some(&oneshot::RecvTimeoutError::Timeout)
+            );
+            respond(server.0.try_recv().unwrap());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_async_call_keeps_the_request_queued_and_tolerates_a_late_reply() {
+        for timeout in [Duration::ZERO, Duration::from_millis(10)] {
+            let (client, mut server) = client_server();
+            assert!(
+                tokio::time::timeout(timeout, client.call_async(GetInstanceInfo))
+                    .await
+                    .is_err()
+            );
+            respond(server.0.try_recv().unwrap());
+        }
     }
 }

@@ -236,7 +236,15 @@ pub(crate) const fn validate<C>(operations: &[Op<C>]) {
                     || str_eq(route.method, "TRACE"),
                 "unsupported HTTP method; use an uppercase standard method"
             );
-            validate_segments(route.path, b'/');
+            if !str_eq(route.path, "/") {
+                let bytes = route.path.as_bytes();
+                let path = if bytes.len() > 1 && bytes[bytes.len() - 1] == b'/' {
+                    route.path.split_at(bytes.len() - 1).0
+                } else {
+                    route.path
+                };
+                validate_segments(path, b'/');
+            }
             let mut previous = 0;
             while previous < index {
                 if let Some(other) = operations[previous].route {

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::VmmCommand;
 use crate::logger::UpdateLogger;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Config {
     pub dragonball: ProcessConfig,

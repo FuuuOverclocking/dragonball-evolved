@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use api::Config;
+use api::config::Config;
 
 pub fn load(path: &Path) -> Result<Config> {
     let value = load_config_value(path, &mut Default::default())?;

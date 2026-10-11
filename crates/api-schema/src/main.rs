@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use api::ProcessConfig;
+use api::config::ProcessConfig;
 use api::metadata::OPERATIONS;
 use clap::{Parser, Subcommand};
 use heck::ToLowerCamelCase;

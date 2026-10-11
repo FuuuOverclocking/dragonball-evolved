@@ -2,6 +2,9 @@
 /target
 /dist
 
+# Python
+__pycache__/
+
 # Editors
 .vscode/
 

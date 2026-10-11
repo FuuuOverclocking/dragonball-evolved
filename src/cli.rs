@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use api::Config;
+use api::config::Config;
 use api::logger::{CrashTarget, Format, LevelFilter, Target};
 use clap::{Parser, Subcommand};
 
@@ -118,28 +118,28 @@ impl Cli {
             .context("parse config file")?
             .unwrap_or_default();
 
-        self.patch_config(&mut config);
+        patch_config(self, &mut config);
         apply_defaults(&mut config);
         Ok((config, None))
     }
+}
 
-    fn patch_config(self, cfg: &mut Config) {
-        let dragonball = &mut cfg.dragonball;
-        dragonball.id = self.id.or(dragonball.id.take());
-        dragonball.api_sock = self.api_sock.or(dragonball.api_sock.take());
-        dragonball.kvm_dev = self.kvm_dev.or(dragonball.kvm_dev.take());
+fn patch_config(cli: Cli, cfg: &mut Config) {
+    let dragonball = &mut cfg.dragonball;
+    dragonball.id = cli.id.or(dragonball.id.take());
+    dragonball.api_sock = cli.api_sock.or(dragonball.api_sock.take());
+    dragonball.kvm_dev = cli.kvm_dev.or(dragonball.kvm_dev.take());
 
-        let logger = &mut dragonball.logger;
-        logger.level = self.log_level.or(logger.level.take());
-        logger.target = self.log_target.or(logger.target.take());
-        logger.crash_target = self.log_crash_target.or(logger.crash_target.take());
-        logger.format = self.log_format.or(logger.format.take());
-        logger.show_tid = self.log_show_tid.or(logger.show_tid.take());
-        logger.show_thread_name = self.log_show_thread_name.or(logger.show_thread_name.take());
-        logger.show_target = self.log_show_target.or(logger.show_target.take());
-        logger.show_file_line = self.log_show_file_line.or(logger.show_file_line.take());
-        logger.show_id = self.log_show_id.or(logger.show_id.take());
-    }
+    let logger = &mut dragonball.logger;
+    logger.level = cli.log_level.or(logger.level.take());
+    logger.target = cli.log_target.or(logger.target.take());
+    logger.crash_target = cli.log_crash_target.or(logger.crash_target.take());
+    logger.format = cli.log_format.or(logger.format.take());
+    logger.show_tid = cli.log_show_tid.or(logger.show_tid.take());
+    logger.show_thread_name = cli.log_show_thread_name.or(logger.show_thread_name.take());
+    logger.show_target = cli.log_show_target.or(logger.show_target.take());
+    logger.show_file_line = cli.log_show_file_line.or(logger.show_file_line.take());
+    logger.show_id = cli.log_show_id.or(logger.show_id.take());
 }
 
 fn apply_defaults(cfg: &mut Config) {
@@ -160,11 +160,22 @@ fn apply_defaults(cfg: &mut Config) {
     logger.show_id.get_or_insert(true);
 }
 
+pub trait ParsedConfig {
+    fn id(&self) -> &str;
+}
+
+impl ParsedConfig for Config {
+    fn id(&self) -> &str {
+        // OK to unwrap, because set in `fn apply_defaults`.
+        self.dragonball.id.as_deref().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use api::ProcessConfig;
+    use api::config::ProcessConfig;
     use api::logger::UpdateLogger;
     use clap::{CommandFactory, FromArgMatches};
 
@@ -268,7 +279,7 @@ mod tests {
         ])
         .unwrap();
 
-        args.patch_config(&mut config);
+        patch_config(args, &mut config);
         apply_defaults(&mut config);
 
         assert_eq!(config.dragonball.id.as_deref(), Some("from-file"));

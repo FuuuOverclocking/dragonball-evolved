@@ -70,7 +70,7 @@ help:
 	@echo 'build          cargo build (debug)'
 	@echo 'schema-export  export vm.schema.json and openapi.yaml into SCHEMA_DIR'
 	@echo 'schema-check   parse CONFIG and print process settings and commands'
-	@echo 'schema-verify  export and validate OpenAPI 3.1 + JSON Schema (PYTHON selects environment)'
+	@echo 'schema-verify  export and validate OpenAPI 3.1 + JSON Schema (auto-setup target/.venv; PYTHON selects bootstrap interpreter)'
 	@echo 'release        build, split debuginfo into a standalone file'
 	@echo 'test           cargo test --workspace'
 	@echo 'api-features   clippy + test all 8 API feature combinations'

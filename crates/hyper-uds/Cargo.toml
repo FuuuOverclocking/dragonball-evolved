@@ -1,0 +1,21 @@
+[package]
+name = "hyper-uds"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Small HTTP/1.1 JSON RPC over Unix sockets with file descriptor passing"
+
+[features]
+default = []
+json = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+http = "1"
+httparse = "1.10"
+libc = "0.2"
+tokio = { version = "1.40", default-features = false, features = ["net"] }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.40", default-features = false, features = ["rt"] }

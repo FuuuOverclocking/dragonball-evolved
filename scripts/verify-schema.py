@@ -3,6 +3,8 @@ import json
 import sys
 from pathlib import Path
 
+from setup import setup
+
 
 def references(value):
     if isinstance(value, dict):
@@ -16,19 +18,12 @@ def references(value):
 
 
 def verify(directory):
-    try:
-        import yaml
-        from jsonschema import Draft202012Validator
-        from jsonschema_path import SchemaPath
-        from openapi_spec_validator import OpenAPIV31SpecValidator
-        from referencing import Registry, Resource
-        from referencing.jsonschema import DRAFT202012
-    except ImportError as error:
-        raise RuntimeError(
-            f"Missing validation dependency: {error}. "
-            "Install openapi-spec-validator==0.9.0 in your Python environment "
-            "and select it with make schema-verify PYTHON=/path/to/python."
-        ) from error
+    import yaml
+    from jsonschema import Draft202012Validator
+    from jsonschema_path import SchemaPath
+    from openapi_spec_validator import OpenAPIV31SpecValidator
+    from referencing import Registry, Resource
+    from referencing.jsonschema import DRAFT202012
 
     schema_path = directory.resolve() / "vm.schema.json"
     openapi_path = directory.resolve() / "openapi.yaml"
@@ -67,6 +62,7 @@ def main():
     )
     args = parser.parse_args()
     try:
+        setup(["openapi-spec-validator==0.9.0"])
         verify(args.directory)
     except Exception as error:
         print(f"schema verification failed: {error}", file=sys.stderr)
