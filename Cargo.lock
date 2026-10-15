@@ -62,10 +62,20 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "api"
 version = "0.1.0"
 dependencies = [
+ "api-macros",
  "oneshot",
  "schemars",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "api-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

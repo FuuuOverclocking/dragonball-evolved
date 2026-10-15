@@ -3,10 +3,11 @@ pub mod helpers;
 pub mod block;
 pub mod config;
 pub mod instance_info;
-pub mod logger;
 pub mod live_upgrade;
+pub mod logger;
 
-use crate::helpers::macros::define_schema;
+use api_macros::define_schema;
+
 use crate::helpers::op_mode;
 #[cfg(feature = "request")]
 pub use crate::helpers::reply::Reply;
@@ -37,7 +38,7 @@ define_schema! {
             route: PUT /v1/disks;
         }
         live_upgrade::HandoverState -> ApiResult<live_upgrade::LiveUpgradeState> {
-            route: POST /v1/live_upgrade/handover_state;
+            route: POST /v1/live-upgrade/handover-state;
             fd_in: resp;
         }
     }

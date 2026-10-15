@@ -1,7 +1,6 @@
 #[cfg(feature = "serde")]
 pub(crate) mod config;
 pub mod fd;
-pub(crate) mod macros;
 pub(crate) mod metadata;
 pub(crate) mod op_mode;
 #[cfg(feature = "request")]
