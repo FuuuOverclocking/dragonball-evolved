@@ -13,7 +13,7 @@ mod transport;
 pub use body::{Body, Fds};
 pub use client::Client;
 pub use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version, header};
-pub use server::serve_connection;
+pub use server::{serve, serve_connection};
 pub use tokio::net::{UnixListener, UnixStream};
 
 // Linux limits a single SCM_RIGHTS message to SCM_MAX_FD descriptors.

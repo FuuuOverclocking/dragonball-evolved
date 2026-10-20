@@ -3,6 +3,7 @@ pub mod helpers;
 pub mod block;
 pub mod config;
 pub mod instance_info;
+pub mod lifecycle;
 pub mod live_upgrade;
 pub mod logger;
 
@@ -37,6 +38,7 @@ define_schema! {
             config: ".machine.disks[]";
             route: PUT /v1/disks;
         }
+        lifecycle::Shutdown -> ApiResult<()>;
         live_upgrade::HandoverState -> ApiResult<live_upgrade::LiveUpgradeState> {
             route: POST /v1/live-upgrade/handover-state;
             fd_in: resp;

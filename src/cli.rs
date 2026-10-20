@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use api::config::Config;
@@ -102,26 +102,23 @@ pub enum SubCommand {
 }
 
 pub fn parse() -> Result<(Config, Option<SubCommand>)> {
-    Cli::parse().into_config()
-}
+    let cli = Cli::parse();
 
-impl Cli {
-    fn into_config(self) -> Result<(Config, Option<SubCommand>)> {
-        if let Some(subcommand) = self.subcommand {
-            return Ok((Config::default(), Some(subcommand)));
-        }
-        let mut config = self
-            .config
-            .as_deref()
-            .map(config::load)
-            .transpose()
-            .context("parse config file")?
-            .unwrap_or_default();
-
-        patch_config(self, &mut config);
-        apply_defaults(&mut config);
-        Ok((config, None))
+    if let Some(subcommand) = cli.subcommand {
+        return Ok((Config::default(), Some(subcommand)));
     }
+
+    let mut config = cli
+        .config
+        .as_deref()
+        .map(config::load)
+        .transpose()
+        .context("parse config file")?
+        .unwrap_or_default();
+
+    patch_config(cli, &mut config);
+    apply_defaults(&mut config);
+    Ok((config, None))
 }
 
 fn patch_config(cli: Cli, cfg: &mut Config) {
@@ -162,12 +159,18 @@ fn apply_defaults(cfg: &mut Config) {
 
 pub trait ParsedConfig {
     fn id(&self) -> &str;
+    fn kvm_dev(&self) -> &Path;
 }
 
 impl ParsedConfig for Config {
     fn id(&self) -> &str {
         // OK to unwrap, because set in `fn apply_defaults`.
         self.dragonball.id.as_deref().unwrap()
+    }
+
+    fn kvm_dev(&self) -> &Path {
+        // OK to unwrap, because set in `fn apply_defaults`.
+        self.dragonball.kvm_dev.as_deref().unwrap()
     }
 }
 
@@ -199,15 +202,12 @@ mod tests {
     }
 
     #[test]
-    fn check_config_parses_without_loading_a_file() {
-        let args = parse_cli(["dragonball-evolved", "check-config", "missing.toml"]).unwrap();
-        let (config, subcommand) = args.into_config().unwrap();
-        let Some(SubCommand::CheckConfig { path }) = subcommand else {
+    fn check_config_parses_path() {
+        let cli = parse_cli(["dragonball-evolved", "check-config", "missing.toml"]).unwrap();
+        let Some(SubCommand::CheckConfig { path }) = cli.subcommand else {
             panic!("expected configuration check");
         };
         assert_eq!(path, PathBuf::from("missing.toml"));
-        assert!(config.dragonball.id.is_none());
-        assert!(config.dragonball.logger.level.is_none());
     }
 
     #[test]
@@ -242,15 +242,18 @@ mod tests {
 
     #[test]
     fn run_without_subcommand_applies_defaults() {
-        let args = parse_cli(["dragonball-evolved"]).unwrap();
-        let (config, subcommand) = args.into_config().unwrap();
-        assert!(subcommand.is_none());
-        assert!(config.dragonball.id.is_some());
-        assert_eq!(
-            config.dragonball.kvm_dev.as_deref(),
-            Some(Path::new("/dev/kvm"))
-        );
+        let cli = parse_cli(["dragonball-evolved"]).unwrap();
+        assert!(cli.subcommand.is_none());
+
+        let mut config = Config::default();
+        patch_config(cli, &mut config);
+        apply_defaults(&mut config);
+
+        assert!(!config.id().is_empty());
+        assert_eq!(config.kvm_dev(), Path::new("/dev/kvm"));
         assert_eq!(config.dragonball.logger.level, Some(LevelFilter::Info));
+        assert_eq!(config.dragonball.logger.target, Some(Target::Stderr));
+        assert_eq!(config.dragonball.logger.format, Some(Format::Text));
     }
 
     #[test]

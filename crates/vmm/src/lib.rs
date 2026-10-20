@@ -1,12 +1,13 @@
 pub mod devices;
 mod exit_status;
+mod kvm_context;
+mod process_ctx;
 mod vmm_server;
 
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
-use api::instance_info::InstanceInfo;
 use api::{Reply, VmmRequest};
 use logger::{info_unlimited, warn_unlimited};
 use tokio::select;
@@ -14,15 +15,17 @@ use tokio::sync::mpsc;
 
 use crate::devices::{DeviceExit, DeviceManager};
 pub use crate::exit_status::VmmExitStatus;
+pub use crate::kvm_context::KvmContext;
+pub use crate::process_ctx::ProcessCtx;
 pub use crate::vmm_server::VmmClient;
 use crate::vmm_server::VmmServer;
 
-pub fn start(info: InstanceInfo) -> Result<VmmClient> {
+pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     let thread_handle = thread::Builder::new()
         .name("vmm-main".into())
-        .spawn(move || vmm_main(VmmServer(rx), info))
+        .spawn(move || vmm_main(VmmServer(rx), ctx))
         .context("spawn vmm-main thread")?;
 
     Ok(VmmClient {
@@ -32,7 +35,7 @@ pub fn start(info: InstanceInfo) -> Result<VmmClient> {
 }
 
 #[tokio::main(flavor = "local")]
-async fn vmm_main(mut server: VmmServer, mut info: InstanceInfo) -> VmmExitStatus {
+async fn vmm_main(mut server: VmmServer, process_ctx: ProcessCtx) -> VmmExitStatus {
     let mut devices = DeviceManager::default();
 
     let (status, shutdown_reply) = loop {

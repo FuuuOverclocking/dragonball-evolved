@@ -1,3 +1,4 @@
+use std::future::{Future, pending};
 use std::io;
 
 use http::header::{
@@ -177,14 +178,32 @@ impl Connection {
         transport::send(&self.stream, &self.write, body).await
     }
 
-    pub(crate) async fn receive(&mut self, mut head: Incoming<'_>) -> io::Result<Option<bool>> {
+    pub(crate) async fn receive(&mut self, head: Incoming<'_>) -> io::Result<Option<bool>> {
+        self.receive_with_shutdown(head, pending()).await
+    }
+
+    pub(crate) async fn receive_with_shutdown(
+        &mut self,
+        mut head: Incoming<'_>,
+        shutdown: impl Future<Output = ()>,
+    ) -> io::Result<Option<bool>> {
+        tokio::pin!(shutdown);
         let request = matches!(head, Incoming::Request(_));
         let mut filled = 0;
         let mut fds = Fds::default();
         let end = loop {
             let mut next_fds = Fds::default();
-            let n =
-                transport::receive(&self.stream, &mut self.read[filled..], &mut next_fds).await?;
+            let receive = transport::receive(&self.stream, &mut self.read[filled..], &mut next_fds);
+            // Once the first bytes arrive, shutdown must not truncate the request.
+            let n = if filled == 0 {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => return Ok(None),
+                    received = receive => received?,
+                }
+            } else {
+                receive.await?
+            };
             if n == 0 {
                 return if filled == 0 && next_fds.is_empty() {
                     Ok(None)
