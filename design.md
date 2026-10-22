@@ -213,61 +213,110 @@ enum Vm {
     Paused(Machine),
 }
 
+enum Controller {
+    Idle(Vm),
+    Busy { stable: VmState, operation: Operation },
+}
+
+struct Operation {
+    future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>>,
+    reply: Option<Reply<ApiResult<()>>>,
+    cancel_tx: Option<oneshot::Sender<()>>,
+}
+
 enum Event {
-    Machine(MachineEvent),      // vCPU 退出、guest 复位、设备退出；NotStarted 时永不就绪
     Request(Option<VmmRequest>),
+    Machine(MachineEvent),
+    Device(DeviceExit),
 }
 
 enum MachineEvent {
     GuestReset,                           // i8042 0xFE、三重故障
     VcpuFailed { index: u8, error: String },
-    DeviceExit(DeviceExit),
 }
 ```
 
 `Machine` 拥有一次启动所需的全部运行时资源：`VmFd`、guest memory、两条 Bus、vCPU 句柄、`DeviceManager`（含 io 线程）、`MachineEvent` 接收端。
 
+**`Controller`** 是主循环实际持有的顶层状态。`Idle(Vm)` 时，`Vm` 拥有 `Machine`。`Busy` 时，`Machine` 的所有权已移入 `Operation` 的 future 中，外层只记住转入前的 `stable: VmState`（`NotStarted` / `Running` / `Paused`）。
+
+- **Idle**：主循环对机器事件和请求做 `select!`，全部处理逻辑在 `handle_idle` 中穷举。
+- **Busy**：一个生命周期操作（Pause / Resume / Start 的 vCPU resume 阶段）正在进行中。主循环对操作 future 和请求做 biased `select!`。查询与 `UpdateLogger` 仍立即处理；其他写 / 生命周期请求返回错误 `"lifecycle operation in progress"`。`GetInstanceInfo` 返回 `stable` 中记录的前一稳定态。操作完成后带回 `Machine`，Controller 回到 `Idle`。
+
+`Operation` 的 future 是 `'static + !Send` 的 `Pin<Box<dyn Future>>`，因此不需要 tokio `Send` bound，可安全地在 `LocalRuntime` 上 `.await`。`cancel_tx` 用于 Shutdown 时中断操作：发送后，future 内的 `select!` 立即退出并归还 `Machine`。
+
 ### 4.2 主循环
 
 ```rust
-let mut vm = Vm::NotStarted(MachineSpec::default());
-let (vm, mut status) = loop {
-    let event = select! {
-        biased;
-        event = vm.next_event() => event,
-        request = server.next_request() => Event::Request(request),
-    };
-    match vm.handle(event, &ctx).await {
-        (next, Step::Continue) => vm = next,
-        (next, Step::Stop(status)) => break (next, status),
+let mut controller = Controller::new(MachineSpec::default());
+let mut status = 'main: loop {
+    match controller {
+        Controller::Idle(mut vm) => {
+            let event = select! {
+                biased;
+                event = vm.next_event() => event,
+                request = server.next_request() => Event::Request(request),
+            };
+            let (next, step) = handle_idle(vm, event, &ctx).await;
+            match step {
+                Step::Continue => controller = next,
+                Step::Stop(s) => { controller = next; break s; }
+            }
+        }
+        Controller::Busy { stable, mut operation } => {
+            let (next, step) = select! {
+                biased;
+                completion = &mut operation.future => {
+                    complete_operation(stable, operation, completion)
+                }
+                request = server.next_request() => {
+                    match handle_busy_request(stable, operation, request) {
+                        BusyAction::Continue(op) => {
+                            controller = Controller::Busy { stable, operation: op };
+                            continue;
+                        }
+                        BusyAction::Shutdown(mut op) => {
+                            let completion = op.future.await;
+                            // 向生命周期请求者发送中断错误
+                            if let Some(reply) = op.reply.take() { reply.send(Err(..)); }
+                            (Controller::Idle(vm_from_state(stable, completion.machine)),
+                             Step::Stop(VmmExitStatus::Ok))
+                        }
+                    }
+                }
+            };
+            match step {
+                Step::Continue => controller = next,
+                Step::Stop(s) => { controller = next; break 'main s; }
+            }
+        }
     }
 };
-server.close();
-if let Err(error) = vm.teardown().await {
+drop(server);
+if let Err(error) = controller.teardown().await {
     status = VmmExitStatus::Error(format!("teardown: {error:#}"));
 }
 status
 ```
 
-`Vm::handle` 在识别 `Shutdown` 时先发送成功回复，再返回 `Step::Stop`；reply 不进入 `Step`，也不参与 teardown。
-
-- 机器事件排在请求之前：guest 已经复位时，不再处理排队的请求。
-- `handle` 消费旧状态、返回新状态，没有 `&mut` 共享。`select!` 的借用在得出 `Event` 时已经结束（沿用现有注释中的理由）。
+- **Idle 分支**：机器事件排在请求之前（biased `select!`），guest 已经复位时不再处理排队的请求。`handle_idle` 消费旧 `Vm`、返回新 `Controller`。生命周期请求（Pause / Resume / Start 的 vCPU resume）将 `Machine` 移入 `Operation`，返回 `Controller::Busy`。
+- **Busy 分支**：操作 future 排在请求之前。future 完成时，`complete_operation` 将 `Machine` 交还给 `Vm`，回到 `Idle`。请求到达时，`handle_busy_request` 只处理查询、`UpdateLogger` 和 `Shutdown`，其余返回错误。`Shutdown` 发送 cancel 后返回 `BusyAction::Shutdown`，主循环等待 future 完成，归还 Machine，以 `Idle` 状态进入 teardown。
+- `select!` 的借用在得出 `Event` / completion / request 时已经结束，`handle_*` 消费旧状态、返回新状态，没有 `&mut` 共享。
 
 ### 4.3 请求 × 状态
 
-| 请求                                       | NotStarted                             | Running            | Paused             |
-| ------------------------------------------ | -------------------------------------- | ------------------ | ------------------ |
-| 配置类（cpus / memory / console / kernel / disk） | `spec.apply(op)`                | 错误：已启动（E9） | 错误：已启动       |
-| `Start`                                    | validate → plan → build → resume → Running | 错误           | 错误               |
-| `Pause`                                    | 错误：未启动                           | 暂停 vCPU → Paused | 成功（幂等）       |
-| `Resume`                                   | 错误：未启动                           | 成功（幂等）       | 恢复 vCPU → Running |
-| `Shutdown`                                 | 回复“已接收”，然后退出                 | 回复“已接收”，然后拆除并退出 | 同左               |
-| `GetInstanceInfo`                          | 纯查询                                 | 纯查询             | 纯查询             |
-| `UpdateLogger`                             | 进程级副作用，与 VM 状态无关            | 同左               | 同左               |
-| `HandoverState`                            | unsupported（E10）                     | 同左               | 同左               |
+| 请求                                       | NotStarted                             | Running            | Paused             | Busy                          |
+| ------------------------------------------ | -------------------------------------- | ------------------ | ------------------ | ----------------------------- |
+| 配置类（cpus / memory / console / kernel / disk） | `spec.apply(op)`                | 错误：已启动（E9） | 错误：已启动       | 错误：操作进行中              |
+| `Start`                                    | validate → plan → build → Busy(resume) | 错误               | 错误               | 错误：操作进行中              |
+| `Pause`                                    | 错误：未启动                           | → Busy(pause)      | 成功（幂等）       | 错误：操作进行中              |
+| `Resume`                                   | 错误：未启动                           | 成功（幂等）       | → Busy(resume)     | 错误：操作进行中              |
+| `Shutdown`                                 | 回复”已接收”，然后退出                 | 回复”已接收”，然后拆除并退出 | 同左               | 回复”已接收”，cancel → teardown |
+| `GetInstanceInfo`                          | 纯查询                                 | 纯查询             | 纯查询             | 返回 `stable`（前一稳定态）   |
+| `UpdateLogger`                             | 进程级副作用，与 VM 状态无关            | 同左               | 同左               | 同左                          |
+| `HandoverState`                            | unsupported（E10）                     | 同左               | 同左               | 同左                          |
 
-不合法的组合直接以错误回复，状态不变。
+不合法的组合直接以错误回复，状态不变。Busy 时的错误回复文本为 `”lifecycle operation in progress”`。
 
 ### 4.4 机器事件
 
@@ -281,11 +330,20 @@ status
 
 不变量：任何还可能写 guest memory 的组件仍在运行时，不释放这块内存。
 
+**从 Idle 状态拆除**（Shutdown 或 GuestReset）：
+
 1. **接收 `Shutdown` 时回复**：立即发送 `Ok(())`，只确认请求已进入停止流程；然后关闭请求入口。
 2. **停 vCPU**：向全部 vCPU 发 `Stop` 并踢出 → `.await` 每个线程的"已退出"通知 → 在 blocking pool 中 `join`。
-3. **停设备**：广播 `Stop`（已有 `watch`）→ `.await` 全部 `DeviceExit`（含 io 线程上的）→ 结束 io 线程。
+3. **停设备**：`devices.stop()`——设置 stop watch，向全部 guest gate 发 `Stop`，`.await` 全部 `DeviceExit`（含 io 线程上的）→ 结束 io 线程。
 4. **drop `Machine`**：Bus 与 transport、ioeventfd/irqfd 注册、`VmFd`。
 5. **释放 guest memory**：最后一个 `Arc` 在这里释放。拆除结果写入最终 `VmmExitStatus`，不再修改已经发送的 Shutdown 回复。
+
+**从 Busy 状态拆除**（Shutdown 到达时有操作在执行）：
+
+1. **回复 `Ok(())`**：同上。
+2. **Cancel**：发送 `cancel_tx`，操作 future 内的 biased `select!` 立即退出，归还 `Machine`。
+3. **向生命周期请求发送中断错误**：被中断的 Pause / Resume / Start 的 reply 收到 `"interrupted by shutdown"`。
+4. **Controller 回到 `Idle`**，随后执行上述 Idle 拆除流程。
 
 ## 5. vCPU
 
@@ -333,28 +391,43 @@ enum VcpuCommand {
 
 ### 5.3 运行循环
 
+vCPU 线程的 `run_once()` 返回三种结果：
+
+```rust
+enum RunResult {
+    Handled,      // I/O 退出已在本线程同步处理完毕
+    Interrupted,  // EINTR / Intr：需要检查控制命令
+    Stop,         // 终结性退出（GuestReset、VcpuFailed）
+}
+```
+
+状态迁移：
+
 ```text
 Paused   ──Resume──▶ 回复，进入 Running
-Paused   ──Pause───▶ 回复，保持 Paused
+Paused   ──Pause───▶ 回复，保持 Paused（幂等）
 Paused   ──Stop────▶ 线程结束
-Running  ──KVM_RUN 返回 EINTR──▶ 清 immediate_exit，try_recv 取出全部命令：
+Running  ──run_once() → Handled────▶ 直接再次进入 KVM_RUN（不检查命令）
+Running  ──run_once() → Interrupted──▶ 清 immediate_exit，try_recv 取出全部命令：
              Pause  → 回复，进入 Paused
              Resume → 回复，继续运行
              Stop   → 线程结束
              无命令 → 重新进入 KVM_RUN
+Running  ──run_once() → Stop──▶ 线程结束
 ```
 
-| `KVM_RUN` 结果                         | 处理                                                        |
-| -------------------------------------- | ----------------------------------------------------------- |
-| `IoIn` / `IoOut`                       | PIO Bus。未命中时读返回 0、写忽略，打限速日志                |
-| `MmioRead` / `MmioWrite`               | MMIO Bus，未命中处理同上                                     |
-| `Shutdown`（三重故障）                 | 发 `GuestReset`，线程结束                                    |
-| `SystemEvent(SHUTDOWN / RESET)`        | 同上                                                         |
-| `FailEntry` / `InternalError` / 其他   | 发 `VcpuFailed`，线程结束（内核态 irqchip 下 `Hlt` 不应出现，归入此类） |
-| `Err(EINTR)`                           | 见上图                                                       |
-| `Err(EAGAIN)`                          | 重新进入                                                     |
+| `KVM_RUN` 结果                         | `RunResult` | 处理                                                        |
+| -------------------------------------- | ----------- | ----------------------------------------------------------- |
+| `IoIn` / `IoOut`                       | `Handled`   | PIO Bus。未命中时读返回 0、写忽略，打限速日志                |
+| `MmioRead` / `MmioWrite`              | `Handled`   | MMIO Bus，未命中处理同上                                     |
+| `Shutdown`（三重故障）                 | `Stop`      | 发 `GuestReset`，线程结束                                    |
+| `SystemEvent(SHUTDOWN / RESET)`        | `Stop`      | 同上                                                         |
+| `FailEntry` / `InternalError` / 其他   | `Stop`      | 发 `VcpuFailed`，线程结束（内核态 irqchip 下 `Hlt` 不应出现，归入此类） |
+| `Intr`                                 | `Interrupted` | 见上图                                                     |
+| `Err(EINTR)`                           | `Interrupted` | 见上图                                                     |
+| `Err(EAGAIN)`                          | `Handled`   | 重新进入                                                     |
 
-**已知限制**：暂停时没有补完进行中的 MMIO/PIO（快照前需要带着 `immediate_exit` 再进入一次 `KVM_RUN`）。本阶段没有快照，不做。
+**关键语义**：MMIO/PIO 退出返回 `Handled`，直接再次 `KVM_RUN`，不检查命令队列。只有 `EINTR` / `Intr`（由踢出信号或进程信号引起）才触发命令处理。这保证了 Pause 的 ACK 发出时，该 vCPU 上所有 pending 的 userspace I/O（MMIO/PIO 分发）已经完成：如果 Pause 信号在 MMIO/PIO 处理期间到达，处理先完成，然后 re-enter `KVM_RUN`，此时 `immediate_exit` 使其立即以 `EINTR`/`Intr` 返回，线程随后处理 Pause 命令并回复。
 
 ## 6. 内存布局与 PVH 启动
 
@@ -625,18 +698,66 @@ enum Transition { Activate, Reset, AckInterrupt(u32), Notify(u16) }
 ```rust
 pub enum Placement { VmmMain, Io }
 
+pub enum DeviceRole {
+    GuestAffecting,   // 块 I/O、串口输入、IRQ 重采样——guest 可观察
+    HostOnly,         // 控制台输出排空——仅宿主可见
+}
+
 impl DeviceManager {
-    pub fn spawn<F, Fut>(&mut self, name: String, placement: Placement, factory: F)
+    pub fn spawn<F>(&mut self, name: String, role: DeviceRole, device: F)
+    where F: Future<Output = Result<()>> + 'static;
+
+    pub fn spawn_on<F, Fut>(&mut self, name: String, placement: Placement, role: DeviceRole, factory: F) -> Result<()>
     where
         F: FnOnce(Stop) -> Fut + Send + 'static,
-        Fut: Future<Output = anyhow::Result<()>> + 'static;   // 设备 future 无需 Send
+        Fut: Future<Output = Result<()>> + 'static;
 }
 ```
 
 - io 线程内部是一个 `LocalRuntime`，循环接收 `Box<dyn FnOnce() + Send>` 任务，在本线程上调用 `spawn_local(factory(stop))`。
-- `Stop`（`watch::Receiver`）与 `DeviceExit` 发送端都是 `Send`，现有的 quiesce 逻辑原样适用于 io 线程上的设备。
+- `Stop`（`watch::Receiver`）与 `DeviceExit` 发送端都是 `Send`，生命周期控制原样适用于 io 线程上的设备。
 - io 线程在设备全部退出后结束，由 `DeviceManager` 在拆除时 join。
 - **原则**：KVM 与 vCPU 需要的那一半（transport、ioeventfd、irqfd）总是在 vmm-main 上建好再注册；目标线程只拿到设备侧的一半。
+
+### 8.7 设备生命周期：quiesce / resume / stop
+
+`DeviceManager` 把设备任务的生命周期拆为三个操作，对应暂停（可恢复冻结）、恢复、和最终终止：
+
+**DeviceRole 分类**：
+
+| 角色              | 说明                              | quiesce 行为       | stop 行为          |
+| ----------------- | --------------------------------- | ------------------ | ------------------ |
+| `GuestAffecting`  | 块 I/O、串口输入、IRQ resample    | 冻结 future        | 终止               |
+| `HostOnly`        | 控制台输出排空                    | 不受影响           | 终止               |
+
+**gate 机制**：`GuestAffecting` 设备在 spawn 时被包裹在一个 supervisor 函数 `gated(gate_rx, device)` 中。gate 是一个 biased `select!` 循环，不修改原 future：
+
+```text
+Running 态（外层循环）：biased select { gate 命令, &mut device future }
+  Quiesce → 回复 ack，进入 Quiesced 态
+  Resume  → 回复 ack（已在运行，幂等）
+  Stop    → 退出 gate 循环，return device.await（future 看到 stop watch）
+  device 完成 → 直接返回结果
+
+Quiesced 态（内层循环）：只 recv gate 命令
+  Resume  → 回复 ack，break 回 Running 态
+  Stop    → 退出 gate 循环，return device.await
+  Quiesce → 回复 ack（幂等）
+```
+
+gate 是纯 supervisor 层控制，不修改也不替换原始 future；quiesce 只是停止对 device future 的 poll，future 内部的 async 栈与 `!Send` 状态完好保留，resume 后从冻结点继续。
+
+**三个操作**：
+
+1. **`quiesce()`**：向所有 `GuestAffecting` 的 gate channel 发 `Quiesce`，并发 `.await` 全部 ack。已退出的设备（gate channel 已断开）静默跳过。`HostOnly` 设备不受影响。
+2. **`resume()`**：向所有 gate channel 发 `Resume`，并发 `.await` 全部 ack。已在运行的 gate 幂等回复。
+3. **`stop()`**：设置 stop watch（`send_replace(true)`），向所有 guest gate 发 `Stop`（解冻 quiesced 的 future），`.await` 全部 `DeviceExit`（含 io 线程上的），然后 join io 线程。从 Running 和 Quiesced 态均可调用。
+
+**与 Machine 的配合**：
+
+- `Machine::pause()`：先 `vcpus.pause()`（vCPU 暂停保证不再产生新的 I/O 退出），再 `devices.quiesce()`。
+- `Machine::resume()`：先 `devices.resume()`（设备就绪），再 `vcpus.resume()`（guest 可以立即发起 I/O）。
+- `Machine::teardown()`：`vcpus.stop()` → `devices.stop()` → drop Bus / VM / memory。
 
 ## 9. API 与配置（E4、E5）
 
@@ -788,12 +909,12 @@ crates/vmm/src/
 
 - 无 ACPI（A5）：guest `poweroff` 只会停住 CPU，VMM 不退出；用 `reboot` 或 API `Shutdown`。
 - MP table + xAPIC 限制 vCPU ≤ 254；拓扑固定。
-- 暂停不补完进行中的 MMIO/PIO（§5.3），引入快照前必须补上。
 - io 线程上的块 I/O 是同步的：同一 io 线程上的设备会互相阻塞（D4 / C12 可解决）。
 - 只在 AMD 宿主上实际运行；Intel CPUID 分支仅有单测。
 - SIGRTMIN 处理函数是进程级的：VMM 作为库嵌入时，与宿主程序共享这个信号。
 - `Start` 在 vmm-main 上同步读取内核与 initrd 文件（D5 的例外）。
 - 控制台 raw mode 下，Ctrl-C 不会终止 VMM。
+- Busy 期间不处理机器事件（`MachineEvent`、`DeviceExit`）：操作 future 独占 Machine，events 和 device exits 的 receiver 在 future 内部不被 poll。操作完成后回到 Idle 时才会在下一轮 select 中处理积压的事件。
 
 ## 14. 实现与验证进度
 
@@ -803,6 +924,10 @@ crates/vmm/src/
 - [x] 设备回归测试包含 reset 后重新激活、非法 avail 索引、错误对齐、超大/越界描述符、大请求有界缓冲，以及任务 panic 后正常 quiesce。
 - [x] `make lint`、`make test`、`make api-features`，并导出与校验 OpenAPI / JSON Schema。
 - [x] 真实 Linux guest：`/fuu.code/kangaroo-6.6/vmlinux`（Linux 6.6.102，PVH）完成双 vCPU、virtio-mmio block、ext4 root、systemd 与自动登录验证。rootfs 以 `ro,rootflags=noload` 挂载，未修改镜像；测试仍默认忽略，以环境变量显式运行。
+- [x] vCPU 运行循环区分 Handled/Interrupted：MMIO/PIO 后直接再次 KVM_RUN，只在 EINTR/Intr 后处理控制命令。Pause ACK 保证 pending userspace I/O 已完成。KVM 回归测试验证阻塞式 MMIO read 期间的 Pause 正确等待 I/O 完成后再暂停。
+- [x] DeviceManager 拆为三操作：quiesce（可恢复冻结 GuestAffecting future）、resume（解除冻结）、stop（最终终止）。DeviceRole 区分 GuestAffecting 与 HostOnly。gate 是 supervisor 层 biased-select，不修改原 future。
+- [x] Machine::pause() 先 vcpus.pause() 再 devices.quiesce()；Machine::resume() 先 devices.resume() 再 vcpus.resume()；teardown 先 vcpus.stop() 再 devices.stop()。
+- [x] 顶层 Controller::{Idle(Vm), Busy{stable, operation}} 替换原来的 Vm handle。Operation 持久化为本地 !Send Pin<Box<Future>>，独占 Machine。Busy 时 GET 返回前一稳定态，UpdateLogger 仍工作，其他写/生命周期返回错误。Shutdown 在 Busy 时通过 cancel oneshot 中断 Operation。Controller 单元测试覆盖 Busy 状态下的查询、拒绝、Shutdown 取消及客户端断开。
 
 运行真实 Linux 冒烟测试：
 

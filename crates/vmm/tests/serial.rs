@@ -10,8 +10,8 @@ use std::fs::File;
 use std::io::{Write, sink};
 
 use common::{pipe, settle, wait_until};
-use vmm::devices::DeviceManager;
 use vmm::devices::legacy::serial::{SerialDevice, SerialHandle};
+use vmm::devices::{DeviceManager, DeviceRole};
 
 /// vm-superio's receive FIFO holds this many bytes.
 const FIFO_SIZE: usize = 64;
@@ -42,7 +42,7 @@ async fn input_stops_at_the_fifo_boundary_and_resumes_once_the_guest_reads() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("serial", device.run(stop));
+    devices.spawn("serial", DeviceRole::GuestAffecting, device.run(stop));
 
     // More input than the FIFO can hold, so the device has to stop partway.
     let mut writer = File::from(host_tx);
@@ -65,7 +65,7 @@ async fn input_stops_at_the_fifo_boundary_and_resumes_once_the_guest_reads() {
     wait_until("the remainder to arrive", || queued(&handle) == 10).await;
     assert_eq!(drain(&handle), vec![b'b'; 10]);
 
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -75,7 +75,7 @@ async fn host_input_reaches_the_guest_fifo() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("serial", device.run(stop));
+    devices.spawn("serial", DeviceRole::GuestAffecting, device.run(stop));
 
     let mut writer = File::from(host_tx);
     writer.write_all(b"hello").unwrap();
@@ -83,7 +83,7 @@ async fn host_input_reaches_the_guest_fifo() {
     wait_until("input to arrive", || queued(&handle) == 5).await;
     assert_eq!(drain(&handle), b"hello");
 
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -93,7 +93,7 @@ async fn closing_the_host_side_ends_the_device() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("serial", device.run(stop));
+    devices.spawn("serial", DeviceRole::GuestAffecting, device.run(stop));
 
     settle().await;
     assert_eq!(devices.running(), 1);
@@ -118,7 +118,7 @@ async fn a_blocked_device_still_answers_the_stop_signal() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("serial", device.run(stop));
+    devices.spawn("serial", DeviceRole::GuestAffecting, device.run(stop));
 
     // Wedge the device against a full FIFO that nothing will drain.
     let mut writer = File::from(host_tx);
@@ -127,6 +127,49 @@ async fn a_blocked_device_still_answers_the_stop_signal() {
 
     // Shutting down while back-pressured must not hang: the stop signal is one
     // arm of the same `select!` the device is waiting on.
-    devices.quiesce().await;
+    devices.stop().await;
     assert_eq!(devices.running(), 0);
+}
+
+#[tokio::test(flavor = "local")]
+async fn serial_input_quiesce_blocks_fifo_resume_delivers() {
+    use std::time::Duration;
+
+    let (host_rx, host_tx) = pipe().unwrap();
+    let (device, handle) = SerialDevice::new(host_rx, sink()).unwrap();
+
+    let mut devices = DeviceManager::new();
+    let stop = devices.stop_signal();
+    devices.spawn("serial", DeviceRole::GuestAffecting, device.run(stop));
+
+    // Write initial data, wait for it to arrive in the FIFO.
+    let mut writer = File::from(host_tx);
+    writer.write_all(b"before").unwrap();
+    wait_until("initial data", || queued(&handle) == 6).await;
+    assert_eq!(drain(&handle), b"before");
+
+    // Quiesce.
+    tokio::time::timeout(Duration::from_secs(5), devices.quiesce())
+        .await
+        .unwrap();
+
+    // Write data while quiesced.
+    writer.write_all(b"during").unwrap();
+
+    // Settle -- FIFO must stay empty.
+    settle().await;
+    assert_eq!(queued(&handle), 0, "data entered FIFO while quiesced");
+
+    // Resume.
+    tokio::time::timeout(Duration::from_secs(5), devices.resume())
+        .await
+        .unwrap();
+
+    // The data written while quiesced should now arrive.
+    wait_until("resumed data to arrive", || queued(&handle) == 6).await;
+    assert_eq!(drain(&handle), b"during");
+
+    tokio::time::timeout(Duration::from_secs(5), devices.stop())
+        .await
+        .unwrap();
 }

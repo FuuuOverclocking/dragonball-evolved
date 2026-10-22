@@ -54,6 +54,12 @@ enum RunState {
     Stop,
 }
 
+enum RunResult {
+    Handled,
+    Interrupted,
+    Stop,
+}
+
 impl VcpuHandle {
     pub fn spawn(
         index: u8,
@@ -244,55 +250,52 @@ impl VcpuRunner {
                     }
                     Err(_) => RunState::Stop,
                 },
-                RunState::Running => {
-                    let state = self.run_once();
-                    if state == RunState::Running {
-                        self.pending_commands(state)
-                    } else {
-                        state
+                RunState::Running => match self.run_once() {
+                    RunResult::Handled => RunState::Running,
+                    RunResult::Interrupted => {
+                        self.fd.set_kvm_immediate_exit(0);
+                        self.pending_commands(RunState::Running)
                     }
-                }
+                    RunResult::Stop => RunState::Stop,
+                },
                 RunState::Stop => return,
             };
         }
     }
 
-    fn run_once(&mut self) -> RunState {
+    fn run_once(&mut self) -> RunResult {
         match self.fd.run() {
             Ok(VcpuExit::IoIn(port, data)) => {
                 data.fill(0);
                 self.pio.read(u64::from(port), data);
-                RunState::Running
+                RunResult::Handled
             }
             Ok(VcpuExit::IoOut(port, data)) => {
                 self.pio.write(u64::from(port), data);
-                RunState::Running
+                RunResult::Handled
             }
             Ok(VcpuExit::MmioRead(address, data)) => {
                 data.fill(0);
                 self.mmio.read(address, data);
-                RunState::Running
+                RunResult::Handled
             }
             Ok(VcpuExit::MmioWrite(address, data)) => {
                 self.mmio.write(address, data);
-                RunState::Running
+                RunResult::Handled
             }
             Ok(VcpuExit::Shutdown)
             | Ok(VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_RESET | KVM_SYSTEM_EVENT_SHUTDOWN, _)) => {
                 let _ = self.events.send(MachineEvent::GuestReset);
-                RunState::Stop
+                RunResult::Stop
             }
-            Ok(VcpuExit::Intr) => self.pending_commands(RunState::Running),
+            Ok(VcpuExit::Intr) => RunResult::Interrupted,
             Ok(exit) => report_failure(
                 &self.events,
                 self.index,
                 format!("unexpected KVM exit: {exit:?}"),
             ),
-            Err(error) if error.errno() == libc::EINTR => {
-                self.fd.set_kvm_immediate_exit(0);
-                self.pending_commands(RunState::Running)
-            }
-            Err(error) if error.errno() == libc::EAGAIN => RunState::Running,
+            Err(error) if error.errno() == libc::EINTR => RunResult::Interrupted,
+            Err(error) if error.errno() == libc::EAGAIN => RunResult::Handled,
             Err(error) => {
                 report_failure(&self.events, self.index, format!("KVM_RUN failed: {error}"))
             }
@@ -319,9 +322,9 @@ fn report_failure(
     events: &tokio_mpsc::UnboundedSender<MachineEvent>,
     index: u8,
     error: String,
-) -> RunState {
+) -> RunResult {
     let _ = events.send(MachineEvent::VcpuFailed { index, error });
-    RunState::Stop
+    RunResult::Stop
 }
 
 fn apply_command(command: VcpuCommand) -> RunState {
@@ -390,6 +393,9 @@ mod tests {
     use crate::machine::bus::BusDevice;
     use crate::machine::memory;
 
+    const KVM_TEST_TIMEOUT: Duration = Duration::from_secs(2);
+    const MMIO_READ_VALUE: u32 = 0x4433_2211;
+
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -404,10 +410,131 @@ mod tests {
         }
     }
 
+    struct BlockingReadDevice {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl BusDevice for BlockingReadDevice {
+        fn read(&self, offset: u64, data: &mut [u8]) {
+            assert_eq!(offset, 0);
+            assert_eq!(data.len(), std::mem::size_of::<u32>());
+            data.copy_from_slice(&MMIO_READ_VALUE.to_le_bytes());
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(KVM_TEST_TIMEOUT)
+                .expect("timed out waiting to release MMIO read");
+        }
+
+        fn write(&self, _offset: u64, _data: &[u8]) {
+            panic!("unexpected MMIO write");
+        }
+    }
+
     fn pipe() -> (OwnedFd, OwnedFd) {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pause_waits_for_mmio_read_completion_on_kvm() {
+        if !Path::new("/dev/kvm").exists() {
+            return;
+        }
+        let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+        let vm = context.kvm().create_vm().unwrap();
+        vm.set_tss_address(TSS_START as usize).unwrap();
+        vm.create_irq_chip().unwrap();
+        vm.create_pit2(kvm_pit_config {
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let regions = ram_regions(16 << 20).unwrap();
+        let memory = memory::create(&regions).unwrap();
+        // SAFETY: The test stops the vCPU and explicitly drops the VM before memory.
+        unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }
+            .unwrap();
+
+        const ENTRY: u64 = 0x10_0000;
+        const MMIO_ADDRESS: u64 = 0x1000_0000;
+        let code = [
+            0xa1, 0x00, 0x00, 0x00, 0x10, // mov eax, [MMIO_ADDRESS]
+            0x41, // inc ecx: must not execute before Pause is acknowledged
+            0xf4, // hlt
+            0xeb, 0xfd, // jmp back to hlt
+        ];
+        memory.write_slice(&code, GuestAddress(ENTRY)).unwrap();
+
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let cpuid = normalize(
+            &context.capabilities().supported_cpuid,
+            &context.capabilities().host_cpuid,
+            1,
+            0,
+        )
+        .unwrap();
+        vcpu.set_cpuid2(&cpuid).unwrap();
+        let entries = boot_msrs();
+        let msrs = Msrs::from_entries(&entries).unwrap();
+        assert_eq!(vcpu.set_msrs(&msrs).unwrap(), entries.len());
+        vcpu.set_regs(&boot_regs(ENTRY)).unwrap();
+        vcpu.set_fpu(&boot_fpu()).unwrap();
+        let (sregs, tables) = boot_sregs(vcpu.get_sregs().unwrap());
+        for table in tables {
+            memory
+                .write_slice(&table.bytes, GuestAddress(table.address))
+                .unwrap();
+        }
+        vcpu.set_sregs(&sregs).unwrap();
+        vcpu.set_lapic(&configure_lint(vcpu.get_lapic().unwrap()))
+            .unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let device: Arc<dyn BusDevice> = Arc::new(BlockingReadDevice {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let pio = Arc::new(Bus::empty());
+        let mmio = Arc::new(Bus::new(vec![(MMIO_ADDRESS..MMIO_ADDRESS + 4, device)]).unwrap());
+        let (event_tx, _event_rx) = tokio_mpsc::unbounded_channel();
+        let handle = VcpuHandle::spawn(0, vcpu, &vm, pio, mmio, event_tx).unwrap();
+
+        let (resume_reply, resumed) = oneshot::channel();
+        handle.command(VcpuCommand::Resume(resume_reply)).unwrap();
+        time::timeout(KVM_TEST_TIMEOUT, resumed)
+            .await
+            .expect("timed out waiting for resume acknowledgement")
+            .expect("vCPU dropped resume acknowledgement");
+        entered_rx
+            .recv_timeout(KVM_TEST_TIMEOUT)
+            .expect("timed out waiting for MMIO read");
+
+        // Queue Pause while the read callback still owns KVM's pending MMIO data.
+        let (pause_reply, paused) = oneshot::channel();
+        handle.command(VcpuCommand::Pause(pause_reply)).unwrap();
+        release_tx.send(()).unwrap();
+        time::timeout(KVM_TEST_TIMEOUT, paused)
+            .await
+            .expect("timed out waiting for pause acknowledgement")
+            .expect("vCPU dropped pause acknowledgement");
+
+        let regs = handle.kick_fd.lock().unwrap().get_regs().unwrap();
+        assert_eq!(regs.rax, u64::from(MMIO_READ_VALUE));
+        assert_eq!(regs.rip, ENTRY + 5);
+        assert_eq!(regs.rcx, 0, "instruction after the MMIO read executed");
+
+        handle.command(VcpuCommand::Stop).unwrap();
+        time::timeout(KVM_TEST_TIMEOUT, handle.wait())
+            .await
+            .expect("timed out waiting for vCPU stop")
+            .unwrap();
+        drop(vm);
     }
 
     #[tokio::test(flavor = "current_thread")]

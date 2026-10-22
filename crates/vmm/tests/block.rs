@@ -10,10 +10,10 @@ use common::guest::{
     VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
 };
 use common::{TempDisk, settle, wait_until};
-use vmm::devices::DeviceManager;
 use vmm::devices::async_fd::AsyncEventFd;
 use vmm::devices::virtio::block::{BlockDevice, BlockHandle};
 use vmm::devices::virtio::{Activation, SessionControl, session_channel};
+use vmm::devices::{DeviceManager, DeviceRole};
 
 /// Spawn a block device and bring it up the way a driver would.
 ///
@@ -50,7 +50,7 @@ async fn read_request_moves_disk_contents_into_guest_memory() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", device.run(stop));
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
 
     let mut guest = GuestDriver::new();
     let _session = activate(&handle, &guest);
@@ -78,7 +78,7 @@ async fn read_request_moves_disk_contents_into_guest_memory() {
     assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_OK]);
     assert_eq!(guest.read_bytes(data, SECTOR_SIZE), vec![0xcd; SECTOR_SIZE]);
 
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -90,7 +90,7 @@ async fn write_request_reaches_the_disk() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", device.run(stop));
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
 
     let mut guest = GuestDriver::new();
     let _session = activate(&handle, &guest);
@@ -116,7 +116,7 @@ async fn write_request_reaches_the_disk() {
     assert_eq!(&on_disk[..SECTOR_SIZE], &[0; SECTOR_SIZE]);
     assert_eq!(&on_disk[SECTOR_SIZE..], &[0x5a; SECTOR_SIZE]);
 
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -130,7 +130,7 @@ async fn one_kick_drains_every_queued_request() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", device.run(stop));
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
 
     let mut guest = GuestDriver::new();
     let _session = activate(&handle, &guest);
@@ -157,7 +157,7 @@ async fn one_kick_drains_every_queued_request() {
         assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_OK]);
     }
 
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -172,7 +172,7 @@ async fn rate_limit_spreads_requests_out_without_a_timerfd() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", device.run(stop));
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
 
     let mut guest = GuestDriver::new();
     let _session = activate(&handle, &guest);
@@ -206,7 +206,7 @@ async fn rate_limit_spreads_requests_out_without_a_timerfd() {
     })
     .await;
 
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -218,7 +218,7 @@ async fn flush_and_get_id_are_answered_and_junk_is_rejected() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", device.run(stop));
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
 
     let mut guest = GuestDriver::new();
     let _session = activate(&handle, &guest);
@@ -267,7 +267,7 @@ async fn flush_and_get_id_are_answered_and_junk_is_rejected() {
     assert_eq!(guest.read_bytes(bad_status, 1), [VIRTIO_BLK_S_UNSUPP]);
     assert_eq!(guest.read_bytes(oob_status, 1), [VIRTIO_BLK_S_IOERR]);
 
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -280,12 +280,12 @@ async fn a_device_the_guest_never_activated_still_stops_cleanly() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", device.run(stop));
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
 
     settle().await;
     assert_eq!(devices.running(), 1);
 
-    devices.quiesce().await;
+    devices.stop().await;
     assert_eq!(devices.running(), 0);
 }
 
@@ -298,7 +298,7 @@ async fn read_only_disk_refuses_writes() {
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", device.run(stop));
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
 
     let mut guest = GuestDriver::new();
     let _session = activate(&handle, &guest);
@@ -319,7 +319,7 @@ async fn read_only_disk_refuses_writes() {
     assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_IOERR]);
     assert_eq!(disk.contents(), vec![0x33; 2 * SECTOR_SIZE]);
 
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 fn configure_transport(transport: &vmm::devices::virtio::mmio::MmioTransport) {
@@ -360,9 +360,12 @@ async fn io_thread_transport_reset_acknowledges_and_reactivates_queues() {
     ));
     let mut devices = DeviceManager::new();
     devices
-        .spawn_on("block-reset", Placement::Io, move |stop| async move {
-            resources.into_device()?.run(stop).await
-        })
+        .spawn_on(
+            "block-reset",
+            Placement::Io,
+            DeviceRole::GuestAffecting,
+            move |stop| async move { resources.into_device()?.run(stop).await },
+        )
         .unwrap();
     for _ in 0..3 {
         configure_transport(&transport);
@@ -387,7 +390,7 @@ async fn io_thread_transport_reset_acknowledges_and_reactivates_queues() {
         assert_eq!(u32::from_le_bytes(status), 0);
         guest.reset_queue();
     }
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -397,7 +400,7 @@ async fn malformed_payload_does_not_partially_modify_the_disk() {
     let (device, handle) = BlockDevice::new("invalid", disk.path(), false, None).unwrap();
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", device.run(stop));
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
     let mut guest = GuestDriver::new();
     let _session = activate(&handle, &guest);
     let header = guest.request_header(VIRTIO_BLK_T_OUT, 0);
@@ -414,7 +417,7 @@ async fn malformed_payload_does_not_partially_modify_the_disk() {
     wait_until("invalid request completion", || guest.used_idx() == 1).await;
     assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_IOERR]);
     assert_eq!(disk.contents(), vec![0x33; SECTOR_SIZE * 2]);
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -429,9 +432,12 @@ async fn corrupt_available_index_reports_failure_without_hanging_shutdown() {
     guest.mem.write_obj(17u16, GuestAddress(0x2002)).unwrap();
     let mut devices = DeviceManager::new();
     devices
-        .spawn_on("invalid-avail", Placement::Io, move |stop| async move {
-            resources.into_device()?.run(stop).await
-        })
+        .spawn_on(
+            "invalid-avail",
+            Placement::Io,
+            DeviceRole::GuestAffecting,
+            move |stop| async move { resources.into_device()?.run(stop).await },
+        )
         .unwrap();
     let _session = activate(&handle, &guest);
     let exit = tokio::time::timeout(Duration::from_secs(1), devices.next_exit())
@@ -444,7 +450,7 @@ async fn corrupt_available_index_reports_failure_without_hanging_shutdown() {
             .to_string()
             .contains("available index")
     );
-    tokio::time::timeout(Duration::from_secs(1), devices.quiesce())
+    tokio::time::timeout(Duration::from_secs(1), devices.stop())
         .await
         .unwrap();
 }
@@ -457,7 +463,7 @@ async fn requests_larger_than_one_mib_use_bounded_staging() {
     let mut guest = GuestDriver::new();
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("large-read", device.run(stop));
+    devices.spawn("large-read", DeviceRole::GuestAffecting, device.run(stop));
     let _session = activate(&handle, &guest);
     let header = guest.request_header(VIRTIO_BLK_T_IN, 0);
     let data = guest.alloc(SIZE as u32);
@@ -471,7 +477,7 @@ async fn requests_larger_than_one_mib_use_bounded_staging() {
     wait_until("large request completion", || guest.used_idx() == 1).await;
     assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_OK]);
     assert_eq!(guest.read_bytes(data, SIZE), vec![0xa5; SIZE]);
-    devices.quiesce().await;
+    devices.stop().await;
 }
 
 #[tokio::test(flavor = "local")]
@@ -517,7 +523,7 @@ async fn truncated_chain_completes_without_writing_an_unreachable_status() {
     let mut guest = GuestDriver::new();
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("truncated", device.run(stop));
+    devices.spawn("truncated", DeviceRole::GuestAffecting, device.run(stop));
     let _session = activate(&handle, &guest);
     let header = guest.request_header(VIRTIO_BLK_T_OUT, 0);
     let status = guest.alloc(1);
@@ -532,5 +538,73 @@ async fn truncated_chain_completes_without_writing_an_unreachable_status() {
     assert_eq!(guest.used_entry(0).1, 0);
     assert_eq!(guest.read_bytes(status, 1), [0xff]);
     assert_eq!(disk.contents(), vec![0x33; SECTOR_SIZE]);
-    devices.quiesce().await;
+    devices.stop().await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn block_quiesce_pauses_and_resume_completes_same_session() {
+    let disk = TempDisk::new("quiesce-blk", &vec![0xab; SECTOR_SIZE]);
+    let (device, handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
+    let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
+
+    let mut devices = DeviceManager::new();
+    let stop = devices.stop_signal();
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
+
+    let mut guest = GuestDriver::new();
+    let _session = activate(&handle, &guest);
+
+    // Complete one request to prove the device is running.
+    let h1 = guest.request_header(VIRTIO_BLK_T_IN, 0);
+    let d1 = guest.alloc(SECTOR_SIZE as u32);
+    let s1 = guest.alloc(1);
+    guest.submit(&[
+        Segment::readable(h1, 16),
+        Segment::writable(d1, SECTOR_SIZE as u32),
+        Segment::writable(s1, 1),
+    ]);
+    handle.queue_notifier.write(1).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), irq.read())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(guest.used_idx(), 1);
+
+    // Quiesce.
+    tokio::time::timeout(Duration::from_secs(5), devices.quiesce())
+        .await
+        .unwrap();
+
+    // Submit a request while quiesced.
+    let h2 = guest.request_header(VIRTIO_BLK_T_IN, 0);
+    let d2 = guest.alloc(SECTOR_SIZE as u32);
+    let s2 = guest.alloc(1);
+    guest.submit(&[
+        Segment::readable(h2, 16),
+        Segment::writable(d2, SECTOR_SIZE as u32),
+        Segment::writable(s2, 1),
+    ]);
+    handle.queue_notifier.write(1).unwrap();
+
+    // Settle -- used ring must NOT advance while quiesced.
+    settle().await;
+    assert_eq!(guest.used_idx(), 1, "request completed while quiesced");
+
+    // Resume.
+    tokio::time::timeout(Duration::from_secs(5), devices.resume())
+        .await
+        .unwrap();
+
+    // The request completes in the same activation/session.
+    tokio::time::timeout(Duration::from_secs(5), irq.read())
+        .await
+        .unwrap()
+        .unwrap();
+    wait_until("quiesced request to complete", || guest.used_idx() == 2).await;
+    assert_eq!(guest.read_bytes(s2, 1), [VIRTIO_BLK_S_OK]);
+    assert_eq!(guest.read_bytes(d2, SECTOR_SIZE), vec![0xab; SECTOR_SIZE]);
+
+    tokio::time::timeout(Duration::from_secs(5), devices.stop())
+        .await
+        .unwrap();
 }

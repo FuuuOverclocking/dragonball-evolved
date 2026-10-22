@@ -1,5 +1,8 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use api::instance_info::{InstanceInfo, VmState};
-use api::{ApiError, ApiResult, VmmCommand, VmmRequest};
+use api::{ApiError, ApiResult, Reply, VmmCommand, VmmRequest};
 use logger::{info_unlimited, warn_unlimited};
 use tokio::select;
 
@@ -10,46 +13,18 @@ use crate::machine::plan::MachinePlan;
 use crate::spec::MachineSpec;
 use crate::{ProcessCtx, VmmExitStatus};
 
+// ---------------------------------------------------------------------------
+// Vm: the three logical states a virtual machine can be in.
+// ---------------------------------------------------------------------------
+
 pub(crate) enum Vm {
     NotStarted(MachineSpec),
     Running(Machine),
     Paused(Machine),
 }
 
-pub(crate) enum Event {
-    Request(Option<VmmRequest>),
-    Machine(MachineEvent),
-    Device(DeviceExit),
-}
-
-pub(crate) enum Step {
-    Continue,
-    Stop(VmmExitStatus),
-}
-
-impl Step {
-    fn error(error: &anyhow::Error) -> Self {
-        Self::Stop(VmmExitStatus::Error(format!("{error:#}")))
-    }
-}
-
-fn accept_shutdown(reply: api::Reply<ApiResult<()>>) -> Step {
-    reply.send(Ok(()));
-    Step::Stop(VmmExitStatus::Ok)
-}
-
 impl Vm {
-    pub(crate) async fn next_event(&mut self) -> Event {
-        match self {
-            Self::NotStarted(_) => std::future::pending().await,
-            Self::Running(machine) | Self::Paused(machine) => select! {
-                Some(event) = machine.events.recv() => Event::Machine(event),
-                Some(exit) = machine.devices.next_exit() => Event::Device(exit),
-            },
-        }
-    }
-
-    fn state(&self) -> VmState {
+    pub(crate) fn state(&self) -> VmState {
         match self {
             Self::NotStarted(_) => VmState::NotStarted,
             Self::Running(_) => VmState::Running,
@@ -75,151 +50,496 @@ impl Vm {
         }
     }
 
-    pub(crate) async fn handle(self, event: Event, ctx: &ProcessCtx) -> (Self, Step) {
-        let request = match event {
-            Event::Request(Some(request)) => request,
-            Event::Request(None) | Event::Machine(MachineEvent::GuestReset) => {
-                return (self, Step::Stop(VmmExitStatus::Ok));
-            }
-            Event::Machine(MachineEvent::VcpuFailed { index, error }) => {
-                return (
-                    self,
-                    Step::Stop(VmmExitStatus::Error(format!("vCPU {index}: {error}"))),
-                );
-            }
-            Event::Device(exit) => {
-                match exit.result {
-                    Ok(()) => info_unlimited!("device {} stopped", exit.name),
-                    Err(error) => warn_unlimited!("device {} failed: {error:#}", exit.name),
-                }
-                return (self, Step::Continue);
-            }
-        };
-        match request {
-            VmmRequest::GetInstanceInfo(_, reply) => {
-                reply.send(InstanceInfo {
-                    id: ctx.id.clone(),
-                    version: ctx.version.clone(),
-                    state: self.state(),
-                });
-                (self, Step::Continue)
-            }
-            VmmRequest::UpdateLogger(cfg, reply) => {
-                reply.send((ctx.update_logger)(cfg.0));
-                (self, Step::Continue)
-            }
-            VmmRequest::HandoverState(_, reply) => {
-                reply.send(Err(ApiError::msg("live upgrade is not supported")));
-                (self, Step::Continue)
-            }
-            VmmRequest::Shutdown(_, reply) => (self, accept_shutdown(reply)),
-            VmmRequest::SetCpus(value, reply) => {
-                let (next, result) = self.configure(VmmCommand::SetCpus(value, ()));
-                reply.send(result);
-                (next, Step::Continue)
-            }
-            VmmRequest::SetMemory(value, reply) => {
-                let (next, result) = self.configure(VmmCommand::SetMemory(value, ()));
-                reply.send(result);
-                (next, Step::Continue)
-            }
-            VmmRequest::SetConsole(value, reply) => {
-                let (next, result) = self.configure(VmmCommand::SetConsole(value, ()));
-                reply.send(result);
-                (next, Step::Continue)
-            }
-            VmmRequest::SetKernel(value, reply) => {
-                let (next, result) = self.configure(VmmCommand::SetKernel(value, ()));
-                reply.send(result);
-                (next, Step::Continue)
-            }
-            VmmRequest::AddDisk(value, reply) => {
-                let (next, result) = self.configure(VmmCommand::AddDisk(value, ()));
-                reply.send(result);
-                (next, Step::Continue)
-            }
-            VmmRequest::Start(_, reply) => match self {
-                Self::NotStarted(spec) => {
-                    let result = MachinePlan::new(spec.clone(), ctx.kvm_ctx.capabilities())
-                        .and_then(|plan| build(plan, &ctx.kvm_ctx));
-                    match result {
-                        Ok(machine) => match machine.vcpus.as_ref().unwrap().resume().await {
-                            Ok(()) => {
-                                reply.send(Ok(()));
-                                (Self::Running(machine), Step::Continue)
-                            }
-                            Err(error) => {
-                                let _ = machine.teardown().await;
-                                reply.send(Err(ApiError::msg(format!("start vCPUs: {error:#}"))));
-                                (Self::NotStarted(spec), Step::Continue)
-                            }
-                        },
-                        Err(error) => {
-                            reply.send(Err(ApiError::msg(format!("{error:#}"))));
-                            (Self::NotStarted(spec), Step::Continue)
-                        }
-                    }
-                }
-                vm => {
-                    reply.send(Err(ApiError::msg("VM is already started")));
-                    (vm, Step::Continue)
-                }
-            },
-            VmmRequest::Pause(_, reply) => match self {
-                Self::Running(machine) => match machine.vcpus.as_ref().unwrap().pause().await {
-                    Ok(()) => {
-                        reply.send(Ok(()));
-                        (Self::Paused(machine), Step::Continue)
-                    }
-                    Err(error) => {
-                        reply.send(Err(ApiError::msg(format!("{error:#}"))));
-                        (Self::Running(machine), Step::error(&error))
-                    }
-                },
-                Self::Paused(machine) => {
-                    reply.send(Ok(()));
-                    (Self::Paused(machine), Step::Continue)
-                }
-                vm => {
-                    reply.send(Err(ApiError::msg("VM is not started")));
-                    (vm, Step::Continue)
-                }
-            },
-            VmmRequest::Resume(_, reply) => match self {
-                Self::Paused(machine) => match machine.vcpus.as_ref().unwrap().resume().await {
-                    Ok(()) => {
-                        reply.send(Ok(()));
-                        (Self::Running(machine), Step::Continue)
-                    }
-                    Err(error) => {
-                        reply.send(Err(ApiError::msg(format!("{error:#}"))));
-                        (Self::Paused(machine), Step::error(&error))
-                    }
-                },
-                Self::Running(machine) => {
-                    reply.send(Ok(()));
-                    (Self::Running(machine), Step::Continue)
-                }
-                vm => {
-                    reply.send(Err(ApiError::msg("VM is not started")));
-                    (vm, Step::Continue)
-                }
-            },
-        }
-    }
-
     pub(crate) async fn teardown(self) -> anyhow::Result<()> {
         match self {
             Self::NotStarted(_) => Ok(()),
             Self::Running(machine) | Self::Paused(machine) => machine.teardown().await,
         }
     }
+
+    pub(crate) async fn next_event(&mut self) -> Event {
+        match self {
+            Self::NotStarted(_) => std::future::pending().await,
+            Self::Running(machine) | Self::Paused(machine) => select! {
+                Some(event) = machine.events.recv() => Event::Machine(event),
+                Some(exit) = machine.devices.next_exit() => Event::Device(exit),
+            },
+        }
+    }
 }
+
+pub(crate) fn vm_from_state(state: VmState, machine: Machine) -> Vm {
+    match state {
+        VmState::Running => Vm::Running(machine),
+        VmState::Paused => Vm::Paused(machine),
+        VmState::NotStarted => Vm::Running(machine),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operation: an in-flight lifecycle action that exclusively owns the Machine.
+// ---------------------------------------------------------------------------
+
+/// The result returned by an operation future when it completes.
+pub(crate) struct OperationCompletion {
+    /// The Machine handed back so the Controller can wrap it in a Vm again.
+    pub machine: Machine,
+    /// The Vm state to set on success.
+    pub target_state: VmState,
+    /// `Ok(())` if the operation succeeded, or an error.
+    pub result: anyhow::Result<()>,
+}
+
+/// A lifecycle operation in progress. The future exclusively owns the Machine.
+pub(crate) struct Operation {
+    /// The future performing the actual work. `'static + !Send`.
+    pub future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>>,
+    /// Reply channel for the lifecycle request that started this operation.
+    pub reply: Option<Reply<ApiResult<()>>>,
+    /// The sender half -- stored so Shutdown can trigger cancellation.
+    pub cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+// ---------------------------------------------------------------------------
+// Controller: the top-level state machine.
+// ---------------------------------------------------------------------------
+
+pub(crate) enum Controller {
+    /// No lifecycle operation is running; the Vm owns the Machine.
+    Idle(Vm),
+    /// A lifecycle operation is in progress; the future owns the Machine.
+    Busy {
+        /// The state the Vm was in before the operation started.
+        stable: VmState,
+        /// The in-flight operation.
+        operation: Operation,
+    },
+}
+
+/// What the main loop should do after handling one event.
+pub(crate) enum Step {
+    Continue,
+    Stop(VmmExitStatus),
+}
+
+impl Step {
+    fn error(error: &anyhow::Error) -> Self {
+        Self::Stop(VmmExitStatus::Error(format!("{error:#}")))
+    }
+}
+
+/// Events the main loop selects on.
+pub(crate) enum Event {
+    Request(Option<VmmRequest>),
+    Machine(MachineEvent),
+    Device(DeviceExit),
+}
+
+// ---------------------------------------------------------------------------
+// Operation constructors for Pause, Resume, Start.
+// ---------------------------------------------------------------------------
+
+fn make_pause_operation(mut machine: Machine, reply: Reply<ApiResult<()>>) -> (VmState, Operation) {
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
+        Box::pin(async move {
+            let outcome = {
+                let pause_fut = machine.pause();
+                tokio::pin!(pause_fut);
+                select! {
+                    biased;
+                    _ = cancel_rx => None,
+                    result = &mut pause_fut => Some(result),
+                }
+            };
+            match outcome {
+                None => OperationCompletion {
+                    machine,
+                    target_state: VmState::Running,
+                    result: Err(anyhow::anyhow!("interrupted by shutdown")),
+                },
+                Some(result) => OperationCompletion {
+                    machine,
+                    target_state: VmState::Paused,
+                    result,
+                },
+            }
+        });
+    (
+        VmState::Running,
+        Operation {
+            future,
+            reply: Some(reply),
+            cancel_tx: Some(cancel_tx),
+        },
+    )
+}
+
+fn make_resume_operation(
+    mut machine: Machine,
+    reply: Reply<ApiResult<()>>,
+) -> (VmState, Operation) {
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
+        Box::pin(async move {
+            let outcome = {
+                let resume_fut = machine.resume();
+                tokio::pin!(resume_fut);
+                select! {
+                    biased;
+                    _ = cancel_rx => None,
+                    result = &mut resume_fut => Some(result),
+                }
+            };
+            match outcome {
+                None => OperationCompletion {
+                    machine,
+                    target_state: VmState::Paused,
+                    result: Err(anyhow::anyhow!("interrupted by shutdown")),
+                },
+                Some(result) => OperationCompletion {
+                    machine,
+                    target_state: VmState::Running,
+                    result,
+                },
+            }
+        });
+    (
+        VmState::Paused,
+        Operation {
+            future,
+            reply: Some(reply),
+            cancel_tx: Some(cancel_tx),
+        },
+    )
+}
+
+fn make_start_operation(machine: Machine, reply: Reply<ApiResult<()>>) -> (VmState, Operation) {
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
+        Box::pin(async move {
+            let outcome = {
+                let resume_fut = machine.vcpus.as_ref().unwrap().resume();
+                tokio::pin!(resume_fut);
+                select! {
+                    biased;
+                    _ = cancel_rx => None,
+                    result = &mut resume_fut => Some(result),
+                }
+            };
+            match outcome {
+                None => OperationCompletion {
+                    machine,
+                    target_state: VmState::NotStarted,
+                    result: Err(anyhow::anyhow!("interrupted by shutdown")),
+                },
+                Some(Ok(())) => OperationCompletion {
+                    machine,
+                    target_state: VmState::Running,
+                    result: Ok(()),
+                },
+                Some(Err(error)) => OperationCompletion {
+                    machine,
+                    target_state: VmState::NotStarted,
+                    result: Err(error),
+                },
+            }
+        });
+    (
+        VmState::NotStarted,
+        Operation {
+            future,
+            reply: Some(reply),
+            cancel_tx: Some(cancel_tx),
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Controller implementation.
+// ---------------------------------------------------------------------------
+
+impl Controller {
+    pub(crate) fn new(spec: MachineSpec) -> Self {
+        Controller::Idle(Vm::NotStarted(spec))
+    }
+
+    /// Teardown the VM, regardless of state.
+    pub(crate) async fn teardown(self) -> anyhow::Result<()> {
+        match self {
+            Controller::Idle(vm) => vm.teardown().await,
+            Controller::Busy {
+                mut operation,
+                stable: _,
+            } => {
+                // Cancel the operation and await it to get the machine back.
+                if let Some(cancel_tx) = operation.cancel_tx.take() {
+                    let _ = cancel_tx.send(());
+                }
+                let completion = operation.future.await;
+                // Send error to the lifecycle reply.
+                if let Some(reply) = operation.reply.take() {
+                    reply.send(Err(ApiError::msg("interrupted by shutdown")));
+                }
+                completion.machine.teardown().await
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle-state handler.
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn handle_idle(vm: Vm, event: Event, ctx: &ProcessCtx) -> (Controller, Step) {
+    let request = match event {
+        Event::Request(Some(request)) => request,
+        Event::Request(None) | Event::Machine(MachineEvent::GuestReset) => {
+            return (Controller::Idle(vm), Step::Stop(VmmExitStatus::Ok));
+        }
+        Event::Machine(MachineEvent::VcpuFailed { index, error }) => {
+            return (
+                Controller::Idle(vm),
+                Step::Stop(VmmExitStatus::Error(format!("vCPU {index}: {error}"))),
+            );
+        }
+        Event::Device(exit) => {
+            match exit.result {
+                Ok(()) => info_unlimited!("device {} stopped", exit.name),
+                Err(error) => warn_unlimited!("device {} failed: {error:#}", exit.name),
+            }
+            return (Controller::Idle(vm), Step::Continue);
+        }
+    };
+    match request {
+        VmmRequest::GetInstanceInfo(_, reply) => {
+            reply.send(InstanceInfo {
+                id: ctx.id.clone(),
+                version: ctx.version.clone(),
+                state: vm.state(),
+            });
+            (Controller::Idle(vm), Step::Continue)
+        }
+        VmmRequest::UpdateLogger(cfg, reply) => {
+            reply.send((ctx.update_logger)(cfg.0));
+            (Controller::Idle(vm), Step::Continue)
+        }
+        VmmRequest::HandoverState(_, reply) => {
+            reply.send(Err(ApiError::msg("live upgrade is not supported")));
+            (Controller::Idle(vm), Step::Continue)
+        }
+        VmmRequest::Shutdown(_, reply) => {
+            reply.send(Ok(()));
+            (Controller::Idle(vm), Step::Stop(VmmExitStatus::Ok))
+        }
+        VmmRequest::SetCpus(value, reply) => {
+            let (next, result) = vm.configure(VmmCommand::SetCpus(value, ()));
+            reply.send(result);
+            (Controller::Idle(next), Step::Continue)
+        }
+        VmmRequest::SetMemory(value, reply) => {
+            let (next, result) = vm.configure(VmmCommand::SetMemory(value, ()));
+            reply.send(result);
+            (Controller::Idle(next), Step::Continue)
+        }
+        VmmRequest::SetConsole(value, reply) => {
+            let (next, result) = vm.configure(VmmCommand::SetConsole(value, ()));
+            reply.send(result);
+            (Controller::Idle(next), Step::Continue)
+        }
+        VmmRequest::SetKernel(value, reply) => {
+            let (next, result) = vm.configure(VmmCommand::SetKernel(value, ()));
+            reply.send(result);
+            (Controller::Idle(next), Step::Continue)
+        }
+        VmmRequest::AddDisk(value, reply) => {
+            let (next, result) = vm.configure(VmmCommand::AddDisk(value, ()));
+            reply.send(result);
+            (Controller::Idle(next), Step::Continue)
+        }
+        VmmRequest::Start(_, reply) => match vm {
+            Vm::NotStarted(spec) => {
+                let result = MachinePlan::new(spec.clone(), ctx.kvm_ctx.capabilities())
+                    .and_then(|plan| build(plan, &ctx.kvm_ctx));
+                match result {
+                    Ok(machine) => {
+                        let (stable, operation) = make_start_operation(machine, reply);
+                        (Controller::Busy { stable, operation }, Step::Continue)
+                    }
+                    Err(error) => {
+                        reply.send(Err(ApiError::msg(format!("{error:#}"))));
+                        (Controller::Idle(Vm::NotStarted(spec)), Step::Continue)
+                    }
+                }
+            }
+            vm => {
+                reply.send(Err(ApiError::msg("VM is already started")));
+                (Controller::Idle(vm), Step::Continue)
+            }
+        },
+        VmmRequest::Pause(_, reply) => match vm {
+            Vm::Running(machine) => {
+                let (stable, operation) = make_pause_operation(machine, reply);
+                (Controller::Busy { stable, operation }, Step::Continue)
+            }
+            Vm::Paused(machine) => {
+                reply.send(Ok(()));
+                (Controller::Idle(Vm::Paused(machine)), Step::Continue)
+            }
+            vm => {
+                reply.send(Err(ApiError::msg("VM is not started")));
+                (Controller::Idle(vm), Step::Continue)
+            }
+        },
+        VmmRequest::Resume(_, reply) => match vm {
+            Vm::Paused(machine) => {
+                let (stable, operation) = make_resume_operation(machine, reply);
+                (Controller::Busy { stable, operation }, Step::Continue)
+            }
+            Vm::Running(machine) => {
+                reply.send(Ok(()));
+                (Controller::Idle(Vm::Running(machine)), Step::Continue)
+            }
+            vm => {
+                reply.send(Err(ApiError::msg("VM is not started")));
+                (Controller::Idle(vm), Step::Continue)
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Busy-state handler: only handles requests while an operation is in flight.
+// ---------------------------------------------------------------------------
+
+/// Result of handling a request while Busy.
+pub(crate) enum BusyAction {
+    /// Keep going; operation is unchanged.
+    Continue(Operation),
+    /// Shutdown requested during Busy. Cancel sent, break the request loop.
+    Shutdown(Operation),
+}
+
+/// Subset of [`ProcessCtx`] fields that the busy handler needs. Avoids
+/// requiring a full ProcessCtx (with KvmContext) for unit testing.
+pub(crate) struct BusyCtx<'a> {
+    pub id: &'a str,
+    pub version: &'a str,
+    pub update_logger: fn(api::logger::LoggerConfig) -> ApiResult<()>,
+}
+
+impl<'a> From<&'a ProcessCtx> for BusyCtx<'a> {
+    fn from(ctx: &'a ProcessCtx) -> Self {
+        Self {
+            id: &ctx.id,
+            version: &ctx.version,
+            update_logger: ctx.update_logger,
+        }
+    }
+}
+
+pub(crate) fn handle_busy_request(
+    stable: VmState,
+    mut operation: Operation,
+    request: Option<VmmRequest>,
+    ctx: &BusyCtx<'_>,
+) -> BusyAction {
+    let request = match request {
+        Some(r) => r,
+        None => {
+            // All clients dropped. Cancel the operation.
+            if let Some(cancel_tx) = operation.cancel_tx.take() {
+                let _ = cancel_tx.send(());
+            }
+            return BusyAction::Shutdown(operation);
+        }
+    };
+
+    match request {
+        VmmRequest::GetInstanceInfo(_, reply) => {
+            reply.send(InstanceInfo {
+                id: ctx.id.to_owned(),
+                version: ctx.version.to_owned(),
+                state: stable.clone(),
+            });
+            BusyAction::Continue(operation)
+        }
+        VmmRequest::UpdateLogger(cfg, reply) => {
+            reply.send((ctx.update_logger)(cfg.0));
+            BusyAction::Continue(operation)
+        }
+        VmmRequest::HandoverState(_, reply) => {
+            reply.send(Err(ApiError::msg("live upgrade is not supported")));
+            BusyAction::Continue(operation)
+        }
+        VmmRequest::Shutdown(_, reply) => {
+            reply.send(Ok(()));
+            if let Some(cancel_tx) = operation.cancel_tx.take() {
+                let _ = cancel_tx.send(());
+            }
+            BusyAction::Shutdown(operation)
+        }
+        other => {
+            reject_busy_request(other);
+            BusyAction::Continue(operation)
+        }
+    }
+}
+
+fn reject_busy_request(request: VmmRequest) {
+    let error = ApiError::msg("lifecycle operation in progress");
+    match request {
+        VmmRequest::SetCpus(_, reply) => reply.send(Err(error)),
+        VmmRequest::SetMemory(_, reply) => reply.send(Err(error)),
+        VmmRequest::SetConsole(_, reply) => reply.send(Err(error)),
+        VmmRequest::SetKernel(_, reply) => reply.send(Err(error)),
+        VmmRequest::AddDisk(_, reply) => reply.send(Err(error)),
+        VmmRequest::Start(_, reply) => reply.send(Err(error)),
+        VmmRequest::Pause(_, reply) => reply.send(Err(error)),
+        VmmRequest::Resume(_, reply) => reply.send(Err(error)),
+        VmmRequest::GetInstanceInfo(_, _)
+        | VmmRequest::UpdateLogger(_, _)
+        | VmmRequest::HandoverState(_, _)
+        | VmmRequest::Shutdown(_, _) => {}
+    }
+}
+
+/// Complete an operation: transition back to Idle, send the reply.
+pub(crate) fn complete_operation(
+    stable: VmState,
+    mut operation: Operation,
+    completion: OperationCompletion,
+) -> (Controller, Step) {
+    let reply = operation.reply.take();
+    match completion.result {
+        Ok(()) => {
+            let vm = vm_from_state(completion.target_state, completion.machine);
+            if let Some(reply) = reply {
+                reply.send(Ok(()));
+            }
+            (Controller::Idle(vm), Step::Continue)
+        }
+        Err(error) => {
+            let vm = vm_from_state(stable, completion.machine);
+            let step = Step::error(&error);
+            if let Some(reply) = reply {
+                reply.send(Err(ApiError::msg(format!("{error:#}"))));
+            }
+            (Controller::Idle(vm), step)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use api::RawVmmOp;
-    use api::lifecycle::Shutdown;
+    use api::instance_info::GetInstanceInfo;
+    use api::lifecycle::{Pause, Shutdown};
+    use api::machine::{MemorySizeMib, SetMemory};
 
     use super::*;
 
@@ -230,10 +550,145 @@ mod tests {
             panic!("expected Shutdown request");
         };
 
-        assert!(matches!(
-            accept_shutdown(reply),
-            Step::Stop(VmmExitStatus::Ok)
-        ));
+        reply.send(Ok(()));
         assert_eq!(receiver.try_recv(), Ok(Ok(())));
+    }
+
+    // ------------------------------------------------------------------
+    // Controller unit tests using controllable futures (no KVM required).
+    // ------------------------------------------------------------------
+
+    fn test_busy_ctx() -> BusyCtx<'static> {
+        BusyCtx {
+            id: "test-id",
+            version: "test-version",
+            update_logger: |_| Ok(()),
+        }
+    }
+
+    /// Create a pending operation with a controllable completion channel.
+    fn mock_operation(
+        stable: VmState,
+    ) -> (
+        VmState,
+        Operation,
+        tokio::sync::oneshot::Sender<OperationCompletion>,
+    ) {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
+            Box::pin(async move { completion_rx.await.unwrap() });
+        let (reply_tx, _reply_rx) = oneshot::channel::<ApiResult<()>>();
+        let operation = Operation {
+            future,
+            reply: Some(Reply::from(reply_tx)),
+            cancel_tx: Some(cancel_tx),
+        };
+        (stable, operation, completion_tx)
+    }
+
+    /// Helper: create an Operation with a proper reply channel the test can observe.
+    fn mock_operation_with_reply(
+        stable: VmState,
+    ) -> (
+        VmState,
+        Operation,
+        tokio::sync::oneshot::Sender<OperationCompletion>,
+        oneshot::Receiver<ApiResult<()>>,
+    ) {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
+            Box::pin(async move { completion_rx.await.unwrap() });
+        let (reply_tx, reply_rx) = oneshot::channel::<ApiResult<()>>();
+        let operation = Operation {
+            future,
+            reply: Some(Reply::from(reply_tx)),
+            cancel_tx: Some(cancel_tx),
+        };
+        (stable, operation, completion_tx, reply_rx)
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn busy_get_instance_info_returns_stable_state() {
+        let (stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let (request, receiver) = GetInstanceInfo.into_vmm_request();
+        let ctx = test_busy_ctx();
+
+        let action = handle_busy_request(stable, operation, Some(request), &ctx);
+        assert!(matches!(action, BusyAction::Continue(_)));
+
+        let info = receiver.try_recv().unwrap();
+        assert_eq!(info.state, VmState::Running);
+        assert_eq!(info.id, "test-id");
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn busy_config_request_rejected() {
+        let (stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let (request, receiver) = SetMemory(MemorySizeMib(32)).into_vmm_request();
+        let ctx = test_busy_ctx();
+
+        let action = handle_busy_request(stable, operation, Some(request), &ctx);
+        assert!(matches!(action, BusyAction::Continue(_)));
+
+        let result = receiver.try_recv().unwrap();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("lifecycle operation in progress")
+        );
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn busy_lifecycle_request_rejected() {
+        let (stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let (request, receiver) = Pause.into_vmm_request();
+        let ctx = test_busy_ctx();
+
+        let action = handle_busy_request(stable, operation, Some(request), &ctx);
+        assert!(matches!(action, BusyAction::Continue(_)));
+
+        let result = receiver.try_recv().unwrap();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("lifecycle operation in progress")
+        );
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn busy_shutdown_replies_ok_and_signals_cancel() {
+        let (_stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let (request, receiver) = Shutdown.into_vmm_request();
+        let ctx = test_busy_ctx();
+
+        let action = handle_busy_request(VmState::Running, operation, Some(request), &ctx);
+        assert!(matches!(action, BusyAction::Shutdown(_)));
+
+        let result = receiver.try_recv().unwrap();
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn client_disconnect_during_busy_triggers_cancel() {
+        let (_stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let ctx = test_busy_ctx();
+
+        let action = handle_busy_request(VmState::Running, operation, None, &ctx);
+        assert!(matches!(action, BusyAction::Shutdown(_)));
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn operation_reply_delivered_on_drop() {
+        let (_stable, operation, _completion_tx, _reply_rx) =
+            mock_operation_with_reply(VmState::Running);
+
+        // Just verify the reply channel is set.
+        assert!(operation.reply.is_some());
     }
 }

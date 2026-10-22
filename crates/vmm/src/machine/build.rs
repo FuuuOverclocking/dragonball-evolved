@@ -24,7 +24,7 @@ use crate::devices::legacy::i8042::I8042Device;
 use crate::devices::legacy::serial::SerialDevice;
 use crate::devices::virtio::block::BlockResources;
 use crate::devices::virtio::mmio::{MmioTransport, NOTIFY_OFFSET};
-use crate::devices::{DeviceManager, Placement};
+use crate::devices::{DeviceManager, DeviceRole, Placement};
 
 pub struct Machine {
     pub vcpus: Option<Vcpus>,
@@ -38,13 +38,24 @@ pub struct Machine {
 }
 
 impl Machine {
+    pub async fn pause(&mut self) -> Result<()> {
+        self.vcpus.as_ref().unwrap().pause().await?;
+        self.devices.quiesce().await;
+        Ok(())
+    }
+
+    pub async fn resume(&mut self) -> Result<()> {
+        self.devices.resume().await;
+        self.vcpus.as_ref().unwrap().resume().await
+    }
+
     pub async fn teardown(mut self) -> Result<()> {
         let result = if let Some(vcpus) = self.vcpus.take() {
             vcpus.stop().await
         } else {
             Ok(())
         };
-        self.devices.quiesce().await;
+        self.devices.stop().await;
         drop(self.pio);
         drop(self.mmio);
         drop(self.vm);
@@ -152,6 +163,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         let stop = devices.stop_signal();
         devices.spawn(
             format!("irq-{}", location.gsi),
+            DeviceRole::GuestAffecting,
             Arc::clone(&handle.interrupt).resample(stop),
         );
         let transport = MmioTransport::new(
@@ -180,9 +192,17 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         vm.register_irqfd(&handle.irq_fd, 4)?;
         pio_devices.push((0x3f8..0x400, Arc::new(handle)));
         let stop = devices.stop_signal();
-        devices.spawn("console-input", serial.run(stop));
+        devices.spawn(
+            "console-input",
+            DeviceRole::GuestAffecting,
+            serial.run(stop),
+        );
         let stop = devices.stop_signal();
-        devices.spawn("console-output", drain.run_stdout(stop));
+        devices.spawn(
+            "console-output",
+            DeviceRole::HostOnly,
+            drain.run_stdout(stop),
+        );
     }
     let pio = Arc::new(Bus::new(pio_devices)?);
     let mmio = Arc::new(Bus::new(mmio_devices)?);
@@ -217,9 +237,12 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         fds.push(vcpu);
     }
     for (name, resources) in blocks {
-        devices.spawn_on(name, Placement::Io, move |stop| async move {
-            resources.into_device()?.run(stop).await
-        })?;
+        devices.spawn_on(
+            name,
+            Placement::Io,
+            DeviceRole::GuestAffecting,
+            move |stop| async move { resources.into_device()?.run(stop).await },
+        )?;
     }
     let mut handles = Vec::with_capacity(fds.len());
     for (index, fd) in fds.into_iter().enumerate() {

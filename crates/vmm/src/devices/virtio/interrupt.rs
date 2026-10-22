@@ -82,9 +82,11 @@ impl IrqTrigger {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
-    use crate::devices::DeviceManager;
     use crate::devices::async_fd::AsyncEventFd;
+    use crate::devices::{DeviceManager, DeviceRole};
 
     #[tokio::test(flavor = "local")]
     async fn resampling_reasserts_pending_interrupts_but_not_acknowledged_ones() {
@@ -92,7 +94,11 @@ mod tests {
         let irq = AsyncEventFd::from_event_fd(interrupt.irq_fd().try_clone().unwrap()).unwrap();
         let mut devices = DeviceManager::new();
         let stop = devices.stop_signal();
-        devices.spawn("resampler", Arc::clone(&interrupt).resample(stop));
+        devices.spawn(
+            "resampler",
+            DeviceRole::GuestAffecting,
+            Arc::clone(&interrupt).resample(stop),
+        );
         interrupt.trigger(InterruptKind::UsedRing).unwrap();
         irq.read().await.unwrap();
         interrupt.resample_fd().write(1).unwrap();
@@ -107,6 +113,58 @@ mod tests {
                 .await
                 .is_err()
         );
-        devices.quiesce().await;
+        devices.stop().await;
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn irq_resampler_quiesce_blocks_reinjection_resume_processes() {
+        let interrupt = Arc::new(IrqTrigger::new().unwrap());
+        let irq = AsyncEventFd::from_event_fd(interrupt.irq_fd().try_clone().unwrap()).unwrap();
+        let mut devices = DeviceManager::new();
+        let stop = devices.stop_signal();
+        devices.spawn(
+            "resampler",
+            DeviceRole::GuestAffecting,
+            Arc::clone(&interrupt).resample(stop),
+        );
+
+        // Trigger a used-ring interrupt, consume it.
+        interrupt.trigger(InterruptKind::UsedRing).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), irq.read())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Quiesce the resampler.
+        tokio::time::timeout(Duration::from_secs(1), devices.quiesce())
+            .await
+            .unwrap();
+
+        // Simulate a guest EOI while quiesced.
+        interrupt.resample_fd().write(1).unwrap();
+
+        // The resampler must NOT re-inject while quiesced.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), irq.read())
+                .await
+                .is_err(),
+            "resampler re-injected while quiesced"
+        );
+
+        // Resume -- the saved resample event should be processed and re-inject.
+        tokio::time::timeout(Duration::from_secs(1), devices.resume())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), irq.read())
+            .await
+            .expect("resampler did not re-inject after resume")
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), devices.stop())
+            .await
+            .unwrap();
     }
 }
