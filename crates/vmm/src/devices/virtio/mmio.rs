@@ -193,6 +193,31 @@ impl MmioTransport {
         }
     }
 
+    /// Construct a transport with previously captured register and interrupt
+    /// state, used during snapshot restore.
+    pub fn with_state(
+        desc: DeviceDesc,
+        memory: SharedGuestMemory,
+        activator: Activator,
+        interrupt: Arc<IrqTrigger>,
+        queue_notifiers: Vec<EventFd>,
+        regs: MmioRegs,
+        interrupt_status: u32,
+    ) -> Self {
+        interrupt.status().store(interrupt_status, Ordering::SeqCst);
+        Self {
+            state: Mutex::new(TransportState {
+                regs,
+                session: None,
+            }),
+            desc,
+            memory,
+            activator,
+            interrupt,
+            queue_notifiers,
+        }
+    }
+
     fn activate(&self, state: &mut TransportState) -> Result<()> {
         let mut queues = Vec::with_capacity(self.desc.queue_max.len());
         for (regs, &max) in state.regs.queues.iter().zip(&self.desc.queue_max) {

@@ -109,6 +109,13 @@ impl I8042Device {
         }
     }
 
+    pub fn from_state(state: I8042State, events: mpsc::UnboundedSender<MachineEvent>) -> Self {
+        Self {
+            state: Mutex::new(state),
+            events,
+        }
+    }
+
     pub fn snapshot_state(&self) -> I8042State {
         *self.state.lock().unwrap()
     }

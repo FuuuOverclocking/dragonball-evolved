@@ -18,7 +18,7 @@ use logger::{info_unlimited, warn};
 use tokio::select;
 use tokio::sync::Notify;
 use vm_superio::serial::SerialEvents;
-use vm_superio::{Serial, Trigger};
+use vm_superio::{Serial, SerialState, Trigger};
 use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 
 use crate::devices::Stop;
@@ -141,6 +141,42 @@ impl<W: Write + Send> SerialDevice<W> {
         };
 
         let uart = Arc::new(Mutex::new(Serial::with_events(irq, events, output)));
+        let input = input
+            .map(AsyncInput::new)
+            .transpose()
+            .context("register serial input")?;
+
+        let handle = SerialHandle {
+            uart: Arc::clone(&uart),
+            irq_fd,
+        };
+        Ok((
+            Self {
+                uart,
+                input,
+                drained,
+            },
+            handle,
+        ))
+    }
+
+    /// Rebuild a UART from previously captured [`SerialState`], used during
+    /// snapshot restore.
+    pub fn from_state(
+        state: &SerialState,
+        input: Option<OwnedFd>,
+        output: W,
+    ) -> Result<(Self, SerialHandle<W>)> {
+        let irq = EventFdTrigger::new().context("create serial irqfd")?;
+        let irq_fd = irq.irq_fd().try_clone().context("clone serial irqfd")?;
+        let drained = Arc::new(Notify::new());
+        let events = FifoEvents {
+            drained: Arc::clone(&drained),
+        };
+
+        let uart = Serial::from_state(state, irq, events, output)
+            .map_err(|e| anyhow!("restore serial: {e:?}"))?;
+        let uart = Arc::new(Mutex::new(uart));
         let input = input
             .map(AsyncInput::new)
             .transpose()
