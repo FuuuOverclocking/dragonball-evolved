@@ -11,6 +11,7 @@ use kvm_ioctls::{IoEventAddress, VmFd};
 use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{KernelLoader, PvhBootCapability, load_cmdline};
 use tokio::sync::mpsc;
+use virtio_queue::QueueState;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
 
 use super::bus::{Bus, BusDevice};
@@ -22,7 +23,7 @@ use crate::arch::x86_64::{cpuid, lapic, layout, mptable, msr, pvh, regs};
 use crate::devices::legacy::console::{self, ConsoleOut, RawModeGuard};
 use crate::devices::legacy::i8042::I8042Device;
 use crate::devices::legacy::serial::{SerialDevice, SerialHandle};
-use crate::devices::virtio::block::BlockResources;
+use crate::devices::virtio::block::{BlockQuiesceHandle, BlockResources};
 use crate::devices::virtio::mmio::{MmioTransport, NOTIFY_OFFSET};
 use crate::devices::{DeviceManager, DeviceRole, Placement};
 
@@ -38,17 +39,29 @@ pub struct Machine {
     pub(crate) vm: VmFd,
     pub(crate) memory: memory::SharedGuestMemory,
     raw_mode: Option<RawModeGuard>,
+    pub(crate) block_quiesce: Vec<BlockQuiesceHandle>,
+    pub(crate) captured_block_queues: Vec<QueueState>,
 }
 
 impl Machine {
     pub async fn pause(&mut self) -> Result<()> {
         self.vcpus.as_ref().unwrap().pause().await?;
+        // Quiesce block devices cooperatively and capture their queue state.
+        let mut block_queues = Vec::new();
+        for handle in &self.block_quiesce {
+            block_queues.extend(handle.quiesce().await?);
+        }
+        self.captured_block_queues = block_queues;
+        // Quiesce gate-based devices (irq resampler, serial).
         self.devices.quiesce().await;
         Ok(())
     }
 
     pub async fn resume(&mut self) -> Result<()> {
         self.devices.resume().await;
+        for handle in &self.block_quiesce {
+            handle.resume().await?;
+        }
         self.vcpus.as_ref().unwrap().resume().await
     }
 
@@ -154,9 +167,10 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
     let mut mmio_devices: Vec<(std::ops::Range<u64>, Arc<dyn BusDevice>)> = Vec::new();
     let mut mmio_transports: Vec<Arc<MmioTransport>> = Vec::new();
     let mut blocks = Vec::new();
+    let mut block_quiesce = Vec::new();
     let mut devices = DeviceManager::new();
     for (disk, location) in plan.spec.disks.iter().zip(&plan.devices) {
-        let (resources, handle) =
+        let (resources, handle, quiesce_handle) =
             BlockResources::open(disk.id.as_ref().unwrap(), &disk.path, disk.read_only, None)?;
         vm.register_ioevent(
             &handle.queue_notifier,
@@ -186,6 +200,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
             Arc::clone(&transport) as Arc<dyn BusDevice>,
         ));
         mmio_transports.push(transport);
+        block_quiesce.push(quiesce_handle);
         blocks.push((disk.id.as_ref().unwrap().clone(), resources));
     }
 
@@ -252,7 +267,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         devices.spawn_on(
             name,
             Placement::Io,
-            DeviceRole::GuestAffecting,
+            DeviceRole::HostOnly,
             move |stop| async move { resources.into_device()?.run(stop).await },
         )?;
     }
@@ -279,5 +294,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         vm,
         memory,
         raw_mode,
+        block_quiesce,
+        captured_block_queues: Vec::new(),
     })
 }

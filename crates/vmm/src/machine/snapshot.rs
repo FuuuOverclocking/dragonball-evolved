@@ -112,8 +112,8 @@ pub fn capture_vcpus(vcpus: &Vcpus) -> Result<Vec<VcpuSnapshot>> {
 
 /// Capture mutex-reachable device state.
 ///
-/// `block_queues` is left empty -- Checkpoint 3 fills that in after the
-/// block device cooperatively exports its queue state.
+/// Block queue states come from `machine.captured_block_queues`, which are
+/// filled in during [`Machine::pause`] via cooperative quiesce.
 pub fn capture_devices(machine: &Machine) -> DeviceSnapshots {
     let serial = machine.serial_handle.as_ref().map(|h| {
         let state = h.uart.lock().unwrap().state();
@@ -144,7 +144,7 @@ pub fn capture_devices(machine: &Machine) -> DeviceSnapshots {
         serial,
         i8042,
         transports,
-        block_queues: Vec::new(),
+        block_queues: machine.captured_block_queues.clone(),
     }
 }
 

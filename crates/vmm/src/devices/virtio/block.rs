@@ -8,9 +8,10 @@ use std::{future, io};
 use anyhow::{Context, Result, bail};
 use logger::warn;
 use tokio::select;
+use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 use virtio_queue::desc::split::Descriptor;
-use virtio_queue::{DescriptorChain, Queue, QueueOwnedT, QueueT};
+use virtio_queue::{DescriptorChain, Queue, QueueOwnedT, QueueState, QueueT};
 use vm_memory::{Address, ByteValued, Bytes, GuestMemoryBackend};
 use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 
@@ -83,12 +84,53 @@ pub struct BlockHandle {
     pub desc: DeviceDesc,
 }
 
+/// Command sent through the block device's own quiesce channel.
+enum BlockQuiesceCmd {
+    /// Pause I/O and reply with the current queue state.
+    Quiesce(oneshot::Sender<Vec<QueueState>>),
+    /// Resume I/O from where it left off.
+    Resume,
+}
+
+/// Handle held outside the device for cooperative quiesce / resume.
+///
+/// Unlike the gate-based external quiesce, this lets the device export its
+/// internal [`QueueState`] at the exact moment it parks.
+pub struct BlockQuiesceHandle {
+    pub id: String,
+    tx: mpsc::Sender<BlockQuiesceCmd>,
+}
+
+impl BlockQuiesceHandle {
+    /// Ask the block device to quiesce and return its queue states.
+    pub async fn quiesce(&self) -> anyhow::Result<Vec<QueueState>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(BlockQuiesceCmd::Quiesce(reply_tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("block device {} is not running", self.id))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("block device {} dropped quiesce reply", self.id))
+    }
+
+    /// Resume the block device after a quiesce.
+    pub async fn resume(&self) -> anyhow::Result<()> {
+        self.tx
+            .send(BlockQuiesceCmd::Resume)
+            .await
+            .map_err(|_| anyhow::anyhow!("block device {} is not running", self.id))?;
+        Ok(())
+    }
+}
+
 pub struct BlockResources {
     id: String,
     disk: Disk,
     queue_kick: EventFd,
     activation: ActivationRx,
     iops: Option<(u64, Duration)>,
+    quiesce_rx: mpsc::Receiver<BlockQuiesceCmd>,
 }
 
 impl BlockResources {
@@ -97,7 +139,8 @@ impl BlockResources {
         path: &Path,
         read_only: bool,
         iops: Option<(u64, Duration)>,
-    ) -> Result<(Self, BlockHandle)> {
+    ) -> Result<(Self, BlockHandle, BlockQuiesceHandle)> {
+        let id = id.into();
         let disk = Disk::open(path, read_only)?;
         if let Some((capacity, window)) = iops
             && (capacity == 0 || window.is_zero())
@@ -108,6 +151,7 @@ impl BlockResources {
         let queue_notifier = queue_kick.try_clone()?;
         let interrupt = Arc::new(IrqTrigger::new()?);
         let (activator, activation) = activation_channel();
+        let (quiesce_tx, quiesce_rx) = mpsc::channel(1);
         let desc = DeviceDesc {
             device_type: 2,
             features: VERSION_1 | (1 << 9) | if read_only { 1 << 5 } else { 0 },
@@ -120,15 +164,21 @@ impl BlockResources {
             interrupt,
             desc,
         };
+        let quiesce_handle = BlockQuiesceHandle {
+            id: id.clone(),
+            tx: quiesce_tx,
+        };
         Ok((
             Self {
-                id: id.into(),
+                id,
                 disk,
                 queue_kick,
                 activation,
                 iops,
+                quiesce_rx,
             },
             handle,
+            quiesce_handle,
         ))
     }
 
@@ -140,6 +190,7 @@ impl BlockResources {
             activation: self.activation,
             iops: self.iops,
             staging: Vec::new(),
+            quiesce_rx: self.quiesce_rx,
         })
     }
 }
@@ -151,6 +202,7 @@ pub struct BlockDevice {
     activation: ActivationRx,
     iops: Option<(u64, Duration)>,
     staging: Vec<u8>,
+    quiesce_rx: mpsc::Receiver<BlockQuiesceCmd>,
 }
 
 impl BlockDevice {
@@ -159,17 +211,39 @@ impl BlockDevice {
         path: &Path,
         read_only: bool,
         iops: Option<(u64, Duration)>,
-    ) -> Result<(Self, BlockHandle)> {
-        let (resources, handle) = BlockResources::open(id, path, read_only, iops)?;
-        Ok((resources.into_device()?, handle))
+    ) -> Result<(Self, BlockHandle, BlockQuiesceHandle)> {
+        let (resources, handle, quiesce_handle) = BlockResources::open(id, path, read_only, iops)?;
+        Ok((resources.into_device()?, handle, quiesce_handle))
     }
 
     pub async fn run(mut self, mut stop: Stop) -> Result<()> {
         loop {
-            let activation = select! {
-                biased;
-                () = stop.requested() => return Ok(()),
-                activation = self.activation.recv() => activation,
+            // Wait for activation, handling quiesce while inactive.
+            let activation = loop {
+                select! {
+                    biased;
+                    () = stop.requested() => return Ok(()),
+                    Some(cmd) = self.quiesce_rx.recv() => {
+                        if let BlockQuiesceCmd::Quiesce(reply) = cmd {
+                            let _ = reply.send(Vec::new());
+                            // Park until resume or stop.
+                            loop {
+                                select! {
+                                    biased;
+                                    () = stop.requested() => return Ok(()),
+                                    cmd = self.quiesce_rx.recv() => match cmd {
+                                        Some(BlockQuiesceCmd::Resume) => break,
+                                        Some(BlockQuiesceCmd::Quiesce(reply)) => {
+                                            let _ = reply.send(Vec::new());
+                                        }
+                                        None => return Ok(()),
+                                    },
+                                }
+                            }
+                        }
+                    }
+                    activation = self.activation.recv() => break activation,
+                }
             };
             let Some(Activation {
                 mem,
@@ -213,6 +287,26 @@ impl BlockDevice {
                 biased;
                 () = stop.requested() => return Ok(()),
                 () = session.requested() => return Ok(()),
+                Some(cmd) = self.quiesce_rx.recv() => match cmd {
+                    BlockQuiesceCmd::Quiesce(reply) => {
+                        let _ = reply.send(vec![active.queue.state()]);
+                        // Park until resume or stop.
+                        loop {
+                            select! {
+                                biased;
+                                () = stop.requested() => return Ok(()),
+                                cmd = self.quiesce_rx.recv() => match cmd {
+                                    Some(BlockQuiesceCmd::Resume) => break,
+                                    Some(BlockQuiesceCmd::Quiesce(reply)) => {
+                                        let _ = reply.send(vec![active.queue.state()]);
+                                    }
+                                    None => return Ok(()),
+                                },
+                            }
+                        }
+                    }
+                    BlockQuiesceCmd::Resume => {}
+                },
                 () = sleep_until_opt(resume_at) => resume_at = self.drain(active, limiter.as_mut())?,
                 result = self.queue_kick.read(), if resume_at.is_none() => {
                     result.context("read block queue notification")?;

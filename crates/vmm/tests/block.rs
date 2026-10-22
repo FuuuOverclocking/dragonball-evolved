@@ -45,7 +45,7 @@ async fn read_request_moves_disk_contents_into_guest_memory() {
     contents.extend_from_slice(&[0xcd; SECTOR_SIZE]);
     let disk = TempDisk::new("read", &contents);
 
-    let (device, handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
+    let (device, handle, _) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -85,7 +85,7 @@ async fn read_request_moves_disk_contents_into_guest_memory() {
 async fn write_request_reaches_the_disk() {
     let disk = TempDisk::new("write", &vec![0; 2 * SECTOR_SIZE]);
 
-    let (device, handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
+    let (device, handle, _) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -125,7 +125,7 @@ async fn one_kick_drains_every_queued_request() {
     // assume one notification means one request.
     let disk = TempDisk::new("drain", &vec![0x11; 8 * SECTOR_SIZE]);
 
-    let (device, handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
+    let (device, handle, _) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -166,7 +166,7 @@ async fn rate_limit_spreads_requests_out_without_a_timerfd() {
 
     // One request per window, so each extra request has to wait for a refill.
     let window = Duration::from_millis(40);
-    let (device, handle) =
+    let (device, handle, _) =
         BlockDevice::new("test-blk", disk.path(), false, Some((1, window))).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
@@ -213,7 +213,7 @@ async fn rate_limit_spreads_requests_out_without_a_timerfd() {
 async fn flush_and_get_id_are_answered_and_junk_is_rejected() {
     let disk = TempDisk::new("misc", &vec![0; 2 * SECTOR_SIZE]);
 
-    let (device, handle) = BlockDevice::new("my-disk", disk.path(), false, None).unwrap();
+    let (device, handle, _) = BlockDevice::new("my-disk", disk.path(), false, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -276,7 +276,7 @@ async fn a_device_the_guest_never_activated_still_stops_cleanly() {
     // back in this state. Here the task is simply parked on two awaits, one of
     // which is the stop signal.
     let disk = TempDisk::new("inactive", &vec![0; SECTOR_SIZE]);
-    let (device, _handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
+    let (device, _handle, _) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
@@ -293,7 +293,7 @@ async fn a_device_the_guest_never_activated_still_stops_cleanly() {
 async fn read_only_disk_refuses_writes() {
     let disk = TempDisk::new("readonly", &vec![0x33; 2 * SECTOR_SIZE]);
 
-    let (device, handle) = BlockDevice::new("test-blk", disk.path(), true, None).unwrap();
+    let (device, handle, _) = BlockDevice::new("test-blk", disk.path(), true, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
@@ -349,7 +349,7 @@ async fn io_thread_transport_reset_acknowledges_and_reactivates_queues() {
     use vmm::devices::virtio::mmio::MmioTransport;
     use vmm::machine::bus::BusDevice;
     let disk = TempDisk::new("reset", &[0xac; SECTOR_SIZE]);
-    let (resources, handle) = BlockResources::open("reset", disk.path(), true, None).unwrap();
+    let (resources, handle, _) = BlockResources::open("reset", disk.path(), true, None).unwrap();
     let mut guest = GuestDriver::new();
     let transport = Arc::new(MmioTransport::new(
         handle.desc,
@@ -397,7 +397,7 @@ async fn io_thread_transport_reset_acknowledges_and_reactivates_queues() {
 async fn malformed_payload_does_not_partially_modify_the_disk() {
     use vm_memory::GuestAddress;
     let disk = TempDisk::new("invalid-payload", &[0x33; SECTOR_SIZE * 2]);
-    let (device, handle) = BlockDevice::new("invalid", disk.path(), false, None).unwrap();
+    let (device, handle, _) = BlockDevice::new("invalid", disk.path(), false, None).unwrap();
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
     devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
@@ -426,7 +426,7 @@ async fn corrupt_available_index_reports_failure_without_hanging_shutdown() {
     use vmm::devices::Placement;
     use vmm::devices::virtio::block::BlockResources;
     let disk = TempDisk::new("invalid-avail", &[0; SECTOR_SIZE]);
-    let (resources, handle) =
+    let (resources, handle, _) =
         BlockResources::open("invalid-avail", disk.path(), true, None).unwrap();
     let guest = GuestDriver::new();
     guest.mem.write_obj(17u16, GuestAddress(0x2002)).unwrap();
@@ -459,7 +459,7 @@ async fn corrupt_available_index_reports_failure_without_hanging_shutdown() {
 async fn requests_larger_than_one_mib_use_bounded_staging() {
     const SIZE: usize = 2 * 1024 * 1024;
     let disk = TempDisk::new("large-read", &vec![0xa5; SIZE]);
-    let (device, handle) = BlockDevice::new("large-read", disk.path(), true, None).unwrap();
+    let (device, handle, _) = BlockDevice::new("large-read", disk.path(), true, None).unwrap();
     let mut guest = GuestDriver::new();
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
@@ -486,7 +486,8 @@ async fn misaligned_queue_address_is_not_silently_replaced_with_zero() {
     use vmm::devices::virtio::mmio::MmioTransport;
     use vmm::machine::bus::BusDevice;
     let disk = TempDisk::new("misaligned", &[0; SECTOR_SIZE]);
-    let (_resources, handle) = BlockResources::open("misaligned", disk.path(), true, None).unwrap();
+    let (_resources, handle, _) =
+        BlockResources::open("misaligned", disk.path(), true, None).unwrap();
     let guest = GuestDriver::new();
     let transport = MmioTransport::new(
         handle.desc,
@@ -519,7 +520,7 @@ async fn misaligned_queue_address_is_not_silently_replaced_with_zero() {
 async fn truncated_chain_completes_without_writing_an_unreachable_status() {
     use vm_memory::GuestAddress;
     let disk = TempDisk::new("truncated", &[0x33; SECTOR_SIZE]);
-    let (device, handle) = BlockDevice::new("truncated", disk.path(), false, None).unwrap();
+    let (device, handle, _) = BlockDevice::new("truncated", disk.path(), false, None).unwrap();
     let mut guest = GuestDriver::new();
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
@@ -544,12 +545,13 @@ async fn truncated_chain_completes_without_writing_an_unreachable_status() {
 #[tokio::test(flavor = "local")]
 async fn block_quiesce_pauses_and_resume_completes_same_session() {
     let disk = TempDisk::new("quiesce-blk", &vec![0xab; SECTOR_SIZE]);
-    let (device, handle) = BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
+    let (device, handle, quiesce_handle) =
+        BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
     let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
 
     let mut devices = DeviceManager::new();
     let stop = devices.stop_signal();
-    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
+    devices.spawn("block", DeviceRole::HostOnly, device.run(stop));
 
     let mut guest = GuestDriver::new();
     let _session = activate(&handle, &guest);
@@ -570,10 +572,20 @@ async fn block_quiesce_pauses_and_resume_completes_same_session() {
         .unwrap();
     assert_eq!(guest.used_idx(), 1);
 
-    // Quiesce.
-    tokio::time::timeout(Duration::from_secs(5), devices.quiesce())
+    // Quiesce via the block-specific channel and verify QueueState.
+    let states = tokio::time::timeout(Duration::from_secs(5), quiesce_handle.quiesce())
         .await
+        .unwrap()
         .unwrap();
+    assert_eq!(states.len(), 1, "block device has exactly one queue");
+    assert_eq!(
+        states[0].next_avail, 1,
+        "next_avail should reflect 1 submitted request"
+    );
+    assert_eq!(
+        states[0].next_used, 1,
+        "next_used should reflect 1 completed request"
+    );
 
     // Submit a request while quiesced.
     let h2 = guest.request_header(VIRTIO_BLK_T_IN, 0);
@@ -590,9 +602,10 @@ async fn block_quiesce_pauses_and_resume_completes_same_session() {
     settle().await;
     assert_eq!(guest.used_idx(), 1, "request completed while quiesced");
 
-    // Resume.
-    tokio::time::timeout(Duration::from_secs(5), devices.resume())
+    // Resume via the block-specific channel.
+    tokio::time::timeout(Duration::from_secs(5), quiesce_handle.resume())
         .await
+        .unwrap()
         .unwrap();
 
     // The request completes in the same activation/session.
@@ -607,4 +620,56 @@ async fn block_quiesce_pauses_and_resume_completes_same_session() {
     tokio::time::timeout(Duration::from_secs(5), devices.stop())
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "local")]
+async fn block_quiesce_returns_queue_state_reflecting_completed_requests() {
+    let disk = TempDisk::new("quiesce-state", &vec![0xab; 4 * SECTOR_SIZE]);
+    let (device, handle, quiesce_handle) =
+        BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
+    let irq = AsyncEventFd::from_event_fd(handle.interrupt.irq_fd().try_clone().unwrap()).unwrap();
+
+    let mut devices = DeviceManager::new();
+    let stop = devices.stop_signal();
+    devices.spawn("block", DeviceRole::HostOnly, device.run(stop));
+
+    let mut guest = GuestDriver::new();
+    let _session = activate(&handle, &guest);
+
+    // Submit and complete 3 read requests.
+    for sector in 0..3u64 {
+        let h = guest.request_header(VIRTIO_BLK_T_IN, sector);
+        let d = guest.alloc(SECTOR_SIZE as u32);
+        let s = guest.alloc(1);
+        guest.submit(&[
+            Segment::readable(h, 16),
+            Segment::writable(d, SECTOR_SIZE as u32),
+            Segment::writable(s, 1),
+        ]);
+    }
+    handle.queue_notifier.write(1).unwrap();
+    irq.read().await.unwrap();
+    wait_until("all three requests to complete", || guest.used_idx() == 3).await;
+
+    // Quiesce and verify the exported QueueState.
+    let states = tokio::time::timeout(Duration::from_secs(5), quiesce_handle.quiesce())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(
+        states[0].next_avail, 3,
+        "next_avail should reflect 3 submitted requests"
+    );
+    assert_eq!(
+        states[0].next_used, 3,
+        "next_used should reflect 3 completed requests"
+    );
+
+    // Resume and stop cleanly.
+    tokio::time::timeout(Duration::from_secs(5), quiesce_handle.resume())
+        .await
+        .unwrap()
+        .unwrap();
+    devices.stop().await;
 }

@@ -65,7 +65,7 @@ async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
             } => {
                 let event = select! {
                     biased;
-                    completion = &mut operation.future => BusyEvent::Completion(completion),
+                    completion = &mut operation.future => BusyEvent::Completion(Box::new(completion)),
                     request = server.next_request() => BusyEvent::Request(request),
                 };
                 let (next, step) =

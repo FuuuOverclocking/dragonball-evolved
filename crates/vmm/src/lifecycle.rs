@@ -423,7 +423,7 @@ pub(crate) enum BusyAction {
 
 /// What the main loop observed while Busy.
 pub(crate) enum BusyEvent {
-    Completion(OperationCompletion),
+    Completion(Box<OperationCompletion>),
     Request(Option<VmmRequest>),
 }
 
@@ -545,7 +545,7 @@ pub(crate) async fn handle_busy(
     ctx: &BusyCtx<'_>,
 ) -> (Controller, Step) {
     match event {
-        BusyEvent::Completion(completion) => complete_operation(stable, operation, completion),
+        BusyEvent::Completion(completion) => complete_operation(stable, operation, *completion),
         BusyEvent::Request(request) => {
             match handle_busy_request(stable.clone(), operation, request, ctx) {
                 BusyAction::Continue(op) => (
