@@ -108,6 +108,10 @@ impl I8042Device {
             events,
         }
     }
+
+    pub fn snapshot_state(&self) -> I8042State {
+        *self.state.lock().unwrap()
+    }
 }
 
 impl BusDevice for I8042Device {

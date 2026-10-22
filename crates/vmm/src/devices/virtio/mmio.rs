@@ -244,6 +244,16 @@ impl MmioTransport {
         state.regs = MmioRegs::new(&self.desc);
         Ok(())
     }
+
+    /// Return a clone of the transport's register state and the current
+    /// interrupt status word. Intended for snapshot capture.
+    pub fn snapshot(&self) -> (MmioRegs, u32) {
+        let state = self.state.lock().unwrap();
+        (
+            state.regs.clone(),
+            self.interrupt.status().load(Ordering::SeqCst),
+        )
+    }
 }
 
 impl BusDevice for MmioTransport {

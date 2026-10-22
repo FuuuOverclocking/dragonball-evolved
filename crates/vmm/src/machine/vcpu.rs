@@ -6,13 +6,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
-use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
+use kvm_bindings::{
+    KVM_MAX_CPUID_ENTRIES, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, Msrs, kvm_msr_entry,
+};
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use tokio::sync::mpsc as tokio_mpsc;
 use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
 
 use super::MachineEvent;
 use super::bus::Bus;
+use super::snapshot::VcpuSnapshot;
+use crate::arch::x86_64::msr::msr_indices;
 
 static SIGNAL_HANDLER_ERRNO: OnceLock<i32> = OnceLock::new();
 
@@ -124,6 +128,51 @@ impl VcpuHandle {
         })
     }
 
+    pub fn capture_state(&self) -> Result<VcpuSnapshot> {
+        let fd = self
+            .kick_fd
+            .lock()
+            .map_err(|_| anyhow!("vCPU {} kick fd mutex was poisoned", self.index))?;
+        // Ordering: get_mp_state first because the internal kvm_apic_accept_events
+        // can modify LAPIC state.
+        let mp_state = fd.get_mp_state().context("get mp_state")?;
+        let regs = fd.get_regs().context("get regs")?;
+        let sregs = fd.get_sregs().context("get sregs")?;
+        let fpu = fd.get_fpu().context("get fpu")?;
+        let lapic = fd.get_lapic().context("get lapic")?;
+        let cpuid = fd.get_cpuid2(KVM_MAX_CPUID_ENTRIES).context("get cpuid")?;
+
+        // Build MSR query from known indices.
+        let entries: Vec<kvm_msr_entry> = msr_indices()
+            .into_iter()
+            .map(|index| kvm_msr_entry {
+                index,
+                ..Default::default()
+            })
+            .collect();
+        let mut msrs_req = Msrs::from_entries(&entries).context("build MSR query")?;
+        let count = fd.get_msrs(&mut msrs_req).context("get msrs")?;
+        let msrs = msrs_req.as_slice()[..count].to_vec();
+
+        let xcrs = fd.get_xcrs().context("get xcrs")?;
+        let debug_regs = fd.get_debug_regs().context("get debug_regs")?;
+        let vcpu_events = fd.get_vcpu_events().context("get vcpu_events")?;
+
+        Ok(VcpuSnapshot {
+            index: self.index,
+            mp_state,
+            regs,
+            sregs,
+            fpu,
+            lapic,
+            cpuid,
+            msrs,
+            xcrs,
+            debug_regs,
+            vcpu_events,
+        })
+    }
+
     fn command(&self, command: VcpuCommand) -> Result<()> {
         self.commands
             .send(command)
@@ -188,6 +237,10 @@ impl Drop for VcpuHandle {
 impl Vcpus {
     pub fn new(handles: Vec<VcpuHandle>) -> Self {
         Self { handles }
+    }
+
+    pub fn handles(&self) -> &[VcpuHandle] {
+        &self.handles
     }
 
     pub fn len(&self) -> usize {
@@ -625,6 +678,78 @@ mod tests {
         assert!(matches!(event, MachineEvent::GuestReset));
         assert_eq!(*output.lock().unwrap(), b"OK");
         vcpus.stop().await.unwrap();
+        drop(vm);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_state_returns_set_registers_on_kvm() {
+        if !Path::new("/dev/kvm").exists() {
+            return;
+        }
+        let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+        let vm = context.kvm().create_vm().unwrap();
+        vm.set_tss_address(TSS_START as usize).unwrap();
+        vm.create_irq_chip().unwrap();
+        vm.create_pit2(kvm_pit_config {
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let regions = ram_regions(16 << 20).unwrap();
+        let memory = memory::create(&regions).unwrap();
+        // SAFETY: test drops VM before memory.
+        unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }
+            .unwrap();
+
+        const ENTRY: u64 = 0x10_0000;
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let cpuid = normalize(
+            &context.capabilities().supported_cpuid,
+            &context.capabilities().host_cpuid,
+            1,
+            0,
+        )
+        .unwrap();
+        vcpu.set_cpuid2(&cpuid).unwrap();
+        let entries = boot_msrs();
+        let msrs = Msrs::from_entries(&entries).unwrap();
+        assert_eq!(vcpu.set_msrs(&msrs).unwrap(), entries.len());
+        let set_regs = boot_regs(ENTRY);
+        vcpu.set_regs(&set_regs).unwrap();
+        let set_fpu = boot_fpu();
+        vcpu.set_fpu(&set_fpu).unwrap();
+        let (sregs, tables) = boot_sregs(vcpu.get_sregs().unwrap());
+        for table in tables {
+            memory
+                .write_slice(&table.bytes, GuestAddress(table.address))
+                .unwrap();
+        }
+        vcpu.set_sregs(&sregs).unwrap();
+        vcpu.set_lapic(&configure_lint(vcpu.get_lapic().unwrap()))
+            .unwrap();
+
+        let pio = Arc::new(Bus::empty());
+        let mmio = Arc::new(Bus::empty());
+        let (event_tx, _event_rx) = tokio_mpsc::unbounded_channel();
+        // vCPU starts paused, so capture_state can read immediately.
+        let handle = VcpuHandle::spawn(0, vcpu, &vm, pio, mmio, event_tx).unwrap();
+
+        let snapshot = handle.capture_state().unwrap();
+
+        assert_eq!(snapshot.index, 0);
+        assert_eq!(snapshot.regs.rip, set_regs.rip);
+        assert_eq!(snapshot.regs.rsp, set_regs.rsp);
+        assert_eq!(snapshot.regs.rflags, set_regs.rflags);
+        assert_eq!(snapshot.fpu.fcw, set_fpu.fcw);
+        assert!(!snapshot.cpuid.as_slice().is_empty(), "cpuid entries > 0");
+        assert!(!snapshot.msrs.is_empty(), "msrs non-empty");
+
+        handle.command(VcpuCommand::Stop).unwrap();
+        time::timeout(KVM_TEST_TIMEOUT, handle.wait())
+            .await
+            .expect("timed out waiting for vCPU stop")
+            .unwrap();
         drop(vm);
     }
 }

@@ -104,6 +104,7 @@ pub(crate) struct Operation {
 // Controller: the top-level state machine.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Controller {
     /// No lifecycle operation is running; the Vm owns the Machine.
     Idle(Vm),

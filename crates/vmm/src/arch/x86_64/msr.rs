@@ -12,6 +12,17 @@ const MSR_CSTAR: u32 = 0xc000_0083;
 const MSR_SYSCALL_MASK: u32 = 0xc000_0084;
 const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
 
+/// Returns the MSR indices that must be saved and restored.
+///
+/// The set currently matches `boot_msrs` plus `IA32_TSC`.
+pub fn msr_indices() -> Vec<u32> {
+    let mut indices: Vec<u32> = boot_msrs().into_iter().map(|e| e.index).collect();
+    if !indices.contains(&MSR_IA32_TSC) {
+        indices.push(MSR_IA32_TSC);
+    }
+    indices
+}
+
 pub fn boot_msrs() -> Vec<kvm_msr_entry> {
     let zero = |index| kvm_msr_entry {
         index,

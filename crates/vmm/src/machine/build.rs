@@ -19,9 +19,9 @@ use super::vcpu::{VcpuHandle, Vcpus};
 use super::{MachineEvent, memory};
 use crate::KvmContext;
 use crate::arch::x86_64::{cpuid, lapic, layout, mptable, msr, pvh, regs};
-use crate::devices::legacy::console::{self, RawModeGuard};
+use crate::devices::legacy::console::{self, ConsoleOut, RawModeGuard};
 use crate::devices::legacy::i8042::I8042Device;
-use crate::devices::legacy::serial::SerialDevice;
+use crate::devices::legacy::serial::{SerialDevice, SerialHandle};
 use crate::devices::virtio::block::BlockResources;
 use crate::devices::virtio::mmio::{MmioTransport, NOTIFY_OFFSET};
 use crate::devices::{DeviceManager, DeviceRole, Placement};
@@ -30,10 +30,13 @@ pub struct Machine {
     pub vcpus: Option<Vcpus>,
     pub devices: DeviceManager,
     pub events: mpsc::UnboundedReceiver<MachineEvent>,
+    pub serial_handle: Option<Arc<SerialHandle<ConsoleOut>>>,
+    pub i8042: Option<Arc<I8042Device>>,
+    pub mmio_transports: Vec<Arc<MmioTransport>>,
     pio: Arc<Bus>,
     mmio: Arc<Bus>,
-    vm: VmFd,
-    memory: memory::SharedGuestMemory,
+    pub(crate) vm: VmFd,
+    pub(crate) memory: memory::SharedGuestMemory,
     raw_mode: Option<RawModeGuard>,
 }
 
@@ -56,6 +59,9 @@ impl Machine {
             Ok(())
         };
         self.devices.stop().await;
+        drop(self.serial_handle);
+        drop(self.i8042);
+        drop(self.mmio_transports);
         drop(self.pio);
         drop(self.mmio);
         drop(self.vm);
@@ -142,9 +148,11 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
     }
 
     let (events_tx, events) = mpsc::unbounded_channel();
+    let i8042 = Arc::new(I8042Device::new(events_tx.clone()));
     let mut pio_devices: Vec<(std::ops::Range<u64>, Arc<dyn BusDevice>)> =
-        vec![(0x60..0x65, Arc::new(I8042Device::new(events_tx.clone())))];
+        vec![(0x60..0x65, Arc::clone(&i8042) as Arc<dyn BusDevice>)];
     let mut mmio_devices: Vec<(std::ops::Range<u64>, Arc<dyn BusDevice>)> = Vec::new();
+    let mut mmio_transports: Vec<Arc<MmioTransport>> = Vec::new();
     let mut blocks = Vec::new();
     let mut devices = DeviceManager::new();
     for (disk, location) in plan.spec.disks.iter().zip(&plan.devices) {
@@ -166,21 +174,23 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
             DeviceRole::GuestAffecting,
             Arc::clone(&handle.interrupt).resample(stop),
         );
-        let transport = MmioTransport::new(
+        let transport = Arc::new(MmioTransport::new(
             handle.desc,
             Arc::clone(&memory),
             handle.activator,
             handle.interrupt,
             vec![handle.queue_notifier],
-        );
+        ));
         mmio_devices.push((
             location.address..location.address + layout::VIRTIO_MMIO_LEN,
-            Arc::new(transport),
+            Arc::clone(&transport) as Arc<dyn BusDevice>,
         ));
+        mmio_transports.push(transport);
         blocks.push((disk.id.as_ref().unwrap().clone(), resources));
     }
 
     let mut raw_mode = None;
+    let mut serial_handle = None;
     if plan.spec.console == ConsoleConfig::Stdio {
         let input = console::open_input()?;
         let fd = input.map(|input| {
@@ -189,8 +199,10 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         });
         let (output, drain) = console::output(console::DEFAULT_OUTPUT_CAPACITY);
         let (serial, handle) = SerialDevice::with_input(fd, output)?;
+        let handle = Arc::new(handle);
         vm.register_irqfd(&handle.irq_fd, 4)?;
-        pio_devices.push((0x3f8..0x400, Arc::new(handle)));
+        pio_devices.push((0x3f8..0x400, Arc::clone(&handle) as Arc<dyn BusDevice>));
+        serial_handle = Some(handle);
         let stop = devices.stop_signal();
         devices.spawn(
             "console-input",
@@ -259,6 +271,9 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         vcpus: Some(Vcpus::new(handles)),
         devices,
         events,
+        serial_handle,
+        i8042: Some(i8042),
+        mmio_transports,
         pio,
         mmio,
         vm,
