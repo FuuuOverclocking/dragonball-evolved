@@ -420,6 +420,12 @@ pub(crate) enum BusyAction {
     Shutdown(Operation),
 }
 
+/// What the main loop observed while Busy.
+pub(crate) enum BusyEvent {
+    Completion(OperationCompletion),
+    Request(Option<VmmRequest>),
+}
+
 /// Subset of [`ProcessCtx`] fields that the busy handler needs. Avoids
 /// requiring a full ProcessCtx (with KvmContext) for unit testing.
 pub(crate) struct BusyCtx<'a> {
@@ -526,6 +532,37 @@ pub(crate) fn complete_operation(
                 reply.send(Err(ApiError::msg(format!("{error:#}"))));
             }
             (Controller::Idle(vm), step)
+        }
+    }
+}
+
+/// Handle one event while the Controller is Busy.
+pub(crate) async fn handle_busy(
+    stable: VmState,
+    operation: Operation,
+    event: BusyEvent,
+    ctx: &BusyCtx<'_>,
+) -> (Controller, Step) {
+    match event {
+        BusyEvent::Completion(completion) => complete_operation(stable, operation, completion),
+        BusyEvent::Request(request) => {
+            match handle_busy_request(stable.clone(), operation, request, ctx) {
+                BusyAction::Continue(op) => (
+                    Controller::Busy {
+                        stable,
+                        operation: op,
+                    },
+                    Step::Continue,
+                ),
+                BusyAction::Shutdown(mut op) => {
+                    let completion = op.future.await;
+                    if let Some(reply) = op.reply.take() {
+                        reply.send(Err(ApiError::msg("interrupted by shutdown")));
+                    }
+                    let vm = vm_from_state(stable, completion.machine);
+                    (Controller::Idle(vm), Step::Stop(VmmExitStatus::Ok))
+                }
+            }
         }
     }
 }

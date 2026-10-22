@@ -17,10 +17,7 @@ use tokio::sync::mpsc;
 
 pub use crate::exit_status::VmmExitStatus;
 pub use crate::kvm_context::{HostCapabilities, KvmContext};
-use crate::lifecycle::{
-    BusyAction, BusyCtx, Controller, Event, Step, complete_operation, handle_busy_request,
-    handle_idle,
-};
+use crate::lifecycle::{BusyCtx, BusyEvent, Controller, Event, Step, handle_busy, handle_idle};
 pub use crate::process_ctx::ProcessCtx;
 use crate::spec::MachineSpec;
 pub use crate::vmm_server::VmmClient;
@@ -66,41 +63,17 @@ async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
                 stable,
                 mut operation,
             } => {
-                // BUSY: select operation completion (biased) and requests.
-                let (result_controller, result_step) = select! {
+                let event = select! {
                     biased;
-                    completion = &mut operation.future => {
-                        complete_operation(stable, operation, completion)
-                    }
-                    request = server.next_request() => {
-                        let busy_ctx = BusyCtx::from(&ctx);
-                        match handle_busy_request(stable.clone(), operation, request, &busy_ctx) {
-                            BusyAction::Continue(op) => {
-                                controller = Controller::Busy {
-                                    stable,
-                                    operation: op,
-                                };
-                                continue;
-                            }
-                            BusyAction::Shutdown(mut op) => {
-                                // Await operation completion (cancel was already sent).
-                                let completion = op.future.await;
-                                // Send interrupted error to lifecycle reply.
-                                if let Some(reply) = op.reply.take() {
-                                    reply.send(Err(api::ApiError::msg(
-                                        "interrupted by shutdown",
-                                    )));
-                                }
-                                let vm = lifecycle::vm_from_state(stable, completion.machine);
-                                (Controller::Idle(vm), Step::Stop(VmmExitStatus::Ok))
-                            }
-                        }
-                    }
+                    completion = &mut operation.future => BusyEvent::Completion(completion),
+                    request = server.next_request() => BusyEvent::Request(request),
                 };
-                match result_step {
-                    Step::Continue => controller = result_controller,
+                let (next, step) =
+                    handle_busy(stable, operation, event, &BusyCtx::from(&ctx)).await;
+                match step {
+                    Step::Continue => controller = next,
                     Step::Stop(s) => {
-                        controller = result_controller;
+                        controller = next;
                         break 'main s;
                     }
                 }
