@@ -759,6 +759,53 @@ gate 是纯 supervisor 层控制，不修改也不替换原始 future；quiesce 
 - `Machine::resume()`：先 `devices.resume()`（设备就绪），再 `vcpus.resume()`（guest 可以立即发起 I/O）。
 - `Machine::teardown()`：`vcpus.stop()` → `devices.stop()` → drop Bus / VM / memory。
 
+### 8.8 状态可提取性：capture / rebuild
+
+**MachineSnapshot 纯数据容器**
+
+`MachineSnapshot` 是一次 capture 的完整快照，所有字段均为普通 struct，不加 serde derive——同进程 round-trip 不需要序列化。
+
+| 字段 | 内容 |
+| --- | --- |
+| `VmKvmState` | irqchip×3（PIC master、PIC slave、IOAPIC）、PIT、clock |
+| `Vec<VcpuSnapshot>` | 每 vCPU 完整寄存器组：regs、sregs、XSAVE（而非 FPU）、xcrs、debug_regs、lapic、msrs、mp_state、vcpu_events |
+| `DeviceSnapshots` | serial `SerialState`、i8042 `I8042State`、mmio transport `MmioRegs` + `interrupt_status`、block `QueueState` |
+| `SharedGuestMemory` | `Arc` 引用，同进程共享 mmap |
+
+**Capture 顺序**
+
+1. **设备状态先**：block `QueueState` 在 pause 时由设备内部协作导出（见下文）；serial / i8042 / transport 通过 Mutex 读取。
+2. **vCPU 状态**：`get_mp_state` 最先——`kvm_apic_accept_events` 副作用；`get_vcpu_events` 最后。
+3. **VM KVM 状态**：irqchip → PIT → clock 最后。
+4. 理由：设备 capture 可能注入最后一个中断，因此必须在 vCPU 和 VM 状态之前完成。
+
+**Rebuild 顺序**
+
+从 `MachineSnapshot` + `MachineSpec` 重建 `Machine`：
+
+1. `create_vm` + TSS + `create_irq_chip` + `set_irqchip`×3 + `create_pit2` + `set_pit2`。
+2. `memory::register`：使用 snapshot 的 `Arc`，mmap 仍存活。
+3. 重建设备运行时：从 spec 重开文件，新建 fd，注册 ioevent / irqfd；注入纯数据状态。
+4. `create_vcpu` + 恢复寄存器：`set_cpuid2` → `set_mp_state` → regs → sregs → xsave → xcrs → debug_regs → lapic → msrs → `vcpu_events` + `kvmclock_ctrl`。
+5. `set_clock`（最后）。
+6. 重建 `DeviceManager` + spawn 设备任务 + 已激活 transport 的 block 重新 Activation。
+
+**Block 内部协作 quiesce**
+
+block 不使用外部 `gated()` supervisor 提取队列状态，而是在 `serve()` 的 `select!` 中处理 quiesce 信号：
+
+- 设备用 `&mut active` 直接调 `queue.state()` 提取 `QueueState`，通过 reply oneshot 发回。
+- 随后进入 parked 等待 resume，同一 session / queue / limiter 保持完好。
+
+**MSR 列表**
+
+vCPU 快照保存与恢复的 MSR 共 17 项：
+
+| 分组 | MSR |
+| --- | --- |
+| boot_msrs（11 项） | `SYSENTER_CS`、`SYSENTER_ESP`、`SYSENTER_EIP`、`STAR`、`CSTAR`、`KERNEL_GS_BASE`、`SYSCALL_MASK`、`LSTAR`、`TSC`、`IA32_MISC_ENABLE`、`MTRRdefType` |
+| 额外（6 项） | `IA32_TSC`、`IA32_FS_BASE`、`IA32_GS_BASE`、`MSR_EFER`、`MSR_TSC_AUX`、`IA32_TSC_DEADLINE` |
+
 ## 9. API 与配置（E4、E5）
 
 ### 9.1 操作定义
@@ -915,6 +962,12 @@ crates/vmm/src/
 - `Start` 在 vmm-main 上同步读取内核与 initrd 文件（D5 的例外）。
 - 控制台 raw mode 下，Ctrl-C 不会终止 VMM。
 - Busy 期间不处理机器事件（`MachineEvent`、`DeviceExit`）：操作 future 独占 Machine，events 和 device exits 的 receiver 在 future 内部不被 poll。操作完成后回到 Idle 时才会在下一轮 select 中处理积压的事件。
+- 同进程 round-trip 已验证；跨进程序列化（含 RAM dump 到文件和格式版本控制）尚未实现。
+- MSR 列表是硬编码的 17 项；长期应改为 `KVM_GET_MSR_INDEX_LIST` 动态发现。
+- 同进程 round-trip 共享 mmap，不复制 RAM；真正的快照需要 dirty page tracking 或完整 dump。
+- rebuild 与 build 约 60% 重复，可在后续提取共享函数。
+- block quiesce 的 parked loop 中缺少 `session.requested()` 分支（延迟清理，非正确性问题）。
+- rate limiter 的 `Instant` 在暂停期间继续流逝，resume 后第一个窗口可能不限流。
 
 ## 14. 实现与验证进度
 
@@ -928,6 +981,12 @@ crates/vmm/src/
 - [x] DeviceManager 拆为三操作：quiesce（可恢复冻结 GuestAffecting future）、resume（解除冻结）、stop（最终终止）。DeviceRole 区分 GuestAffecting 与 HostOnly。gate 是 supervisor 层 biased-select，不修改原 future。
 - [x] Machine::pause() 先 vcpus.pause() 再 devices.quiesce()；Machine::resume() 先 devices.resume() 再 vcpus.resume()；teardown 先 vcpus.stop() 再 devices.stop()。
 - [x] 顶层 Controller::{Idle(Vm), Busy{stable, operation}} 替换原来的 Vm handle。Operation 持久化为本地 !Send Pin<Box<Future>>，独占 Machine。Busy 时 GET 返回前一稳定态，UpdateLogger 仍工作，其他写/生命周期返回错误。Shutdown 在 Busy 时通过 cancel oneshot 中断 Operation。Controller 单元测试覆盖 Busy 状态下的查询、拒绝、Shutdown 取消及客户端断开。
+- [x] MachineSnapshot 纯数据容器：VmKvmState、VcpuSnapshot（XSAVE）、DeviceSnapshots、block QueueState 导出。
+- [x] capture 函数：设备先 → vCPU → VM KVM 状态，带 Firecracker ordering 注释。
+- [x] block device 内部协作 quiesce：serve() select! 中处理 quiesce 信号，用 &mut 直接提取 QueueState。
+- [x] rebuild 函数：从 MachineSnapshot + MachineSpec 重建 Machine，KVM 恢复顺序匹配 Firecracker，含 kvmclock_ctrl 和 XSAVE。
+- [x] 同进程 round-trip 验证：寄存器递增 guest 经历 capture→teardown→rebuild→resume 后继续运行；block reactivation 从 captured QueueState 恢复。
+- [x] 深度 review 修复：XSAVE 替代 FPU、kvmclock_ctrl、FS/GS BASE + EFER + TSC_AUX + TSC_DEADLINE MSR、transport session 注入。
 
 运行真实 Linux 冒烟测试：
 
