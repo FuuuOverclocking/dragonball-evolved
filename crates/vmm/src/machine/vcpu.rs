@@ -138,7 +138,7 @@ impl VcpuHandle {
         let mp_state = fd.get_mp_state().context("get mp_state")?;
         let regs = fd.get_regs().context("get regs")?;
         let sregs = fd.get_sregs().context("get sregs")?;
-        let fpu = fd.get_fpu().context("get fpu")?;
+        let xsave = fd.get_xsave().context("get xsave")?;
         let lapic = fd.get_lapic().context("get lapic")?;
         let cpuid = fd.get_cpuid2(KVM_MAX_CPUID_ENTRIES).context("get cpuid")?;
 
@@ -163,7 +163,7 @@ impl VcpuHandle {
             mp_state,
             regs,
             sregs,
-            fpu,
+            xsave,
             lapic,
             cpuid,
             msrs,
@@ -741,7 +741,12 @@ mod tests {
         assert_eq!(snapshot.regs.rip, set_regs.rip);
         assert_eq!(snapshot.regs.rsp, set_regs.rsp);
         assert_eq!(snapshot.regs.rflags, set_regs.rflags);
-        assert_eq!(snapshot.fpu.fcw, set_fpu.fcw);
+        // The FCW sits at the start of the legacy x87 region inside the XSAVE
+        // area (lower 16 bits of region[0]).
+        assert_eq!(
+            snapshot.xsave.region[0] as u16, set_fpu.fcw,
+            "FCW mismatch in XSAVE region"
+        );
         assert!(!snapshot.cpuid.as_slice().is_empty(), "cpuid entries > 0");
         assert!(!snapshot.msrs.is_empty(), "msrs non-empty");
 

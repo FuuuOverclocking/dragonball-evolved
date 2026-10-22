@@ -6,19 +6,34 @@ const MSR_IA32_SYSENTER_ESP: u32 = 0x175;
 const MSR_IA32_SYSENTER_EIP: u32 = 0x176;
 const MSR_IA32_MISC_ENABLE: u32 = 0x1a0;
 const MSR_MTRR_DEF_TYPE: u32 = 0x2ff;
+const IA32_TSC_DEADLINE: u32 = 0x6E0;
+const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xc000_0081;
 const MSR_LSTAR: u32 = 0xc000_0082;
 const MSR_CSTAR: u32 = 0xc000_0083;
 const MSR_SYSCALL_MASK: u32 = 0xc000_0084;
+const IA32_FS_BASE: u32 = 0xC000_0100;
+const IA32_GS_BASE: u32 = 0xC000_0101;
 const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
+const MSR_TSC_AUX: u32 = 0xC000_0103;
 
 /// Returns the MSR indices that must be saved and restored.
 ///
-/// The set currently matches `boot_msrs` plus `IA32_TSC`.
+/// The set covers `boot_msrs` plus additional registers required for faithful
+/// vCPU state round-tripping (segment bases, EFER, TSC helpers, etc.).
 pub fn msr_indices() -> Vec<u32> {
     let mut indices: Vec<u32> = boot_msrs().into_iter().map(|e| e.index).collect();
-    if !indices.contains(&MSR_IA32_TSC) {
-        indices.push(MSR_IA32_TSC);
+    for &extra in &[
+        MSR_IA32_TSC,
+        IA32_FS_BASE,
+        IA32_GS_BASE,
+        MSR_EFER,
+        MSR_TSC_AUX,
+        IA32_TSC_DEADLINE,
+    ] {
+        if !indices.contains(&extra) {
+            indices.push(extra);
+        }
     }
     indices
 }

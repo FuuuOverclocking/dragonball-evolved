@@ -7,11 +7,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use kvm_bindings::{
-    CpuId, KVM_PIT_SPEAKER_DUMMY, Msrs, kvm_clock_data, kvm_debugregs, kvm_fpu, kvm_irqchip,
+    CpuId, KVM_PIT_SPEAKER_DUMMY, Msrs, kvm_clock_data, kvm_debugregs, kvm_irqchip,
     kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_pit_config, kvm_pit_state2, kvm_regs,
-    kvm_sregs, kvm_vcpu_events, kvm_xcrs,
+    kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
 };
 use kvm_ioctls::{IoEventAddress, VmFd};
+use logger::warn;
 use tokio::sync::mpsc;
 use virtio_queue::{Queue, QueueState, QueueT};
 use vm_superio::SerialState;
@@ -55,7 +56,7 @@ pub struct VcpuSnapshot {
     pub mp_state: kvm_mp_state,
     pub regs: kvm_regs,
     pub sregs: kvm_sregs,
-    pub fpu: kvm_fpu,
+    pub xsave: kvm_xsave,
     pub lapic: kvm_lapic_state,
     pub cpuid: CpuId,
     pub msrs: Vec<kvm_msr_entry>,
@@ -320,6 +321,7 @@ pub fn rebuild(
             queue_state,
             driver_features,
             interrupt_for_activation,
+            Arc::clone(mmio_transports.last().unwrap()),
         ));
     }
 
@@ -364,7 +366,10 @@ pub fn rebuild(
             .context("restore mp_state")?;
         vcpu.set_regs(&vcpu_snap.regs).context("restore regs")?;
         vcpu.set_sregs(&vcpu_snap.sregs).context("restore sregs")?;
-        vcpu.set_fpu(&vcpu_snap.fpu).context("restore fpu")?;
+        // SAFETY: We restore the same kvm_xsave that get_xsave() produced on the
+        // same host. No dynamic XSTATE features are enabled, so the traditional
+        // 4096-byte kvm_xsave is sufficient.
+        unsafe { vcpu.set_xsave(&vcpu_snap.xsave) }.context("restore xsave")?;
         vcpu.set_xcrs(&vcpu_snap.xcrs).context("restore xcrs")?;
         vcpu.set_debug_regs(&vcpu_snap.debug_regs)
             .context("restore debug_regs")?;
@@ -380,6 +385,11 @@ pub fn rebuild(
         }
         vcpu.set_vcpu_events(&vcpu_snap.vcpu_events)
             .context("restore vcpu_events")?;
+        // Notify KVM that the guest's pvclock may be out of sync after restore,
+        // preventing spurious soft-lockup detection inside the guest.
+        if let Err(e) = vcpu.kvmclock_ctrl() {
+            warn!("kvmclock_ctrl failed for vCPU {}: {e:#}", vcpu_snap.index);
+        }
         fds.push(vcpu);
     }
 
@@ -388,9 +398,17 @@ pub fn rebuild(
         .context("restore VM clock")?;
 
     // 7. Spawn block device tasks and handle reactivation.
-    for (name, resources, activator, queue_state, driver_features, interrupt) in blocks {
+    for (name, resources, activator, queue_state, driver_features, interrupt, transport) in blocks {
         let mem = Arc::clone(&snapshot.memory);
-        let reactivate = queue_state.map(|qs| (qs, activator, mem, driver_features, interrupt));
+        // Create the session channel outside the async block so we can inject
+        // the control half into the MmioTransport synchronously.
+        let reactivate = if let Some(qs) = queue_state {
+            let (control, session) = session_channel();
+            transport.inject_session(control);
+            Some((qs, activator, mem, driver_features, interrupt, session))
+        } else {
+            None
+        };
         devices.spawn_on(
             name,
             Placement::Io,
@@ -399,12 +417,12 @@ pub fn rebuild(
                 let device = resources.into_device()?;
                 // If the device was active before the snapshot, send an
                 // activation with the captured queue state so it resumes I/O.
-                if let Some((qs, activator, mem, driver_features, interrupt)) = reactivate {
+                if let Some((qs, activator, mem, driver_features, interrupt, session)) = reactivate
+                {
                     let queue = Queue::try_from(qs).context("restore block queue from state")?;
                     if !queue.is_valid(mem.as_ref()) {
                         bail!("restored block queue failed validation");
                     }
-                    let (control, session) = session_channel();
                     activator.activate(Activation {
                         mem,
                         queues: vec![queue],
@@ -412,9 +430,6 @@ pub fn rebuild(
                         driver_features,
                         session,
                     })?;
-                    // Keep the session control alive alongside the device so
-                    // the session channel is not dropped prematurely.
-                    let _control = control;
                     device.run(stop).await
                 } else {
                     device.run(stop).await

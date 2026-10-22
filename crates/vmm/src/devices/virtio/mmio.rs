@@ -279,6 +279,13 @@ impl MmioTransport {
             self.interrupt.status().load(Ordering::SeqCst),
         )
     }
+
+    /// Inject a previously created [`SessionControl`] into the transport,
+    /// used during snapshot restore so that a subsequent guest-initiated
+    /// reset can reach the reactivated device.
+    pub fn inject_session(&self, control: SessionControl) {
+        self.state.lock().unwrap().session = Some(control);
+    }
 }
 
 impl BusDevice for MmioTransport {
