@@ -12,8 +12,8 @@ use common::guest::{
 use common::{TempDisk, settle, wait_until};
 use vmm::devices::DeviceManager;
 use vmm::devices::async_fd::AsyncEventFd;
-use vmm::devices::virtio::Activation;
 use vmm::devices::virtio::block::{BlockDevice, BlockHandle};
+use vmm::devices::virtio::{Activation, SessionControl, session_channel};
 
 /// Spawn a block device and bring it up the way a driver would.
 ///
@@ -21,16 +21,20 @@ use vmm::devices::virtio::block::{BlockDevice, BlockHandle};
 /// `DRIVER_OK` write is a synchronous mmio exit handled on a vcpu thread, so the
 /// handshake has to cross a thread boundary. It is a channel send here rather
 /// than firecracker's `activate_evt` eventfd round-trip.
-fn activate(handle: &BlockHandle, guest: &GuestDriver) {
+fn activate(handle: &BlockHandle, guest: &GuestDriver) -> SessionControl {
+    let (control, session) = session_channel();
     let activation = Activation {
         mem: Arc::clone(&guest.mem),
         queues: vec![guest.queue()],
         interrupt: Arc::clone(&handle.interrupt),
+        driver_features: 1 << 32,
+        session,
     };
     let activator = handle.activator.clone();
     std::thread::spawn(move || activator.activate(activation).expect("activate device"))
         .join()
         .expect("activation thread panicked");
+    control
 }
 
 #[tokio::test(flavor = "local")]
@@ -49,7 +53,7 @@ async fn read_request_moves_disk_contents_into_guest_memory() {
     devices.spawn("block", device.run(stop));
 
     let mut guest = GuestDriver::new();
-    activate(&handle, &guest);
+    let _session = activate(&handle, &guest);
 
     let header = guest.request_header(VIRTIO_BLK_T_IN, 1);
     let data = guest.alloc(SECTOR_SIZE as u32);
@@ -89,7 +93,7 @@ async fn write_request_reaches_the_disk() {
     devices.spawn("block", device.run(stop));
 
     let mut guest = GuestDriver::new();
-    activate(&handle, &guest);
+    let _session = activate(&handle, &guest);
 
     let header = guest.request_header(VIRTIO_BLK_T_OUT, 1);
     let data = guest.alloc(SECTOR_SIZE as u32);
@@ -129,7 +133,7 @@ async fn one_kick_drains_every_queued_request() {
     devices.spawn("block", device.run(stop));
 
     let mut guest = GuestDriver::new();
-    activate(&handle, &guest);
+    let _session = activate(&handle, &guest);
 
     const REQUESTS: u16 = 5;
     let mut statuses = Vec::new();
@@ -171,7 +175,7 @@ async fn rate_limit_spreads_requests_out_without_a_timerfd() {
     devices.spawn("block", device.run(stop));
 
     let mut guest = GuestDriver::new();
-    activate(&handle, &guest);
+    let _session = activate(&handle, &guest);
 
     const REQUESTS: u16 = 3;
     for sector in 0..u64::from(REQUESTS) {
@@ -217,7 +221,7 @@ async fn flush_and_get_id_are_answered_and_junk_is_rejected() {
     devices.spawn("block", device.run(stop));
 
     let mut guest = GuestDriver::new();
-    activate(&handle, &guest);
+    let _session = activate(&handle, &guest);
 
     let flush_header = guest.request_header(VIRTIO_BLK_T_FLUSH, 0);
     let flush_status = guest.alloc(1);
@@ -297,7 +301,7 @@ async fn read_only_disk_refuses_writes() {
     devices.spawn("block", device.run(stop));
 
     let mut guest = GuestDriver::new();
-    activate(&handle, &guest);
+    let _session = activate(&handle, &guest);
 
     let header = guest.request_header(VIRTIO_BLK_T_OUT, 0);
     let data = guest.alloc(SECTOR_SIZE as u32);
@@ -315,5 +319,218 @@ async fn read_only_disk_refuses_writes() {
     assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_IOERR]);
     assert_eq!(disk.contents(), vec![0x33; 2 * SECTOR_SIZE]);
 
+    devices.quiesce().await;
+}
+
+fn configure_transport(transport: &vmm::devices::virtio::mmio::MmioTransport) {
+    use vmm::machine::bus::BusDevice;
+    for (offset, value) in [
+        (0x70, 1u32),
+        (0x70, 3),
+        (0x24, 1),
+        (0x20, 1),
+        (0x70, 11),
+        (0x30, 0),
+        (0x38, 16),
+        (0x80, 0x1000),
+        (0x90, 0x2000),
+        (0xa0, 0x3000),
+        (0x44, 1),
+        (0x70, 15),
+    ] {
+        transport.write(offset, &value.to_le_bytes());
+    }
+}
+
+#[tokio::test(flavor = "local")]
+async fn io_thread_transport_reset_acknowledges_and_reactivates_queues() {
+    use vmm::devices::Placement;
+    use vmm::devices::virtio::block::BlockResources;
+    use vmm::devices::virtio::mmio::MmioTransport;
+    use vmm::machine::bus::BusDevice;
+    let disk = TempDisk::new("reset", &[0xac; SECTOR_SIZE]);
+    let (resources, handle) = BlockResources::open("reset", disk.path(), true, None).unwrap();
+    let mut guest = GuestDriver::new();
+    let transport = Arc::new(MmioTransport::new(
+        handle.desc,
+        guest.mem.clone(),
+        handle.activator,
+        handle.interrupt,
+        vec![handle.queue_notifier],
+    ));
+    let mut devices = DeviceManager::new();
+    devices
+        .spawn_on("block-reset", Placement::Io, move |stop| async move {
+            resources.into_device()?.run(stop).await
+        })
+        .unwrap();
+    for _ in 0..3 {
+        configure_transport(&transport);
+        let header = guest.request_header(VIRTIO_BLK_T_IN, 0);
+        let data = guest.alloc(SECTOR_SIZE as u32);
+        let status = guest.alloc(1);
+        guest.submit(&[
+            Segment::readable(header, 16),
+            Segment::writable(data, SECTOR_SIZE as u32),
+            Segment::writable(status, 1),
+        ]);
+        transport.write(0x50, &0u32.to_le_bytes());
+        wait_until("transport IO completion", || guest.used_idx() == 1).await;
+        assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_OK]);
+        assert_eq!(guest.read_bytes(data, SECTOR_SIZE), vec![0xac; SECTOR_SIZE]);
+        let reset = transport.clone();
+        tokio::task::spawn_blocking(move || reset.write(0x70, &0u32.to_le_bytes()))
+            .await
+            .unwrap();
+        let mut status = [0; 4];
+        transport.read(0x70, &mut status);
+        assert_eq!(u32::from_le_bytes(status), 0);
+        guest.reset_queue();
+    }
+    devices.quiesce().await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn malformed_payload_does_not_partially_modify_the_disk() {
+    use vm_memory::GuestAddress;
+    let disk = TempDisk::new("invalid-payload", &[0x33; SECTOR_SIZE * 2]);
+    let (device, handle) = BlockDevice::new("invalid", disk.path(), false, None).unwrap();
+    let mut devices = DeviceManager::new();
+    let stop = devices.stop_signal();
+    devices.spawn("block", device.run(stop));
+    let mut guest = GuestDriver::new();
+    let _session = activate(&handle, &guest);
+    let header = guest.request_header(VIRTIO_BLK_T_OUT, 0);
+    let data = guest.alloc(SECTOR_SIZE as u32);
+    guest.write_bytes(data, &[0x77; SECTOR_SIZE]);
+    let status = guest.alloc(1);
+    guest.submit(&[
+        Segment::readable(header, 16),
+        Segment::readable(data, SECTOR_SIZE as u32),
+        Segment::readable(GuestAddress(u64::MAX - 128), u32::MAX - 1024),
+        Segment::writable(status, 1),
+    ]);
+    handle.queue_notifier.write(1).unwrap();
+    wait_until("invalid request completion", || guest.used_idx() == 1).await;
+    assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_IOERR]);
+    assert_eq!(disk.contents(), vec![0x33; SECTOR_SIZE * 2]);
+    devices.quiesce().await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn corrupt_available_index_reports_failure_without_hanging_shutdown() {
+    use vm_memory::{Bytes, GuestAddress};
+    use vmm::devices::Placement;
+    use vmm::devices::virtio::block::BlockResources;
+    let disk = TempDisk::new("invalid-avail", &[0; SECTOR_SIZE]);
+    let (resources, handle) =
+        BlockResources::open("invalid-avail", disk.path(), true, None).unwrap();
+    let guest = GuestDriver::new();
+    guest.mem.write_obj(17u16, GuestAddress(0x2002)).unwrap();
+    let mut devices = DeviceManager::new();
+    devices
+        .spawn_on("invalid-avail", Placement::Io, move |stop| async move {
+            resources.into_device()?.run(stop).await
+        })
+        .unwrap();
+    let _session = activate(&handle, &guest);
+    let exit = tokio::time::timeout(Duration::from_secs(1), devices.next_exit())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        exit.result
+            .unwrap_err()
+            .to_string()
+            .contains("available index")
+    );
+    tokio::time::timeout(Duration::from_secs(1), devices.quiesce())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "local")]
+async fn requests_larger_than_one_mib_use_bounded_staging() {
+    const SIZE: usize = 2 * 1024 * 1024;
+    let disk = TempDisk::new("large-read", &vec![0xa5; SIZE]);
+    let (device, handle) = BlockDevice::new("large-read", disk.path(), true, None).unwrap();
+    let mut guest = GuestDriver::new();
+    let mut devices = DeviceManager::new();
+    let stop = devices.stop_signal();
+    devices.spawn("large-read", device.run(stop));
+    let _session = activate(&handle, &guest);
+    let header = guest.request_header(VIRTIO_BLK_T_IN, 0);
+    let data = guest.alloc(SIZE as u32);
+    let status = guest.alloc(1);
+    guest.submit(&[
+        Segment::readable(header, 16),
+        Segment::writable(data, SIZE as u32),
+        Segment::writable(status, 1),
+    ]);
+    handle.queue_notifier.write(1).unwrap();
+    wait_until("large request completion", || guest.used_idx() == 1).await;
+    assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_OK]);
+    assert_eq!(guest.read_bytes(data, SIZE), vec![0xa5; SIZE]);
+    devices.quiesce().await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn misaligned_queue_address_is_not_silently_replaced_with_zero() {
+    use vmm::devices::virtio::block::BlockResources;
+    use vmm::devices::virtio::mmio::MmioTransport;
+    use vmm::machine::bus::BusDevice;
+    let disk = TempDisk::new("misaligned", &[0; SECTOR_SIZE]);
+    let (_resources, handle) = BlockResources::open("misaligned", disk.path(), true, None).unwrap();
+    let guest = GuestDriver::new();
+    let transport = MmioTransport::new(
+        handle.desc,
+        guest.mem,
+        handle.activator,
+        handle.interrupt,
+        vec![handle.queue_notifier],
+    );
+    for (offset, value) in [
+        (0x70, 1u32),
+        (0x70, 3),
+        (0x24, 1),
+        (0x20, 1),
+        (0x70, 11),
+        (0x38, 16),
+        (0x80, 0x1000),
+        (0x90, 0x2000),
+        (0xa0, 1),
+        (0x44, 1),
+        (0x70, 15),
+    ] {
+        transport.write(offset, &value.to_le_bytes());
+    }
+    let mut status = [0; 4];
+    transport.read(0x70, &mut status);
+    assert_ne!(u32::from_le_bytes(status) & 64, 0);
+}
+
+#[tokio::test(flavor = "local")]
+async fn truncated_chain_completes_without_writing_an_unreachable_status() {
+    use vm_memory::GuestAddress;
+    let disk = TempDisk::new("truncated", &[0x33; SECTOR_SIZE]);
+    let (device, handle) = BlockDevice::new("truncated", disk.path(), false, None).unwrap();
+    let mut guest = GuestDriver::new();
+    let mut devices = DeviceManager::new();
+    let stop = devices.stop_signal();
+    devices.spawn("truncated", device.run(stop));
+    let _session = activate(&handle, &guest);
+    let header = guest.request_header(VIRTIO_BLK_T_OUT, 0);
+    let status = guest.alloc(1);
+    guest.write_bytes(status, &[0xff]);
+    guest.submit(&[
+        Segment::readable(header, 16),
+        Segment::readable(GuestAddress(0), u32::MAX),
+        Segment::writable(status, 1),
+    ]);
+    handle.queue_notifier.write(1).unwrap();
+    wait_until("truncated chain completion", || guest.used_idx() == 1).await;
+    assert_eq!(guest.used_entry(0).1, 0);
+    assert_eq!(guest.read_bytes(status, 1), [0xff]);
+    assert_eq!(disk.contents(), vec![0x33; SECTOR_SIZE]);
     devices.quiesce().await;
 }

@@ -131,7 +131,14 @@ mod tests {
         assert_eq!(serialized.value, value);
         assert!(serialized.fds.is_empty());
 
-        let (request, waiter) = crate::block::AddDisk {}.into_vmm_command().into_request();
+        let (request, waiter) = crate::block::AddDisk(crate::block::BlockDevConfig {
+            id: None,
+            path: "/test/disk".into(),
+            read_only: false,
+            root: false,
+        })
+        .into_vmm_command()
+        .into_request();
         let VmmRequest::AddDisk(_, reply) = request else {
             panic!("expected AddDisk");
         };

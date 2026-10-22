@@ -179,7 +179,7 @@ mod tests {
     use std::path::Path;
 
     use api::config::ProcessConfig;
-    use api::logger::UpdateLogger;
+    use api::logger::LoggerConfig;
     use clap::{CommandFactory, FromArgMatches};
 
     use super::*;
@@ -263,7 +263,7 @@ mod tests {
                 id: Some("from-file".into()),
                 api_sock: None,
                 kvm_dev: None,
-                logger: UpdateLogger {
+                logger: LoggerConfig {
                     level: Some(LevelFilter::Warn),
                     show_tid: Some(true),
                     ..Default::default()

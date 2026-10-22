@@ -14,7 +14,7 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow};
-use logger::info_unlimited;
+use logger::{info_unlimited, warn};
 use tokio::select;
 use tokio::sync::Notify;
 use vm_superio::serial::SerialEvents;
@@ -23,6 +23,7 @@ use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 
 use crate::devices::Stop;
 use crate::devices::async_fd::AsyncInput;
+use crate::machine::bus::BusDevice;
 
 /// How much console input to pull from the host in one read.
 const RX_CHUNK: usize = 64;
@@ -85,6 +86,32 @@ pub struct SerialHandle<W: Write + Send> {
     pub irq_fd: EventFd,
 }
 
+impl<W: Write + Send + 'static> BusDevice for SerialHandle<W> {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        if data.len() != 1 {
+            return;
+        }
+        match self.uart.lock() {
+            Ok(mut uart) => data[0] = uart.read(offset as u8),
+            Err(_) => warn!("serial uart mutex was poisoned"),
+        }
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) {
+        if data.len() != 1 {
+            return;
+        }
+        match self.uart.lock() {
+            Ok(mut uart) => {
+                if let Err(error) = uart.write(offset as u8, data[0]) {
+                    warn!("serial register write failed: {error:?}");
+                }
+            }
+            Err(_) => warn!("serial uart mutex was poisoned"),
+        }
+    }
+}
+
 /// A 16550A UART driven by its own task.
 #[derive(Debug)]
 pub struct SerialDevice<W: Write + Send> {
@@ -94,7 +121,7 @@ pub struct SerialDevice<W: Write + Send> {
     /// task's own state stay out of reach of other threads, so this lock is only
     /// ever held for the length of a register access and never across an await.
     uart: Arc<Mutex<Uart<W>>>,
-    input: AsyncInput<OwnedFd>,
+    input: Option<AsyncInput<OwnedFd>>,
     drained: Arc<Notify>,
 }
 
@@ -102,6 +129,10 @@ impl<W: Write + Send> SerialDevice<W> {
     /// Build a UART reading from `input` -- a pty, a pipe, or `stdin` -- and
     /// writing guest output to `output`.
     pub fn new(input: OwnedFd, output: W) -> Result<(Self, SerialHandle<W>)> {
+        Self::with_input(Some(input), output)
+    }
+
+    pub fn with_input(input: Option<OwnedFd>, output: W) -> Result<(Self, SerialHandle<W>)> {
         let irq = EventFdTrigger::new().context("create serial irqfd")?;
         let irq_fd = irq.irq_fd().try_clone().context("clone serial irqfd")?;
         let drained = Arc::new(Notify::new());
@@ -110,7 +141,10 @@ impl<W: Write + Send> SerialDevice<W> {
         };
 
         let uart = Arc::new(Mutex::new(Serial::with_events(irq, events, output)));
-        let input = AsyncInput::new(input).context("register serial input")?;
+        let input = input
+            .map(AsyncInput::new)
+            .transpose()
+            .context("register serial input")?;
 
         let handle = SerialHandle {
             uart: Arc::clone(&uart),
@@ -128,6 +162,10 @@ impl<W: Write + Send> SerialDevice<W> {
 
     /// Feed host input to the guest until the vmm stops or the input closes.
     pub async fn run(self, mut stop: Stop) -> Result<()> {
+        let Some(input) = &self.input else {
+            stop.requested().await;
+            return Ok(());
+        };
         let mut buf = [0u8; RX_CHUNK];
         // Bytes read from the host, and how many of them the FIFO has taken. A
         // short `enqueue_raw_bytes` leaves a remainder that must survive until
@@ -141,7 +179,7 @@ impl<W: Write + Send> SerialDevice<W> {
                 filled = select! {
                     biased;
                     () = stop.requested() => return Ok(()),
-                    result = self.input.read(&mut buf) => result.context("read serial input")?,
+                    result = input.read(&mut buf) => result.context("read serial input")?,
                 };
 
                 // End of file. Returning drops the descriptor with the task

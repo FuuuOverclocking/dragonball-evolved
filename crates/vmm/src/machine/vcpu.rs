@@ -1,0 +1,503 @@
+use std::os::unix::thread::JoinHandleExt;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{Ordering, fence};
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+
+use anyhow::{Context, Result, anyhow};
+use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
+use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
+use tokio::sync::mpsc as tokio_mpsc;
+use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
+
+use super::MachineEvent;
+use super::bus::Bus;
+
+static SIGNAL_HANDLER_ERRNO: OnceLock<i32> = OnceLock::new();
+
+extern "C" fn kick_signal_handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    fence(Ordering::Acquire);
+}
+
+pub enum VcpuCommand {
+    Pause(oneshot::Sender<()>),
+    Resume(oneshot::Sender<()>),
+    Stop,
+}
+
+pub struct VcpuHandle {
+    index: u8,
+    kick_fd: Mutex<VcpuFd>,
+    commands: mpsc::Sender<VcpuCommand>,
+    exited: Option<oneshot::Receiver<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+pub struct Vcpus {
+    handles: Vec<VcpuHandle>,
+}
+
+struct VcpuRunner {
+    index: u8,
+    fd: VcpuFd,
+    pio: Arc<Bus>,
+    mmio: Arc<Bus>,
+    commands: mpsc::Receiver<VcpuCommand>,
+    events: tokio_mpsc::UnboundedSender<MachineEvent>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunState {
+    Paused,
+    Running,
+    Stop,
+}
+
+impl VcpuHandle {
+    pub fn spawn(
+        index: u8,
+        fd: VcpuFd,
+        vm: &VmFd,
+        pio: Arc<Bus>,
+        mmio: Arc<Bus>,
+        events: tokio_mpsc::UnboundedSender<MachineEvent>,
+    ) -> Result<Self> {
+        install_signal_handler()?;
+        // SAFETY: `fd` is live and the new descriptor is owned by the following VcpuFd.
+        let raw_fd = unsafe {
+            libc::fcntl(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                libc::F_DUPFD_CLOEXEC,
+                0,
+            )
+        };
+        if raw_fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("duplicate vCPU fd");
+        }
+        // SAFETY: `raw_fd` is a fresh duplicate of this VM's vCPU fd.
+        let kick_fd =
+            unsafe { vm.create_vcpu_from_rawfd(raw_fd) }.context("construct duplicate vCPU fd")?;
+        let (command_tx, command_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = oneshot::channel();
+        let panic_events = events.clone();
+        let runner = VcpuRunner {
+            index,
+            fd,
+            pio,
+            mmio,
+            commands: command_rx,
+            events,
+        };
+        let thread = thread::Builder::new()
+            .name(format!("vcpu-{index}"))
+            .spawn(move || {
+                if let Err(error) = unblock_kick_signal() {
+                    let _ = panic_events.send(MachineEvent::VcpuFailed {
+                        index,
+                        error: error.to_string(),
+                    });
+                    let _ = exited_tx.send(());
+                    return;
+                }
+                if panic::catch_unwind(AssertUnwindSafe(|| runner.run())).is_err() {
+                    let _ = panic_events.send(MachineEvent::VcpuFailed {
+                        index,
+                        error: "vCPU thread panicked".into(),
+                    });
+                }
+                let _ = exited_tx.send(());
+            })
+            .context("spawn vCPU thread")?;
+        Ok(Self {
+            index,
+            kick_fd: Mutex::new(kick_fd),
+            commands: command_tx,
+            exited: Some(exited_rx),
+            thread: Some(thread),
+        })
+    }
+
+    fn command(&self, command: VcpuCommand) -> Result<()> {
+        self.commands
+            .send(command)
+            .map_err(|_| anyhow!("vCPU {} already exited", self.index))?;
+        self.kick()
+    }
+
+    fn kick(&self) -> Result<()> {
+        self.kick_fd
+            .lock()
+            .map_err(|_| anyhow!("vCPU {} kick fd mutex was poisoned", self.index))?
+            .set_kvm_immediate_exit(1);
+        fence(Ordering::Release);
+        let thread = self
+            .thread
+            .as_ref()
+            .context("vCPU thread was already joined")?;
+        // SAFETY: The pthread handle remains valid until its JoinHandle is joined.
+        let errno = unsafe { libc::pthread_kill(thread.as_pthread_t(), SIGRTMIN()) };
+        if errno != 0 {
+            return Err(std::io::Error::from_raw_os_error(errno)).context("signal vCPU");
+        }
+        Ok(())
+    }
+
+    async fn wait(mut self) -> Result<()> {
+        if let Some(exited) = self.exited.take() {
+            exited
+                .await
+                .map_err(|_| anyhow!("vCPU {} exit notification was dropped", self.index))?;
+        }
+        if let Some(thread) = self.thread.take() {
+            tokio::task::spawn_blocking(move || {
+                thread.join().map_err(|_| anyhow!("vCPU thread panicked"))
+            })
+            .await??;
+        }
+        Ok(())
+    }
+
+    fn join(&mut self) -> Result<()> {
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow!("vCPU {} thread panicked", self.index))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VcpuHandle {
+    fn drop(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+        let _ = self.commands.send(VcpuCommand::Stop);
+        let _ = self.kick();
+        let _ = self.join();
+    }
+}
+
+impl Vcpus {
+    pub fn new(handles: Vec<VcpuHandle>) -> Self {
+        Self { handles }
+    }
+
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    pub async fn pause(&self) -> Result<()> {
+        let mut replies = Vec::with_capacity(self.handles.len());
+        for handle in &self.handles {
+            let (reply, waiter) = oneshot::channel();
+            handle.command(VcpuCommand::Pause(reply))?;
+            replies.push(waiter);
+        }
+        wait_for_replies(replies, "pause").await
+    }
+
+    pub async fn resume(&self) -> Result<()> {
+        let mut replies = Vec::with_capacity(self.handles.len());
+        for handle in &self.handles {
+            let (reply, waiter) = oneshot::channel();
+            handle.command(VcpuCommand::Resume(reply))?;
+            replies.push(waiter);
+        }
+        wait_for_replies(replies, "resume").await
+    }
+
+    pub async fn stop(self) -> Result<()> {
+        for handle in &self.handles {
+            let _ = handle.command(VcpuCommand::Stop);
+        }
+        for handle in self.handles {
+            handle.wait().await?;
+        }
+        Ok(())
+    }
+}
+
+async fn wait_for_replies(replies: Vec<oneshot::Receiver<()>>, operation: &str) -> Result<()> {
+    for reply in replies {
+        reply
+            .await
+            .map_err(|_| anyhow!("vCPU dropped {operation} reply"))?;
+    }
+    Ok(())
+}
+
+impl VcpuRunner {
+    fn run(mut self) {
+        let mut state = RunState::Paused;
+        loop {
+            state = match state {
+                RunState::Paused => match self.commands.recv() {
+                    Ok(command) => {
+                        self.fd.set_kvm_immediate_exit(0);
+                        apply_command(command)
+                    }
+                    Err(_) => RunState::Stop,
+                },
+                RunState::Running => {
+                    let state = self.run_once();
+                    if state == RunState::Running {
+                        self.pending_commands(state)
+                    } else {
+                        state
+                    }
+                }
+                RunState::Stop => return,
+            };
+        }
+    }
+
+    fn run_once(&mut self) -> RunState {
+        match self.fd.run() {
+            Ok(VcpuExit::IoIn(port, data)) => {
+                data.fill(0);
+                self.pio.read(u64::from(port), data);
+                RunState::Running
+            }
+            Ok(VcpuExit::IoOut(port, data)) => {
+                self.pio.write(u64::from(port), data);
+                RunState::Running
+            }
+            Ok(VcpuExit::MmioRead(address, data)) => {
+                data.fill(0);
+                self.mmio.read(address, data);
+                RunState::Running
+            }
+            Ok(VcpuExit::MmioWrite(address, data)) => {
+                self.mmio.write(address, data);
+                RunState::Running
+            }
+            Ok(VcpuExit::Shutdown)
+            | Ok(VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_RESET | KVM_SYSTEM_EVENT_SHUTDOWN, _)) => {
+                let _ = self.events.send(MachineEvent::GuestReset);
+                RunState::Stop
+            }
+            Ok(VcpuExit::Intr) => self.pending_commands(RunState::Running),
+            Ok(exit) => report_failure(
+                &self.events,
+                self.index,
+                format!("unexpected KVM exit: {exit:?}"),
+            ),
+            Err(error) if error.errno() == libc::EINTR => {
+                self.fd.set_kvm_immediate_exit(0);
+                self.pending_commands(RunState::Running)
+            }
+            Err(error) if error.errno() == libc::EAGAIN => RunState::Running,
+            Err(error) => {
+                report_failure(&self.events, self.index, format!("KVM_RUN failed: {error}"))
+            }
+        }
+    }
+
+    fn pending_commands(&mut self, mut state: RunState) -> RunState {
+        loop {
+            match self.commands.try_recv() {
+                Ok(command) => {
+                    state = apply_command(command);
+                    if state == RunState::Stop {
+                        return state;
+                    }
+                }
+                Err(TryRecvError::Empty) => return state,
+                Err(TryRecvError::Disconnected) => return RunState::Stop,
+            }
+        }
+    }
+}
+
+fn report_failure(
+    events: &tokio_mpsc::UnboundedSender<MachineEvent>,
+    index: u8,
+    error: String,
+) -> RunState {
+    let _ = events.send(MachineEvent::VcpuFailed { index, error });
+    RunState::Stop
+}
+
+fn apply_command(command: VcpuCommand) -> RunState {
+    match command {
+        VcpuCommand::Pause(reply) => {
+            let _ = reply.send(());
+            RunState::Paused
+        }
+        VcpuCommand::Resume(reply) => {
+            let _ = reply.send(());
+            RunState::Running
+        }
+        VcpuCommand::Stop => RunState::Stop,
+    }
+}
+
+fn unblock_kick_signal() -> Result<()> {
+    // SAFETY: sigemptyset initializes the mask; all pointers live through their calls.
+    let errno = unsafe {
+        let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(mask.as_mut_ptr());
+        let mut mask = mask.assume_init();
+        libc::sigaddset(&mut mask, SIGRTMIN());
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut())
+    };
+    if errno != 0 {
+        return Err(std::io::Error::from_raw_os_error(errno)).context("unblock vCPU kick signal");
+    }
+    Ok(())
+}
+
+fn install_signal_handler() -> Result<()> {
+    let errno = *SIGNAL_HANDLER_ERRNO.get_or_init(|| {
+        register_signal_handler(SIGRTMIN(), kick_signal_handler)
+            .err()
+            .map_or(0, |error| error.errno())
+    });
+    if errno == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(errno)).context("install vCPU kick signal handler")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, Msrs, kvm_pit_config};
+    use tokio::time;
+    use vm_memory::{Bytes, GuestAddress};
+
+    use super::*;
+    use crate::KvmContext;
+    use crate::arch::x86_64::cpuid::normalize;
+    use crate::arch::x86_64::lapic::configure_lint;
+    use crate::arch::x86_64::layout::{TSS_START, ram_regions};
+    use crate::arch::x86_64::msr::boot_msrs;
+    use crate::arch::x86_64::regs::{boot_fpu, boot_regs, boot_sregs};
+    use crate::devices::legacy::i8042::I8042Device;
+    use crate::devices::legacy::serial::SerialDevice;
+    use crate::machine::bus::BusDevice;
+    use crate::machine::memory;
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_mode_payload_uses_pvh_serial_and_i8042_on_kvm() {
+        if !Path::new("/dev/kvm").exists() {
+            return;
+        }
+        let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+        let vm = context.kvm().create_vm().unwrap();
+        vm.set_tss_address(TSS_START as usize).unwrap();
+        vm.create_irq_chip().unwrap();
+        vm.create_pit2(kvm_pit_config {
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let regions = ram_regions(16 << 20).unwrap();
+        let memory = memory::create(&regions).unwrap();
+        // SAFETY: The test stops vCPUs and explicitly drops VM before memory.
+        unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }
+            .unwrap();
+
+        const ENTRY: u64 = 0x10_0000;
+        const PVH_MAGIC: u32 = 0x336e_c578;
+        let code = [
+            0x8b, 0x03, // mov eax, [ebx]
+            0x3d, 0x78, 0xc5, 0x6e, 0x33, // cmp eax, PVH_MAGIC
+            0x75, 0x14, // jne fail
+            0x66, 0xba, 0xf8, 0x03, // mov dx, 0x3f8
+            0xb0, b'O', 0xee, // out dx, al
+            0xb0, b'K', 0xee, // out dx, al
+            0x66, 0xba, 0x64, 0x00, // mov dx, 0x64
+            0xb0, 0xfe, 0xee, // out dx, al: i8042 reset
+            0xf4, // hlt while teardown catches up
+            0xeb, 0xfd, // jmp back to hlt
+            0x66, 0xba, 0xf8, 0x03, // fail: mov dx, 0x3f8
+            0xb0, b'F', 0xee, // out dx, al
+            0x0f, 0x0b, // ud2
+        ];
+        memory.write_obj(PVH_MAGIC, GuestAddress(0x6000)).unwrap();
+        memory.write_slice(&code, GuestAddress(ENTRY)).unwrap();
+
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let cpuid = normalize(
+            &context.capabilities().supported_cpuid,
+            &context.capabilities().host_cpuid,
+            1,
+            0,
+        )
+        .unwrap();
+        vcpu.set_cpuid2(&cpuid).unwrap();
+        let entries = boot_msrs();
+        let msrs = Msrs::from_entries(&entries).unwrap();
+        assert_eq!(vcpu.set_msrs(&msrs).unwrap(), entries.len());
+        vcpu.set_regs(&boot_regs(ENTRY)).unwrap();
+        vcpu.set_fpu(&boot_fpu()).unwrap();
+        let (sregs, tables) = boot_sregs(vcpu.get_sregs().unwrap());
+        for table in tables {
+            memory
+                .write_slice(&table.bytes, GuestAddress(table.address))
+                .unwrap();
+        }
+        vcpu.set_sregs(&sregs).unwrap();
+        vcpu.set_lapic(&configure_lint(vcpu.get_lapic().unwrap()))
+            .unwrap();
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (input, _input_writer) = pipe();
+        let (_serial_task, serial) =
+            SerialDevice::new(input, SharedWriter(output.clone())).unwrap();
+        vm.register_irqfd(&serial.irq_fd, 4).unwrap();
+        let (event_tx, mut event_rx) = tokio_mpsc::unbounded_channel();
+        let serial: Arc<dyn BusDevice> = Arc::new(serial);
+        let i8042: Arc<dyn BusDevice> = Arc::new(I8042Device::new(event_tx.clone()));
+        let pio = Arc::new(Bus::new(vec![(0x3f8..0x400, serial), (0x60..0x65, i8042)]).unwrap());
+        let mmio = Arc::new(Bus::empty());
+        let vcpus = Vcpus::new(vec![
+            VcpuHandle::spawn(0, vcpu, &vm, pio, mmio, event_tx).unwrap(),
+        ]);
+
+        vcpus.pause().await.unwrap();
+        vcpus.resume().await.unwrap();
+        let event = time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, MachineEvent::GuestReset));
+        assert_eq!(*output.lock().unwrap(), b"OK");
+        vcpus.stop().await.unwrap();
+        drop(vm);
+    }
+}

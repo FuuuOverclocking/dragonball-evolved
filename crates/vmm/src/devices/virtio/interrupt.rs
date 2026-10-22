@@ -22,14 +22,12 @@ pub enum InterruptKind {
 
 /// An `irqfd`: writing it makes KVM inject the device's interrupt.
 ///
-/// This one is never awaited. Userspace only ever writes it, so it stays outside
-/// the reactor for the same reason it stays outside firecracker's epoll set. It
-/// is `Send + Sync` because both the device task and vcpu threads raise
-/// interrupts.
+/// The IRQ fd is written, while its paired resample fd reports kernel EOIs.
 #[derive(Debug)]
 pub struct IrqTrigger {
     status: Arc<AtomicU32>,
     irq_fd: EventFd,
+    resample_fd: EventFd,
 }
 
 impl IrqTrigger {
@@ -37,6 +35,7 @@ impl IrqTrigger {
         Ok(Self {
             status: Arc::new(AtomicU32::new(0)),
             irq_fd: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
+            resample_fd: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC)?,
         })
     }
 
@@ -58,5 +57,56 @@ impl IrqTrigger {
     /// The descriptor registered with `KVM_IRQFD`.
     pub fn irq_fd(&self) -> &EventFd {
         &self.irq_fd
+    }
+
+    pub fn resample_fd(&self) -> &EventFd {
+        &self.resample_fd
+    }
+
+    pub async fn resample(self: Arc<Self>, mut stop: crate::devices::Stop) -> anyhow::Result<()> {
+        let resample =
+            crate::devices::async_fd::AsyncEventFd::from_event_fd(self.resample_fd.try_clone()?)?;
+        loop {
+            tokio::select! {
+                biased;
+                () = stop.requested() => return Ok(()),
+                result = resample.read() => { result?; }
+            }
+            if self.status.load(Ordering::SeqCst) != 0 {
+                self.irq_fd.write(1)?;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::DeviceManager;
+    use crate::devices::async_fd::AsyncEventFd;
+
+    #[tokio::test(flavor = "local")]
+    async fn resampling_reasserts_pending_interrupts_but_not_acknowledged_ones() {
+        let interrupt = Arc::new(IrqTrigger::new().unwrap());
+        let irq = AsyncEventFd::from_event_fd(interrupt.irq_fd().try_clone().unwrap()).unwrap();
+        let mut devices = DeviceManager::new();
+        let stop = devices.stop_signal();
+        devices.spawn("resampler", Arc::clone(&interrupt).resample(stop));
+        interrupt.trigger(InterruptKind::UsedRing).unwrap();
+        irq.read().await.unwrap();
+        interrupt.resample_fd().write(1).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), irq.read())
+            .await
+            .unwrap()
+            .unwrap();
+        interrupt.status.store(0, Ordering::SeqCst);
+        interrupt.resample_fd().write(1).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), irq.read())
+                .await
+                .is_err()
+        );
+        devices.quiesce().await;
     }
 }

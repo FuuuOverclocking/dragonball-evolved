@@ -16,7 +16,7 @@ use vmm::devices::virtio::SharedGuestMemory;
 pub const QUEUE_SIZE: u16 = 16;
 pub const SECTOR_SIZE: usize = 512;
 
-const MEM_SIZE: usize = 0x40000;
+const MEM_SIZE: usize = 4 * 1024 * 1024;
 const DESC_TABLE: u64 = 0x1000;
 const AVAIL_RING: u64 = 0x2000;
 const USED_RING: u64 = 0x3000;
@@ -83,6 +83,15 @@ impl GuestDriver {
             next_avail: 0,
             next_buffer: BUFFER_AREA,
         }
+    }
+
+    pub fn reset_queue(&mut self) {
+        self.mem
+            .write_slice(&[0; 0x2100], GuestAddress(DESC_TABLE))
+            .unwrap();
+        self.next_desc = 0;
+        self.next_avail = 0;
+        self.next_buffer = BUFFER_AREA;
     }
 
     /// A queue configured exactly as a driver would leave it after negotiation.

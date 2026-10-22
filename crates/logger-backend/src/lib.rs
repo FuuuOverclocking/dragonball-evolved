@@ -175,8 +175,8 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_api(config: api::logger::UpdateLogger, id: Option<String>) -> Self {
-        let api::logger::UpdateLogger {
+    pub fn from_api(config: api::logger::LoggerConfig, id: Option<String>) -> Self {
+        let api::logger::LoggerConfig {
             level,
             target,
             crash_target,

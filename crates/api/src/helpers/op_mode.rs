@@ -23,7 +23,15 @@ impl OpMode for Command {
 mod tests {
     #[test]
     fn command_does_not_need_a_reply_channel() {
-        let command: crate::VmmCommand = crate::VmmCommand::AddDisk(Default::default(), ());
+        let command: crate::VmmCommand = crate::VmmCommand::AddDisk(
+            crate::block::AddDisk(crate::block::BlockDevConfig {
+                id: None,
+                path: "/test/disk".into(),
+                read_only: false,
+                root: false,
+            }),
+            (),
+        );
         assert!(matches!(command, crate::VmmCommand::AddDisk(_, ())));
     }
 
@@ -31,8 +39,15 @@ mod tests {
     #[test]
     fn request_delivers_its_typed_reply() {
         let (sender, receiver) = oneshot::channel();
-        let request: crate::VmmRequest =
-            crate::VmmRequest::AddDisk(Default::default(), sender.into());
+        let request: crate::VmmRequest = crate::VmmRequest::AddDisk(
+            crate::block::AddDisk(crate::block::BlockDevConfig {
+                id: None,
+                path: "/test/disk".into(),
+                read_only: false,
+                root: false,
+            }),
+            sender.into(),
+        );
         let crate::VmmRequest::AddDisk(_, reply) = request else {
             unreachable!();
         };

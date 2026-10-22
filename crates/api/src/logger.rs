@@ -1,11 +1,17 @@
 use std::path::PathBuf;
 
-/// Update the logger configuration. Omitted fields leave their current values unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UpdateLogger(pub LoggerConfig);
+
+/// Logger configuration. Omitted fields leave their current values unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct UpdateLogger {
+pub struct LoggerConfig {
     /// Lowest enabled log level: off, error, warn, info, debug or trace (case-insensitive).
     pub level: Option<LevelFilter>,
     /// Where normal log records are written.
@@ -169,6 +175,23 @@ impl serde::Serialize for CrashTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn update_operation_preserves_the_configuration_wire_shape() {
+        let config = LoggerConfig {
+            level: Some(LevelFilter::Info),
+            target: Some(Target::Stderr),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        let operation: UpdateLogger = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(operation.0, config);
+        assert_eq!(serde_json::to_value(operation).unwrap(), value);
+        assert!(
+            serde_json::from_value::<UpdateLogger>(serde_json::json!({ "unknown": true })).is_err()
+        );
+    }
 
     #[test]
     fn levels_accept_all_ascii_casings() {

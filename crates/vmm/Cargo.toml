@@ -9,7 +9,10 @@ anyhow.workspace = true
 api = { workspace = true, features = ["request"] }
 bon.workspace = true
 displaydoc.workspace = true
+kvm-bindings.workspace = true
+kvm-ioctls.workspace = true
 libc.workspace = true
+linux-loader.workspace = true
 logger.workspace = true
 oneshot.workspace = true
 thiserror.workspace = true

@@ -96,7 +96,7 @@ impl VmmClient {
 
 #[cfg(test)]
 mod tests {
-    use api::block::AddDisk;
+    use api::block::{AddDisk, BlockDevConfig};
     use api::instance_info::{GetInstanceInfo, InstanceInfo, VmState};
 
     use super::*;
@@ -143,9 +143,22 @@ mod tests {
             };
             assert_eq!(info.unwrap(), instance_info());
             let result = if with_timeout {
-                client.call_timeout(AddDisk {}, Duration::from_secs(5))
+                client.call_timeout(
+                    AddDisk(BlockDevConfig {
+                        id: None,
+                        path: "/test/disk".into(),
+                        read_only: false,
+                        root: false,
+                    }),
+                    Duration::from_secs(5),
+                )
             } else {
-                client.call(AddDisk {})
+                client.call(AddDisk(BlockDevConfig {
+                    id: None,
+                    path: "/test/disk".into(),
+                    read_only: false,
+                    root: false,
+                }))
             };
             assert_eq!(result.unwrap(), Err(api::ApiError::msg("disk failed")));
             worker.join().unwrap();
@@ -164,7 +177,15 @@ mod tests {
             instance_info()
         );
         assert_eq!(
-            client.call_async(AddDisk {}).await.unwrap(),
+            client
+                .call_async(AddDisk(BlockDevConfig {
+                    id: None,
+                    path: "/test/disk".into(),
+                    read_only: false,
+                    root: false
+                }))
+                .await
+                .unwrap(),
             Err(api::ApiError::msg("disk failed"))
         );
         worker.await.unwrap();

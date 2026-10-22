@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::VmmCommand;
-use crate::logger::UpdateLogger;
+use crate::logger::LoggerConfig;
 
 #[derive(Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -55,5 +55,5 @@ pub struct ProcessConfig {
     pub kvm_dev: Option<PathBuf>,
 
     /// Initial logger configuration. Omitted fields use the process defaults.
-    pub logger: UpdateLogger,
+    pub logger: LoggerConfig,
 }

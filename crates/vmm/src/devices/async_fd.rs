@@ -15,7 +15,7 @@
 //! mutate.
 
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -39,7 +39,9 @@ impl AsyncEventFd {
 
     /// Register an existing eventfd, which must have been created non-blocking.
     pub fn from_event_fd(event_fd: EventFd) -> io::Result<Self> {
-        let inner = AsyncFd::with_interest(event_fd, Interest::READABLE)?;
+        // SAFETY: `AsyncEventFd` owns the eventfd and never swaps it while registered.
+        let inner = unsafe { AsyncFd::register_with_interest(event_fd, Interest::READABLE) }
+            .map_err(io::Error::from)?;
         Ok(Self { inner })
     }
 
@@ -80,16 +82,18 @@ impl AsRawFd for AsyncEventFd {
 /// An arbitrary readable descriptor -- a pty, a pipe, `stdin` -- that can be
 /// awaited.
 #[derive(Debug)]
-pub struct AsyncInput<T: AsRawFd> {
+pub struct AsyncInput<T: AsFd + AsRawFd> {
     inner: AsyncFd<T>,
 }
 
-impl<T: AsRawFd> AsyncInput<T> {
+impl<T: AsFd + AsRawFd> AsyncInput<T> {
     /// Switch `source` to non-blocking mode and register it with the current
     /// reactor.
     pub fn new(source: T) -> io::Result<Self> {
         set_nonblocking(source.as_raw_fd())?;
-        let inner = AsyncFd::with_interest(source, Interest::READABLE)?;
+        // SAFETY: `AsyncInput` owns `source`, never mutably exposes it, and never swaps its fd.
+        let inner = unsafe { AsyncFd::register_with_interest(source, Interest::READABLE) }
+            .map_err(io::Error::from)?;
         Ok(Self { inner })
     }
 
@@ -105,10 +109,47 @@ impl<T: AsRawFd> AsyncInput<T> {
     }
 }
 
+#[derive(Debug)]
+pub struct AsyncOutput<T: AsFd + AsRawFd> {
+    inner: AsyncFd<T>,
+}
+
+impl<T: AsFd + AsRawFd> AsyncOutput<T> {
+    pub fn new(output: T) -> io::Result<Self> {
+        set_nonblocking(output.as_raw_fd())?;
+        // SAFETY: `AsyncOutput` owns `output`, never mutably exposes it, and never swaps its fd.
+        let inner = unsafe { AsyncFd::register_with_interest(output, Interest::WRITABLE) }
+            .map_err(io::Error::from)?;
+        Ok(Self { inner })
+    }
+
+    pub async fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            let mut guard = self.inner.writable().await?;
+            match guard.try_io(|output| write_fd(output.get_ref().as_raw_fd(), buf)) {
+                Ok(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(Ok(count)) => buf = &buf[count..],
+                Ok(Err(error)) => return Err(error),
+                Err(_would_block) => continue,
+            }
+        }
+        Ok(())
+    }
+}
+
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: `buf` is a valid mutable slice, so the kernel writes at most
     // `buf.len()` initialised bytes into memory this call exclusively owns.
     let count = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(count as usize)
+}
+
+fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is a valid shared slice and the kernel only reads from it.
+    let count = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
     if count < 0 {
         return Err(io::Error::last_os_error());
     }

@@ -1,22 +1,25 @@
+pub mod arch;
 pub mod devices;
 mod exit_status;
 mod kvm_context;
+mod lifecycle;
+pub mod machine;
 mod process_ctx;
+pub mod spec;
 mod vmm_server;
 
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result};
-use api::{Reply, VmmRequest};
-use logger::{info_unlimited, warn_unlimited};
 use tokio::select;
 use tokio::sync::mpsc;
 
-use crate::devices::{DeviceExit, DeviceManager};
 pub use crate::exit_status::VmmExitStatus;
-pub use crate::kvm_context::KvmContext;
+pub use crate::kvm_context::{HostCapabilities, KvmContext};
+use crate::lifecycle::{Event, Step, Vm};
 pub use crate::process_ctx::ProcessCtx;
+use crate::spec::MachineSpec;
 pub use crate::vmm_server::VmmClient;
 use crate::vmm_server::VmmServer;
 
@@ -35,89 +38,25 @@ pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
 }
 
 #[tokio::main(flavor = "local")]
-async fn vmm_main(mut server: VmmServer, process_ctx: ProcessCtx) -> VmmExitStatus {
-    let mut devices = DeviceManager::default();
+async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
+    let mut vm = Vm::NotStarted(MachineSpec::default());
 
-    let (status, shutdown_reply) = loop {
-        // The `select!` only decides *what happened*. Handling it afterwards is
-        // what lets the request dispatch grow: this arm list stays three lines
-        // long however many variants `VmmRequest` gains, and the handler gets
-        // `&mut self`, which no arm body can have while the other futures are
-        // still borrowing fields of `self`.
+    let (vm, mut status) = loop {
         let event = select! {
             biased;
+            event = vm.next_event() => event,
             request = server.next_request() => Event::Request(request),
-            Some(exit) = devices.next_exit() => Event::DeviceExit(exit),
         };
-
-        let step = match event {
-            Event::Request(Some(request)) => handle_request(request, &mut devices).await,
-
-            // Nothing can ask the vmm to do anything ever again. The vmm itself did
-            // not fail, so this is a clean exit, but an embedder dropping its last
-            // handle mid-run is worth saying out loud.
-            Event::Request(None) => {
-                warn_unlimited!("Every vmm client is gone, shutting down");
-                Step::stop(VmmExitStatus::Ok)
-            }
-
-            Event::DeviceExit(exit) => {
-                match exit.result {
-                    Ok(()) => info_unlimited!("Device {} stopped", exit.name),
-                    Err(e) => warn_unlimited!("Device {} failed: {e:?}", exit.name),
-                }
-                Step::Continue
-            }
-        };
-
-        match step {
-            Step::Continue => {}
-            Step::Stop { status, reply } => break (status, reply),
+        match vm.handle(event, &ctx).await {
+            (next, Step::Continue) => vm = next,
+            (next, Step::Stop(status)) => break (next, status),
         }
     };
 
-    // Devices stop at a point of their own choosing, so an in-flight request is
-    // never torn in half.
-    devices.quiesce().await;
-
-    // Answering only now makes the reply mean "shutdown finished".
-    if let Some(reply) = shutdown_reply {
-        reply.send(());
+    drop(server);
+    
+    if let Err(error) = vm.teardown().await {
+        status = VmmExitStatus::Error(format!("teardown: {error:#}"));
     }
     status
-}
-
-async fn handle_request(request: VmmRequest, devices: &mut DeviceManager) -> Step {
-    // match request {
-    // }
-
-    todo!()
-}
-
-/// Something the vmm has to react to.
-enum Event {
-    /// A client request, or `None` once every client has gone.
-    Request(Option<VmmRequest>),
-    DeviceExit(DeviceExit),
-}
-
-/// What the main loop should do next.
-enum Step {
-    /// Keep serving.
-    Continue,
-    /// Wind down, then answer `reply` once every device has stopped.
-    Stop {
-        status: VmmExitStatus,
-        reply: Option<Reply<()>>,
-    },
-}
-
-impl Step {
-    /// Wind down without anyone waiting to be told.
-    fn stop(status: VmmExitStatus) -> Self {
-        Self::Stop {
-            status,
-            reply: None,
-        }
-    }
 }

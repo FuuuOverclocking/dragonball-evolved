@@ -7,7 +7,7 @@ use vmm::{KvmContext, ProcessCtx};
 #[tokio::main(flavor = "local")]
 async fn main() -> Result<()> {
     // Parse CLI arguments.
-    let (cfg, subcommand) = cli::parse().context("parse config from cli")?;
+    let (mut cfg, subcommand) = cli::parse().context("parse config from cli")?;
 
     // Run subcommands that do not require starting a VMM.
     if let Some(cmd) = subcommand {
@@ -29,7 +29,11 @@ async fn main() -> Result<()> {
         let _ = vmm_client2.call_async(api::lifecycle::Shutdown).await;
     });
 
-    // Configure the VM, then boot or restore if required.
+    if let Err(error) = configure(&vmm_client, std::mem::take(&mut cfg.commands)).await {
+        let _ = vmm_client.call_async(api::lifecycle::Shutdown).await;
+        let _ = vmm_client.async_join_vmm_thread().await;
+        return Err(error);
+    }
 
     // Start API server if the API socket path is provided.
     let api_server = if let Some(sock) = &cfg.dragonball.api_sock {
@@ -40,7 +44,8 @@ async fn main() -> Result<()> {
     };
 
     // Wait for the VMM thread to finish.
-    match vmm_client.async_join_vmm_thread().await {
+    let exit_result = vmm_client.async_join_vmm_thread().await;
+    match &exit_result {
         Ok(exit_status) => exit_status.print_log(),
         Err(e) => error_unlimited!("failed to join vmm thread: {e:?}"),
     }
@@ -53,8 +58,30 @@ async fn main() -> Result<()> {
             .context("api server graceful shutdown")?;
     }
 
-    // Flush metrics.
+    match exit_result? {
+        vmm::VmmExitStatus::Ok => Ok(()),
+        vmm::VmmExitStatus::Error(error) => anyhow::bail!("{error}"),
+    }
+}
 
+async fn configure(client: &vmm::VmmClient, commands: Vec<api::VmmCommand>) -> Result<()> {
+    let auto_start = commands
+        .iter()
+        .any(|command| matches!(command, api::VmmCommand::SetKernel(_, ())));
+    for command in commands {
+        let operation = format!("{command:?}");
+        let (request, waiter) = command.into_request();
+        client.send(request)?;
+        waiter
+            .await
+            .map_err(|error| anyhow::anyhow!("{operation}: {error}"))?;
+    }
+    if auto_start {
+        client
+            .call_async(api::lifecycle::Start)
+            .await?
+            .map_err(|error| anyhow::anyhow!("Start: {error}"))?;
+    }
     Ok(())
 }
 

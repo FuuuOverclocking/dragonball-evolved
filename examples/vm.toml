@@ -7,5 +7,15 @@ api_sock = "/tmp/fuu-vm/api.sock"
 kvm_dev = "/dev/my_kvm"
 
 [machine]
+cpus = 2
+memory_mib = 1024
+console = "stdio"
+
+[machine.kernel]
+path = "/path/to/pvh-vmlinux"
 
 [[machine.disks]]
+id = "rootfs"
+path = "/path/to/rootfs.ext4"
+read_only = true
+root = true

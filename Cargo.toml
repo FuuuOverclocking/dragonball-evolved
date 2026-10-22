@@ -19,7 +19,10 @@ bon = "3.10.2"
 clap = "4.6.7"
 displaydoc = "0.2.7"
 heck = "0.5.0"
+kvm-bindings = { version = "0.14.2", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25.1"
 libc = "0.2.191"
+linux-loader = { version = "0.14.0", default-features = false, features = ["elf"] }
 log = { version = "0.4.34", features = ["serde", "std"] }
 names = { version = "0.14.0", default-features = false }
 oneshot = { version = "0.2.1", features = ["std", "async"] }

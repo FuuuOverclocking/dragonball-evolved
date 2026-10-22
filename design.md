@@ -1,6 +1,6 @@
 # dragonball-evolved VMM 设计：x86-64 / KVM / Linux guest
 
-> 状态：待评审。第 1 节是决策清单，`[x]` 为建议项，请逐项调整勾选。每项有编号（如 `C6`），便于讨论。
+> 状态：已批准并实现首阶段代码；已用 PVH Linux 6.6.102 验证启动到 Debian 13 systemd/login。第 1 节的勾选表示范围选择；实际进度见第 14 节。每项有编号（如 `C6`），便于讨论。
 > 第 2 节起是按建议项展开的详细设计；修改勾选后，相关章节随之调整。
 >
 > 参考：firecracker 1.18-dev（主要）、cloud-hypervisor（对照）。git 中已删除的 `docs/vmm-architecture.md` 与 blog 系列只作背景参考，不作约束。
@@ -38,7 +38,7 @@
 - [ ] **A5 ACPI**（RSDP / XSDT / FADT / MADT / DSDT）。
   不做的代价：guest `poweroff` 只会让 CPU 停住，VMM 无法感知，所以关机走 `reboot` 或 API；CPU/内存热插拔、VMGenID 也依赖 ACPI。
 - [x] **A6 内核态 irqchip**：`KVM_CREATE_IRQCHIP`（PIC + IOAPIC + LAPIC）+ `KVM_CREATE_PIT2`（`KVM_PIT_SPEAKER_DUMMY`）。
-  GSI 0–23 使用 KVM 默认路由，设备只需 `KVM_IRQFD`。
+  GSI 0–23 使用 KVM 默认路由；virtio 使用 `KVM_IRQFD` + resamplefd，在 EOI 后对仍有 pending status 的 level IRQ 重触发。
 - [ ] **A7 split irqchip（用户态 IOAPIC）/ 显式 GSI 路由表 / MSI。** virtio-pci、VFIO 时才需要。
 - [x] **A8 默认 cmdline**：`console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd`。
   用户给出 cmdline 时整体替换默认值。VMM 只追加自己负责的片段：`virtio_mmio.device=…`，以及根盘的 `root=/dev/vda rw|ro`。
@@ -47,7 +47,7 @@
 
 - [x] **B1 guest RAM 为匿名私有 mmap**（`MAP_NORESERVE`），每段一个 KVM memslot。
 - [x] **B2 布局含 32 位 MMIO 空洞 `[3 GiB, 4 GiB)`。** 超过 3 GiB 的 RAM 从 4 GiB 处继续。布局由纯函数 `ram_regions(size)` 给出。
-- [ ] **B3 memfd / hugetlbfs backing。** vhost-user、快照、共享内存的前提；backing 必须在启动时决定，不能事后更换。
+- [ ] **B3 memfd / hugetlbfs backing。** vhost-user 和跨进程共享内存需要可导出的 backing；快照本身不要求 memfd。backing 在启动时决定。
 - [x] **B4 SMP：1–254 个 vCPU**（xAPIC + MP table 的上限，同时受 `KVM_CAP_MAX_VCPUS` 约束）。拓扑固定为 1 socket、每核 1 线程。
 - [ ] **B5 x2APIC 模式（>254 vCPU）/ 可配置拓扑（SMT、多 socket）/ NUMA。**
 - [x] **B6 CPUID 归一化**：以 `KVM_GET_SUPPORTED_CPUID` 为基线，按厂商改写（见 §7.1）。
@@ -120,7 +120,7 @@
   - 生命周期：`Start / Pause / Resume / Shutdown`，均带 HTTP 路由；
   - `GetInstanceInfo` 反映真实状态。
 - [x] **E5 自动启动**：配置文件含 `machine.kernel` 时，main 在依次下发全部配置命令后，自动发送 `Start`。
-- [x] **E6 API `Shutdown` 为硬停**：停 vCPU → quiesce 设备 → 释放机器 → 回复。沿用现有语义：回复表示"已经关完"。
+- [x] **E6 API `Shutdown` 为硬停**：收到请求后立即回复 `Ok(())`，表示“已接收”；随后关闭请求入口，并按“停 vCPU → quiesce 设备 → 释放机器”完成拆除。回复不表示机器已经关闭，拆除失败只反映在最终 `VmmExitStatus`。
 - [x] **E7 退出原因**：
   - guest 复位 → VMM 正常退出；
   - vCPU 内部错误 → VMM 以错误状态退出；
@@ -133,7 +133,7 @@
 
 - [x] **F1 代码全部放在 `crates/vmm` 内**：`arch::x86_64`（纯：无 fd、无 tokio）、`machine`（副作用）、`devices`。
 - [ ] **F2 把纯 arch 代码拆成独立 crate。** 编译隔离更强，但现阶段边界仍在变化。
-- [x] **F3 新依赖**：`kvm-ioctls 0.25`、`kvm-bindings 0.14`（`fam-wrappers`）、`linux-loader 0.14`（`elf`、`pvh`）。tokio 不新增特性：控制台走 `AsyncFd`（属于已启用的 `net` 特性）。
+- [x] **F3 新依赖**：`kvm-ioctls 0.25`、`kvm-bindings 0.14`（`fam-wrappers`）、`linux-loader 0.14`（只启用 `elf`；PVH 模块随之提供，没有独立 `pvh` feature）。tokio 不新增特性：控制台走 `AsyncFd`（属于已启用的 `net` 特性）。
   不引入 `vm-allocator`：布局一次算出，不需要运行时分配器。
 - [x] **F4 纯函数单测**：布局、memmap、MP table（含校验和）、CPUID 归一化、寄存器、transport 状态机、cmdline、`MachineSpec` 校验。
 - [x] **F5 KVM 集成测试**：测试代码现场生成一个 mini PVH ELF（几十字节手写 32 位代码 + Xen note）。
@@ -231,21 +231,25 @@ enum MachineEvent {
 
 ```rust
 let mut vm = Vm::NotStarted(MachineSpec::default());
-let (vm, status, reply) = loop {
+let (vm, mut status) = loop {
     let event = select! {
         biased;
-        Some(e) = vm.next_machine_event() => Event::Machine(e),
+        event = vm.next_event() => event,
         request = server.next_request() => Event::Request(request),
     };
     match vm.handle(event, &ctx).await {
         (next, Step::Continue) => vm = next,
-        (next, Step::Stop { status, reply }) => break (next, status, reply),
+        (next, Step::Stop(status)) => break (next, status),
     }
 };
-vm.teardown().await;
-if let Some(reply) = reply { reply.send(()) }
+server.close();
+if let Err(error) = vm.teardown().await {
+    status = VmmExitStatus::Error(format!("teardown: {error:#}"));
+}
 status
 ```
+
+`Vm::handle` 在识别 `Shutdown` 时先发送成功回复，再返回 `Step::Stop`；reply 不进入 `Step`，也不参与 teardown。
 
 - 机器事件排在请求之前：guest 已经复位时，不再处理排队的请求。
 - `handle` 消费旧状态、返回新状态，没有 `&mut` 共享。`select!` 的借用在得出 `Event` 时已经结束（沿用现有注释中的理由）。
@@ -258,7 +262,7 @@ status
 | `Start`                                    | validate → plan → build → resume → Running | 错误           | 错误               |
 | `Pause`                                    | 错误：未启动                           | 暂停 vCPU → Paused | 成功（幂等）       |
 | `Resume`                                   | 错误：未启动                           | 成功（幂等）       | 恢复 vCPU → Running |
-| `Shutdown`                                 | 退出                                   | 拆除后退出         | 拆除后退出         |
+| `Shutdown`                                 | 回复“已接收”，然后退出                 | 回复“已接收”，然后拆除并退出 | 同左               |
 | `GetInstanceInfo`                          | 纯查询                                 | 纯查询             | 纯查询             |
 | `UpdateLogger`                             | 进程级副作用，与 VM 状态无关            | 同左               | 同左               |
 | `HandoverState`                            | unsupported（E10）                     | 同左               | 同左               |
@@ -277,11 +281,11 @@ status
 
 不变量：任何还可能写 guest memory 的组件仍在运行时，不释放这块内存。
 
-1. **停 vCPU**：向全部 vCPU 发 `Stop` 并踢出 → `.await` 每个线程的"已退出"通知 → `join`。`join` 此时立即返回，不阻塞 vmm-main。
-2. **停设备**：广播 `Stop`（已有 `watch`）→ `.await` 全部 `DeviceExit`（含 io 线程上的）→ 结束 io 线程。
-3. **drop `Machine`**：Bus 与 transport、ioeventfd/irqfd 注册、`VmFd`。
-4. **释放 guest memory**：最后一个 `Arc` 在这里释放。
-5. **回复 `Shutdown`**。
+1. **接收 `Shutdown` 时回复**：立即发送 `Ok(())`，只确认请求已进入停止流程；然后关闭请求入口。
+2. **停 vCPU**：向全部 vCPU 发 `Stop` 并踢出 → `.await` 每个线程的"已退出"通知 → 在 blocking pool 中 `join`。
+3. **停设备**：广播 `Stop`（已有 `watch`）→ `.await` 全部 `DeviceExit`（含 io 线程上的）→ 结束 io 线程。
+4. **drop `Machine`**：Bus 与 transport、ioeventfd/irqfd 注册、`VmFd`。
+5. **释放 guest memory**：最后一个 `Arc` 在这里释放。拆除结果写入最终 `VmmExitStatus`，不再修改已经发送的 Shutdown 回复。
 
 ## 5. vCPU
 
@@ -434,17 +438,17 @@ MP table（A4），按 MP Spec 1.4 生成字节，并计算两处校验和：
 
 ### 7.1 CPUID 归一化（B6）
 
-纯函数 `normalize(base, host, topology, index) -> CpuidEntries`。所有 vCPU 共用同一份基线，逐个 vCPU 计算。下表中 N 为 vCPU 数，`P = next_power_of_two(N)`。
+纯函数 `normalize(base, host, topology, index) -> CpuidEntries`。所有 vCPU 共用同一份基线，逐个 vCPU 计算。下表中 N 为 vCPU 数，`W = ceil(log2(N))`（N=1 时 W=0）。
 
 **通用**：
 
 | 叶            | 修改                                                                                     |
 | ------------- | ---------------------------------------------------------------------------------------- |
 | `0x0`         | 厂商字符串取宿主值                                                                        |
-| `0x1`         | EBX[15:8]=8（CLFLUSH 64 B）；EBX[23:16]=P；EBX[31:24]=APIC ID                             |
+| `0x1`         | EBX[15:8]=8（CLFLUSH 64 B）；EBX[23:16]=N；EBX[31:24]=APIC ID                             |
 |               | ECX[31]=1（hypervisor）；ECX[24]=1（TSC-deadline）；ECX[15]=0（PDCM）；EDX[28]=(N>1)（HTT） |
 | `0xB`         | 子叶 0（SMT 层）：EAX=0，EBX=1，ECX=`0x100`                                                |
-|               | 子叶 1（Core 层）：EAX=log2(P)（与 `0x1` 的 EBX[23:16] 一致；firecracker 用固定的 log2(32)），EBX=N，ECX=`0x201`；各子叶 EDX=x2APIC ID |
+|               | 子叶 1（Core 层）：EAX=W，EBX=N，ECX=`0x201`；各子叶 EDX=x2APIC ID |
 |               | 新内核的 KVM 不再返回子叶 1，缺失时补上                                                    |
 | `0x8000_0005` / `0x8000_0006` | 透传宿主值；`0x8000_0006` 的 EDX[17:16] 清零                               |
 
@@ -452,7 +456,7 @@ MP table（A4），按 MP Spec 1.4 生成字节，并计算两处校验和：
 
 | 叶      | 修改                                                     |
 | ------- | -------------------------------------------------------- |
-| `0x4`   | EAX[25:14]：L1/L2 为 0，L3 为 N−1；EAX[31:26]=N−1         |
+| `0x4`   | EAX[25:14]：L1/L2 为 0，L3 为 N−1；EAX[31:26]=min(N−1,63)，完整拓扑由 0xB/0x1F 提供 |
 | `0x6`   | 清 Turbo（EAX[1]）、EPB（ECX[3]）                         |
 | `0x7.0` | EBX[6]、EBX[13] 置 1；清 WAITPKG（ECX[5]）                |
 | `0xA`   | 全部清零（不暴露 vPMU）                                   |
@@ -464,7 +468,7 @@ MP table（A4），按 MP Spec 1.4 生成字节，并计算两处校验和：
 | ------------- | ------------------------------------------------------------ |
 | `0x7.0`       | 清 EDX[29]（AMD 没有 `IA32_ARCH_CAPABILITIES`，KVM 却总是置位） |
 | `0x8000_0001` | ECX[22]=1（TopologyExtensions）                               |
-| `0x8000_0008` | ECX[15:12]=7（ApicIdSize）；ECX[7:0]=N−1                      |
+| `0x8000_0008` | ECX[15:12]=W（ApicIdSize）；ECX[7:0]=N−1                      |
 | `0x8000_001D` | 透传宿主；L1/L2 NumSharingCache=0，L3 为 N−1                  |
 | `0x8000_001E` | 透传后改写：EAX=APIC ID；EBX[7:0]=core id（= vCPU 序号），EBX[15:8]=0；ECX[10:0]=0（单节点） |
 
@@ -678,14 +682,17 @@ define_schema! {
 }
 ```
 
-| 请求类型      | 形状                                                                  | 校验                                  |
-| ------------- | --------------------------------------------------------------------- | ------------------------------------- |
-| `SetCpus`     | `u8` newtype（`serde(transparent)`）                                  | 1 ≤ n ≤ min(254, `KVM_CAP_MAX_VCPUS`) |
-| `SetMemory`   | `u32` newtype，单位 MiB                                               | 非零；放不下内核时在 `Start` 报错      |
-| `SetConsole`  | `enum { Stdio, None }`                                                | —                                     |
-| `SetKernel`   | `{ path: PathBuf, cmdline: Option<String>, initrd: Option<PathBuf> }` | cmdline 加上追加片段后 ≤ 2 KiB         |
-| `AddDisk`     | `{ id: Option<String>, path: PathBuf, read_only: bool, root: bool }`  | id 唯一（缺省为 `disk<N>`）；至多一个根盘 |
-| `Start` 等    | 单元结构体，HTTP body 为空                                            | 见 §4.3                               |
+操作使用动词命名，承载的配置/值类型使用名词；操作层为 `#[serde(transparent)]`，不增加 JSON/TOML 嵌套，也不改变路由、操作名或字段。
+
+| 操作类型 | 配置/值类型 | serde 形状 | 校验 |
+| --- | --- | --- | --- |
+| `SetCpus(VcpuCount)` | `VcpuCount(u8)` | 整数 | 1 ≤ n ≤ min(254, `KVM_CAP_MAX_VCPUS`) |
+| `SetMemory(MemorySizeMib)` | `MemorySizeMib(u32)` | 整数，单位 MiB | 非零；放不下内核时在 `Start` 报错 |
+| `SetConsole(ConsoleConfig)` | `ConsoleConfig::{Stdio, None}` | `"stdio"` / `"none"` | — |
+| `SetKernel(KernelConfig)` | `KernelConfig { path, cmdline, initrd }` | 原有对象 | cmdline 加上追加片段后 ≤ 2 KiB |
+| `AddDisk(BlockDevConfig)` | `BlockDevConfig { id, path, read_only, root }` | 原有对象 | id 唯一；至多一个根盘 |
+| `UpdateLogger(LoggerConfig)` | `LoggerConfig { level, target, ... }` | 原有对象 | 缺省字段保留当前值 |
+| `Start` 等 | 单元结构体 | HTTP body 为空 | 见 §4.3 |
 
 - **默认值**：不配置时，`cpus` = 1、`memory_mib` = 128、`console` = `Stdio`。没有 `machine.kernel` 时，`Start` 报错。
 - **覆盖规则**：同一配置项重复设置时，后者覆盖前者（`apply` 是纯覆盖）；`AddDisk` 累加。
@@ -753,7 +760,7 @@ crates/vmm/src/
     └── virtio/            mod.rs、interrupt.rs、block.rs（已有）、mmio.rs
 ```
 
-依赖方向：`arch` ← `machine` ← `lifecycle` ← `lib`；`devices` 不依赖 `machine`。transport 通过 `BusDevice` 接入 Bus。
+主要依赖方向：`arch` ← `machine` ← `lifecycle` ← `lib`。`devices` 只引用 `machine` 中的边界类型 `BusDevice`、`MachineEvent`，不访问机器构建、KVM 或 vCPU 管理。transport 通过 `BusDevice` 接入 Bus。
 
 ## 11. 测试（F4–F6）
 
@@ -761,7 +768,7 @@ crates/vmm/src/
 | -------------- | ------------------------------------------------------------------------------------------ | ------------- |
 | 纯函数         | `ram_regions`、memmap、MP table（结构与校验和）、CPUID（每张表逐项断言）、GDT 编码、寄存器、MMIO 状态机（合法与非法转移、特性协商、reset）、i8042 状态机、cmdline 拼接、`MachineSpec` 校验 | 任意          |
 | 设备（已有形式） | 沿用 `tests/block.rs`、`tests/serial.rs`：测试扮演 guest 驱动；改为经 transport 激活，覆盖 reset 后重新激活、io 线程放置 | 任意          |
-| KVM 集成       | mini PVH ELF：32 位代码先检查 `[ebx]` 是否等于 start_info magic，再向 COM1 输出 `OK`，最后 `out 0x64, 0xFE`；断言输出与 `GuestReset`。另测 pause/resume 与 `Shutdown` 的拆除顺序 | `/dev/kvm`    |
+| KVM 集成       | mini PVH ELF：32 位代码先检查 `[ebx]` 是否等于 start_info magic，再向 COM1 输出 `OK`，最后 `out 0x64, 0xFE`；断言输出与 `GuestReset`。另测 pause/resume、Shutdown 立即确认及后续拆除 | `/dev/kvm`    |
 | 真实 Linux     | `#[ignore]`；`DBE_KERNEL`、`DBE_INITRD`、`DBE_ROOTFS`。断言串口出现约定标记，guest `reboot` 后 VMM 以 `Ok` 退出 | PVH 内核      |
 
 ## 12. 实施顺序
@@ -787,6 +794,35 @@ crates/vmm/src/
 - SIGRTMIN 处理函数是进程级的：VMM 作为库嵌入时，与宿主程序共享这个信号。
 - `Start` 在 vmm-main 上同步读取内核与 initrd 文件（D5 的例外）。
 - 控制台 raw mode 下，Ctrl-C 不会终止 VMM。
+
+## 14. 实现与验证进度
+
+- [x] M1–M5 代码已接通：纯架构模块、KVM/vCPU、串口与 i8042、virtio-mmio/blk、IO LocalRuntime、生命周期、API 与配置自动启动。
+- [x] 在真实 KVM 上运行生成的 PVH ELF，验证串口、块设备读盘、initrd modlist、复位退出；另测双 vCPU 拆除、暂停/恢复及启动失败重试。
+- [x] REST API 端到端测试：配置 → Start → Pause → Resume → Shutdown，验证 socket 清理。
+- [x] 设备回归测试包含 reset 后重新激活、非法 avail 索引、错误对齐、超大/越界描述符、大请求有界缓冲，以及任务 panic 后正常 quiesce。
+- [x] `make lint`、`make test`、`make api-features`，并导出与校验 OpenAPI / JSON Schema。
+- [x] 真实 Linux guest：`/fuu.code/kangaroo-6.6/vmlinux`（Linux 6.6.102，PVH）完成双 vCPU、virtio-mmio block、ext4 root、systemd 与自动登录验证。rootfs 以 `ro,rootflags=noload` 挂载，未修改镜像；测试仍默认忽略，以环境变量显式运行。
+
+运行真实 Linux 冒烟测试：
+
+```sh
+DBE_KERNEL=/path/to/vmlinux \
+DBE_INITRD=/path/to/initramfs.cpio.gz \
+DBE_ROOTFS=/path/to/rootfs.ext4 \
+cargo test -p dragonball-evolved --test boot linux_pvh_smoke_boot -- --ignored --nocapture
+```
+
+`DBE_INITRD`、`DBE_ROOTFS`、`DBE_CMDLINE` 可选；guest init 须输出 `DBE_LINUX_OK` 后执行 `reboot`，测试同时检查 Linux 启动日志、标记与正常退出。
+
+实现中收紧的边界：
+
+- guest RAM 至少 16 MiB，检查宿主物理地址宽度、memslot 与 IRQ 数量。
+- guest 请求在任何磁盘修改前完成描述符方向、全部地址及磁盘范围校验；大描述符分块处理，staging 不超过 64 KiB。
+- 激活 channel 容量为 1；reset 超时保留旧会话，拒绝在旧队列仍可能运行时重新激活。
+- vCPU 线程显式解除继承的 SIGRTMIN 屏蔽，复制的 fd 保留 CLOEXEC；线程 join 放到 blocking pool。
+- 控制台普通文件输出也交给 blocking pool；raw-mode guard 恢复原始 termios；停机时控制台最多尝试 flush 一秒，避免不可读终端阻止拆除。
+- IO runtime 创建有一次启动握手；机器构建的 open/read/ioctl 仍属于 D5 的启动期例外。
 
 ## 附录 A：guest 内核要求
 
