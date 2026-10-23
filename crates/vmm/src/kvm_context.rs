@@ -41,16 +41,8 @@ pub struct KvmContext {
 impl KvmContext {
     pub fn from_dev_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let metadata = path
-            .metadata()
-            .with_context(|| format!("stat KVM device {}", path.display()))?;
-        if !metadata.file_type().is_char_device() {
-            bail!("KVM device {} is not a character device", path.display());
-        }
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .with_context(|| format!("KVM device path contains NUL: {}", path.display()))?;
-        let kvm = Kvm::new_with_path(&c_path)
-            .with_context(|| format!("open KVM device {}", path.display()))?;
+        let kvm = Self::check_and_oepn(path)?;
+
         let api_version = kvm.get_api_version();
         if api_version != KVM_API_VERSION as i32 {
             bail!(
@@ -87,6 +79,18 @@ impl KvmContext {
             path: path.to_path_buf(),
             capabilities,
         })
+    }
+
+    fn check_and_oepn(path: &Path) -> Result<Kvm> {
+        let metadata = path
+            .metadata()
+            .with_context(|| format!("stat KVM device {}", path.display()))?;
+        if !metadata.file_type().is_char_device() {
+            bail!("KVM device {} is not a character device", path.display());
+        }
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .with_context(|| format!("KVM device path contains NUL: {}", path.display()))?;
+        Kvm::new_with_path(&c_path).with_context(|| format!("open KVM device {}", path.display()))
     }
 
     pub fn kvm(&self) -> &Kvm {

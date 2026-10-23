@@ -85,6 +85,8 @@ message 必须在调用线程落地 —— `Record` 借的是调用方栈上的 
 
 `show_id` 指实例 id,由 bin crate 在 init 时一次性写入 `OnceLock`。打开文件在调用线程完成,失败要能返回给调用方(API),送进队列的是已打开的 `File`。
 
+text 行在 sink 是终端时加 ANSI 颜色,配色与 `dlog` 一致:时间戳绿、级别按严重度(ERRO 红底、WARN 橙底、其余灰)、`[线程]` 列蓝,均加粗;消息与尾随字段不着色。是否是终端只在换 sink 时用 `IsTerminal` 判断一次,不逐行查。json 永不着色。
+
 级别是唯一由前端读的配置项,所以它留在 `log` 的全局原子里(`log::set_max_level`),不走队列。
 
 ### FlushGuard
@@ -105,7 +107,7 @@ message 必须在调用线程落地 —— `Record` 借的是调用方栈上的 
 - 记录格式与普通文本行对齐:`<ts> ERRO [tname:tid] crashed on SIGSEGV, code=1, addr=0x0, id=<id>`。信号打名字而不是编号;`si_addr` 只在内核自己抛出(`si_code > 0`)且该信号确实带地址时才打,否则那个 union 里装的是发送方 pid/uid,当地址打出来是误导。字段集是固定的,不受 `show_*` 影响 —— 那些配置由写入线程独占,handler 不能加锁去读。
 - 线程名只有 `tid == pid` 时能给出 `main`,其余线程报 `-`:读 `comm` 要开文件,handler 不做。拿 crash 行里的 tid 去翻同线程早先的普通日志即可。
 - `clock_gettime` 是 async-signal-safe,`localtime_r` 不是。init 时预存 UTC 偏移秒数,handler 用整数运算算出本地时间。
-- 始终 text。json 转义要额外的分支和缓冲,收益为零。
+- 始终 text,且不着色。json 转义要额外的分支和缓冲,收益为零;是否是终端随 sink 变化,而 handler 不读可变状态。
 - 写完后 `nanosleep` 一段 grace period,给后台线程机会把已入队的普通日志刷出去;然后恢复默认 handler 并 re-raise,保住 core dump 和退出码。
 
 panic 不是信号,panic hook 可以分配、可以取 backtrace,走普通路径。

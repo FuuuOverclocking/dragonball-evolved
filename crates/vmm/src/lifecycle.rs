@@ -97,7 +97,7 @@ pub(crate) struct Operation {
     /// Reply channel for the lifecycle request that started this operation.
     pub reply: Option<Reply<ApiResult<()>>>,
     /// The sender half -- stored so Shutdown can trigger cancellation.
-    pub cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub cancel_tx: Option<oneshot::Sender<()>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ pub(crate) enum Event {
 // ---------------------------------------------------------------------------
 
 fn make_pause_operation(mut machine: Machine, reply: Reply<ApiResult<()>>) -> (VmState, Operation) {
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
         Box::pin(async move {
             let outcome = {
@@ -180,7 +180,7 @@ fn make_resume_operation(
     mut machine: Machine,
     reply: Reply<ApiResult<()>>,
 ) -> (VmState, Operation) {
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
         Box::pin(async move {
             let outcome = {
@@ -216,7 +216,7 @@ fn make_resume_operation(
 }
 
 fn make_start_operation(machine: Machine, reply: Reply<ApiResult<()>>) -> (VmState, Operation) {
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
         Box::pin(async move {
             let outcome = {
@@ -607,13 +607,9 @@ mod tests {
     /// Create a pending operation with a controllable completion channel.
     fn mock_operation(
         stable: VmState,
-    ) -> (
-        VmState,
-        Operation,
-        tokio::sync::oneshot::Sender<OperationCompletion>,
-    ) {
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    ) -> (VmState, Operation, oneshot::Sender<OperationCompletion>) {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
         let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
             Box::pin(async move { completion_rx.await.unwrap() });
         let (reply_tx, _reply_rx) = oneshot::channel::<ApiResult<()>>();
@@ -631,11 +627,11 @@ mod tests {
     ) -> (
         VmState,
         Operation,
-        tokio::sync::oneshot::Sender<OperationCompletion>,
+        oneshot::Sender<OperationCompletion>,
         oneshot::Receiver<ApiResult<()>>,
     ) {
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
         let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
             Box::pin(async move { completion_rx.await.unwrap() });
         let (reply_tx, reply_rx) = oneshot::channel::<ApiResult<()>>();

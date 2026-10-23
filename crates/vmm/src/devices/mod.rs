@@ -398,7 +398,6 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use tokio::sync::oneshot;
     use tokio::time::timeout;
 
     use super::*;

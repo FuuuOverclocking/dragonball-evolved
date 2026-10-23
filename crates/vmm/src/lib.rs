@@ -23,7 +23,8 @@ use crate::spec::MachineSpec;
 pub use crate::vmm_server::VmmClient;
 use crate::vmm_server::VmmServer;
 
-pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
+pub fn 
+start(ctx: ProcessCtx) -> Result<VmmClient> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     let thread_handle = thread::Builder::new()

@@ -11,7 +11,7 @@ crates/logger-backend
     - FlushGuard: drop 时执行 logger_backend::flush(), 可随意生成多个该结构
     - 运行时可更换配置, 包括
         - log target: stderr, file(path)
-        - log format: json, text
+        - log format: json, text (text 输出到终端时按 dlog 配色着色)
         - log fields:
             - show_tid
             - show_thread_name

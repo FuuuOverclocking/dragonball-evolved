@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write as _};
+use std::io::{self, BufWriter, IsTerminal as _, Write as _};
 use std::process;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -42,6 +42,13 @@ impl Sink {
             Sink::File(file) => file.flush(),
         }
     }
+
+    fn is_terminal(&self) -> bool {
+        match self {
+            Sink::Stderr => io::stderr().is_terminal(),
+            Sink::File(file) => file.get_ref().is_terminal(),
+        }
+    }
 }
 
 /// Which optional fields a line carries.
@@ -69,7 +76,9 @@ impl Default for Fields {
 /// What the writer thread owns.
 #[derive(Debug)]
 pub struct Settings {
-    pub sink: Sink,
+    sink: Sink,
+    /// Whether `sink` is a terminal, decided when the sink changes rather than per line.
+    color: bool,
     pub format: Format,
     pub fields: Fields,
 }
@@ -87,10 +96,20 @@ pub struct Update {
 }
 
 impl Settings {
+    pub fn new(sink: Sink) -> Self {
+        Self {
+            color: sink.is_terminal(),
+            sink,
+            format: Format::default(),
+            fields: Fields::default(),
+        }
+    }
+
     pub fn apply(&mut self, update: Update) {
         if let Some(sink) = update.sink {
             // Whatever the old sink still holds belongs to the old target.
             let _ = self.sink.flush();
+            self.color = sink.is_terminal();
             self.sink = sink;
         }
         if let Some(format) = update.format {
@@ -208,7 +227,7 @@ fn write_entry(
 fn emit(view: &View<'_>, settings: &mut Settings, names: &mut ThreadNames, line: &mut Vec<u8>) {
     line.clear();
     match settings.format {
-        Format::Text => render_text(line, view, &settings.fields, names),
+        Format::Text => render_text(line, view, &settings.fields, settings.color, names),
         Format::Json => render_json(line, view, &settings.fields, names),
     }
     line.push(b'\n');
@@ -218,13 +237,25 @@ fn emit(view: &View<'_>, settings: &mut Settings, names: &mut ThreadNames, line:
     let _ = settings.sink.write_line(line);
 }
 
-fn render_text(out: &mut Vec<u8>, view: &View<'_>, fields: &Fields, names: &mut ThreadNames) {
+fn render_text(
+    out: &mut Vec<u8>,
+    view: &View<'_>,
+    fields: &Fields,
+    color: bool,
+    names: &mut ThreadNames,
+) {
+    paint(out, color, TIMESTAMP_SGR);
     out.extend_from_slice(time::render(view.timestamp).as_bytes());
+    paint(out, color, RESET);
     out.push(b' ');
+    paint(out, color, level_sgr(view.level));
     out.extend_from_slice(level_name(view.level).as_bytes());
+    paint(out, color, RESET);
 
     if fields.show_thread_name || fields.show_tid {
-        out.extend_from_slice(b" [");
+        out.push(b' ');
+        paint(out, color, THREAD_SGR);
+        out.push(b'[');
         let mut first = true;
         if fields.show_thread_name {
             separate(out, &mut first);
@@ -235,6 +266,7 @@ fn render_text(out: &mut Vec<u8>, view: &View<'_>, fields: &Fields, names: &mut 
             push_u64(out, u64::from(view.tid));
         }
         out.push(b']');
+        paint(out, color, RESET);
     }
 
     // The message leads; everything else trails it as `key=value`, so a line
@@ -350,6 +382,25 @@ pub fn level_name(level: Level) -> &'static str {
     }
 }
 
+// The palette `dlog` uses, so a terminal shows a log the same way that viewer does.
+const RESET: &[u8] = b"\x1b[0m";
+const TIMESTAMP_SGR: &[u8] = b"\x1b[1;32m";
+const THREAD_SGR: &[u8] = b"\x1b[1;34m";
+
+fn level_sgr(level: Level) -> &'static [u8] {
+    match level {
+        Level::Error => b"\x1b[1;41m",
+        Level::Warn => b"\x1b[1;48;5;208m",
+        Level::Info | Level::Debug | Level::Trace => b"\x1b[1;90m",
+    }
+}
+
+fn paint(out: &mut Vec<u8>, color: bool, sgr: &[u8]) {
+    if color {
+        out.extend_from_slice(sgr);
+    }
+}
+
 /// tid to thread name, read from the kernel's `comm`.
 ///
 /// `comm` holds 15 bytes, so longer names arrive truncated. Misses are not
@@ -417,7 +468,13 @@ mod tests {
 
     fn text(fields: Fields, view: &View<'_>) -> String {
         let mut out = Vec::new();
-        render_text(&mut out, view, &fields, &mut ThreadNames::default());
+        render_text(&mut out, view, &fields, false, &mut ThreadNames::default());
+        String::from_utf8(out).unwrap()
+    }
+
+    fn painted(fields: Fields, view: &View<'_>) -> String {
+        let mut out = Vec::new();
+        render_text(&mut out, view, &fields, true, &mut ThreadNames::default());
         String::from_utf8(out).unwrap()
     }
 
@@ -478,6 +535,77 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_gets_dlog_colours_and_the_message_stays_plain() {
+        let fields = Fields {
+            show_tid: true,
+            show_target: true,
+            show_file_line: true,
+            ..all_off()
+        };
+        let line = painted(fields, &view("boom", "vmm::block", "block.rs"));
+        let tid = crate::entry::tid();
+
+        assert!(line.starts_with("\x1b[1;32m20"), "{line:?}");
+        assert!(
+            line.ends_with(&format!(
+                "\x1b[0m \x1b[1;48;5;208mWARN\x1b[0m \x1b[1;34m[{tid}]\x1b[0m boom, \
+                 target=vmm::block, at block.rs:108"
+            )),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn each_level_has_its_dlog_colour() {
+        for (level, painted_level) in [
+            (Level::Error, "\x1b[1;41mERRO\x1b[0m"),
+            (Level::Warn, "\x1b[1;48;5;208mWARN\x1b[0m"),
+            (Level::Info, "\x1b[1;90mINFO\x1b[0m"),
+            (Level::Debug, "\x1b[1;90mDEBG\x1b[0m"),
+            (Level::Trace, "\x1b[1;90mTRAC\x1b[0m"),
+        ] {
+            let line = painted(
+                all_off(),
+                &View {
+                    level,
+                    ..view("boom", "", "")
+                },
+            );
+
+            assert!(
+                line.ends_with(&format!(" {painted_level} boom")),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn colour_follows_whether_the_sink_is_a_terminal() {
+        let null = || {
+            let file = File::options().write(true).open("/dev/null").unwrap();
+            Sink::File(BufWriter::new(file))
+        };
+        let mut settings = Settings::new(null());
+        assert!(!settings.color);
+
+        // A pty master answers `isatty` the same way its slave does.
+        let Ok(pty) = File::options().read(true).write(true).open("/dev/ptmx") else {
+            return;
+        };
+        settings.apply(Update {
+            sink: Some(Sink::File(BufWriter::new(pty))),
+            ..Update::default()
+        });
+        assert!(settings.color);
+
+        settings.apply(Update {
+            sink: Some(null()),
+            ..Update::default()
+        });
+        assert!(!settings.color);
+    }
+
+    #[test]
     fn json_escapes_the_message() {
         let line = json(all_off(), &view("a\"b\\c\nd\te\r\u{1}f", "", ""));
 
@@ -517,11 +645,8 @@ mod tests {
         ));
         let file = File::create(&path).unwrap();
 
-        let mut settings = Settings {
-            sink: Sink::File(BufWriter::new(file)),
-            format: Format::Text,
-            fields: all_off(),
-        };
+        let mut settings = Settings::new(Sink::File(BufWriter::new(file)));
+        settings.fields = all_off();
         let entry = Entry::new(
             &log::Record::builder()
                 .metadata(

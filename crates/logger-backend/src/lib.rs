@@ -30,7 +30,7 @@ use std::{fmt, thread};
 use log::{LevelFilter, Log, Metadata, Record};
 
 use crate::entry::Entry;
-use crate::writer::{Fields, Msg, Settings, Sink, Update};
+use crate::writer::{Msg, Settings, Sink, Update};
 
 /// Queue depth. Deep enough to absorb a burst, shallow enough that a stalled
 /// writer costs a few hundred kilobytes rather than the host's memory.
@@ -256,11 +256,7 @@ pub fn init(mut config: Config) -> Result<FlushGuard, Error> {
     crash::init().map_err(Error::Crash)?;
 
     let (level, update) = split(config)?;
-    let mut settings = Settings {
-        sink: Sink::Stderr,
-        format: Format::default(),
-        fields: Fields::default(),
-    };
+    let mut settings = Settings::new(Sink::Stderr);
     settings.apply(update);
 
     let (sender, receiver) = mpsc::sync_channel(QUEUE_DEPTH);
