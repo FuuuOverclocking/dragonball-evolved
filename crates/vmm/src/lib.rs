@@ -41,7 +41,7 @@ pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
 async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
     let mut controller = Controller::new(MachineSpec::default());
 
-    let mut status = 'main: loop {
+    let mut status = loop {
         match controller {
             Controller::Idle(mut vm) => {
                 // IDLE: select machine/device events (biased) and requests.
@@ -74,7 +74,7 @@ async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
                     Step::Continue => controller = next,
                     Step::Stop(s) => {
                         controller = next;
-                        break 'main s;
+                        break s;
                     }
                 }
             }
