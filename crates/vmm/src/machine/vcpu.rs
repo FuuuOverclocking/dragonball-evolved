@@ -5,11 +5,12 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use kvm_bindings::{
     KVM_MAX_CPUID_ENTRIES, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, Msrs, kvm_msr_entry,
 };
 use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
+use logger::warn;
 use tokio::sync::mpsc as tokio_mpsc;
 use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
 
@@ -221,6 +222,46 @@ impl VcpuHandle {
         }
         Ok(())
     }
+}
+
+/// Restores state taken by [`VcpuHandle::capture_state`] onto a fresh vCPU.
+pub(super) fn restore_state(fd: &VcpuFd, snapshot: &VcpuSnapshot) -> Result<()> {
+    // Restore ordering follows Firecracker: cpuid first (BSP detection
+    // depends on it), then mp_state, general regs, sregs, xsave, xcrs,
+    // debug regs, lapic (after sregs), MSRs, vcpu_events last.
+    fd.set_cpuid2(&snapshot.cpuid).context("restore cpuid")?;
+    fd.set_mp_state(snapshot.mp_state)
+        .context("restore mp_state")?;
+    fd.set_regs(&snapshot.regs).context("restore regs")?;
+    fd.set_sregs(&snapshot.sregs).context("restore sregs")?;
+    // SAFETY: We restore the same kvm_xsave that get_xsave() produced on the
+    // same host. No dynamic XSTATE features are enabled, so the traditional
+    // 4096-byte kvm_xsave is sufficient.
+    unsafe { fd.set_xsave(&snapshot.xsave) }.context("restore xsave")?;
+    fd.set_xcrs(&snapshot.xcrs).context("restore xcrs")?;
+    fd.set_debug_regs(&snapshot.debug_regs)
+        .context("restore debug_regs")?;
+    fd.set_lapic(&snapshot.lapic).context("restore lapic")?;
+    let msrs = Msrs::from_entries(&snapshot.msrs).context("build MSR set")?;
+    let set_count = fd.set_msrs(&msrs).context("restore msrs")?;
+    if set_count != snapshot.msrs.len() {
+        bail!(
+            "KVM set {set_count}/{} MSRs for vCPU {}",
+            snapshot.msrs.len(),
+            snapshot.index
+        );
+    }
+    fd.set_vcpu_events(&snapshot.vcpu_events)
+        .context("restore vcpu_events")?;
+    // Notify KVM that the guest's pvclock may be out of sync after restore,
+    // preventing spurious soft-lockup detection inside the guest.
+    if let Err(error) = fd.kvmclock_ctrl() {
+        warn!(
+            "kvmclock_ctrl failed for vCPU {}: {error:#}",
+            snapshot.index
+        );
+    }
+    Ok(())
 }
 
 impl Drop for VcpuHandle {

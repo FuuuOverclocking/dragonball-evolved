@@ -62,7 +62,7 @@ impl Vm {
             Self::NotStarted(_) => std::future::pending().await,
             Self::Running(machine) | Self::Paused(machine) => select! {
                 Some(event) = machine.events.recv() => Event::Machine(event),
-                Some(exit) = machine.devices.next_exit() => Event::Device(exit),
+                Some(exit) = machine.tasks.next_exit() => Event::Device(exit),
             },
         }
     }

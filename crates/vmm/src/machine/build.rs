@@ -4,70 +4,118 @@ use std::range::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use api::machine::ConsoleConfig;
 use kvm_bindings::{
     KVM_MP_STATE_UNINITIALIZED, KVM_PIT_SPEAKER_DUMMY, Msrs, kvm_mp_state, kvm_pit_config,
 };
-use kvm_ioctls::{IoEventAddress, VmFd};
+use kvm_ioctls::{VcpuFd, VmFd};
 use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{KernelLoader, PvhBootCapability, load_cmdline};
-use logger::warn_unlimited;
 use tokio::sync::mpsc;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
 
+use super::MachineEvent;
+use super::block::{self, AttachedBlock};
 use super::bus::{Bus, BusDevice};
-use super::plan::MachinePlan;
+use super::memory::{self, SharedGuestMemory};
+use super::plan::{DevicePlan, MachinePlan};
+use super::platform::{Platform, PlatformSnapshot};
+use super::snapshot::DeviceSnapshot;
 use super::vcpu::{VcpuHandle, Vcpus};
-use super::{MachineEvent, memory};
 use crate::KvmContext;
 use crate::arch::x86_64::{cpuid, lapic, layout, mptable, msr, pvh, regs};
-use crate::devices::legacy::console::{self, ConsoleOut, RawModeGuard};
-use crate::devices::legacy::i8042::I8042Device;
-use crate::devices::legacy::serial::{SerialDevice, SerialHandle};
-use crate::devices::virtio::block::{BlockQuiesceHandle, BlockQuiesced, BlockResources};
-use crate::devices::virtio::mmio::{MmioTransport, NOTIFY_OFFSET};
-use crate::devices::{DeviceManager, DeviceRole, Placement};
+use crate::devices::DeviceManager;
 
 pub struct Machine {
     pub vcpus: Option<Vcpus>,
-    pub devices: DeviceManager,
+    /// The device tasks: their stop signal, their exits and the I/O thread.
+    pub tasks: DeviceManager,
     pub events: mpsc::UnboundedReceiver<MachineEvent>,
-    pub serial_handle: Option<Arc<SerialHandle<ConsoleOut>>>,
-    pub i8042: Option<Arc<I8042Device>>,
-    pub mmio_transports: Vec<Arc<MmioTransport>>,
-    pub(super) pio: Arc<Bus>,
-    pub(super) mmio: Arc<Bus>,
+    pub(super) plan: MachinePlan,
+    pub(super) platform: Platform,
+    /// In plan order.
+    pub(super) devices: Vec<AttachedDevice>,
+    pio: Arc<Bus>,
+    mmio: Arc<Bus>,
     pub(crate) vm: VmFd,
-    pub(crate) memory: memory::SharedGuestMemory,
-    pub(super) raw_mode: Option<RawModeGuard>,
-    pub(crate) block_quiesce: Vec<BlockQuiesceHandle>,
-    /// Each block device's state as of the last pause (or as built / restored),
-    /// index-aligned with `block_quiesce` and `mmio_transports`.
-    pub(crate) captured_blocks: Vec<BlockQuiesced>,
+    pub(crate) memory: SharedGuestMemory,
+}
+
+/// A device attached to a machine, by kind.
+pub(super) enum AttachedDevice {
+    Block(AttachedBlock),
+}
+
+impl AttachedDevice {
+    fn attach(
+        plan: &DevicePlan,
+        vm: &VmFd,
+        memory: &SharedGuestMemory,
+        tasks: &mut DeviceManager,
+        mmio_bus: &mut Vec<(Range<u64>, Arc<dyn BusDevice>)>,
+        restore: Option<DeviceSnapshot>,
+    ) -> Result<Self> {
+        match plan {
+            DevicePlan::Block(plan) => {
+                let restore = restore.map(|captured| match captured {
+                    DeviceSnapshot::Block(captured) => captured,
+                });
+                block::attach(plan.clone(), vm, memory, tasks, mmio_bus, restore).map(Self::Block)
+            }
+        }
+    }
+
+    async fn quiesce(&mut self) {
+        match self {
+            Self::Block(block) => block.quiesce().await,
+        }
+    }
+
+    async fn resume(&self) {
+        match self {
+            Self::Block(block) => block.resume().await,
+        }
+    }
+
+    pub(super) fn capture(&self) -> Result<DeviceSnapshot> {
+        match self {
+            Self::Block(block) => block.capture().map(DeviceSnapshot::Block),
+        }
+    }
+}
+
+/// What [`assemble`] restores the platform and the devices from.
+pub(super) struct Restore {
+    pub platform: PlatformSnapshot,
+    /// In plan order, one per planned device.
+    pub devices: Vec<DeviceSnapshot>,
 }
 
 impl Machine {
+    /// The layout this machine was built or restored with.
+    pub fn plan(&self) -> &MachinePlan {
+        &self.plan
+    }
+
+    /// The MMIO bus as the vCPUs see it.
+    pub fn mmio_bus(&self) -> &Bus {
+        &self.mmio
+    }
+
     pub async fn pause(&mut self) -> Result<()> {
         self.vcpus.as_ref().unwrap().pause().await?;
-        // Quiesce block devices cooperatively and record what each one was doing.
-        let mut captured = Vec::with_capacity(self.block_quiesce.len());
-        for handle in &self.block_quiesce {
-            let quiesced = handle.quiesce().await;
-            if quiesced == BlockQuiesced::Exited {
-                warn_unlimited!("block device {} has exited; pausing without it", handle.id);
-            }
-            captured.push(quiesced);
+        // Cooperatively quiesced devices record what they were doing as they park.
+        for device in &mut self.devices {
+            device.quiesce().await;
         }
-        self.captured_blocks = captured;
-        // Quiesce gate-based devices (irq resampler, serial).
-        self.devices.quiesce().await;
+        // Gate-based tasks: interrupt resamplers and the console input.
+        self.tasks.quiesce().await;
         Ok(())
     }
 
     pub async fn resume(&mut self) -> Result<()> {
-        self.devices.resume().await;
-        for handle in &self.block_quiesce {
-            handle.resume().await;
+        self.tasks.resume().await;
+        for device in &self.devices {
+            device.resume().await;
         }
         self.vcpus.as_ref().unwrap().resume().await
     }
@@ -78,21 +126,20 @@ impl Machine {
         } else {
             Ok(())
         };
-        self.devices.stop().await;
-        drop(self.serial_handle);
-        drop(self.i8042);
-        drop(self.mmio_transports);
+        self.tasks.stop().await;
+        drop(self.devices);
+        drop(self.platform);
         drop(self.pio);
         drop(self.mmio);
         drop(self.vm);
         drop(self.memory);
-        drop(self.raw_mode);
         result
     }
 }
 
-pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
-    let memory = memory::create(&plan.ram)?;
+/// Creates a VM with the in-kernel interrupt controllers and PIT; a restore then
+/// loads their captured state.
+pub(super) fn create_vm(context: &KvmContext) -> Result<VmFd> {
     let vm = context.kvm().create_vm().context("create KVM VM")?;
     vm.set_tss_address(layout::TSS_START as usize)
         .context("set TSS address")?;
@@ -102,6 +149,12 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         ..Default::default()
     })
     .context("create PIT2")?;
+    Ok(vm)
+}
+
+pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
+    let memory = memory::create(&plan.ram)?;
+    let vm = create_vm(context)?;
     // SAFETY: Machine and startup rollback both stop vCPUs and drop VM before memory.
     unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }?;
 
@@ -167,87 +220,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         memory.write_slice(&blob.bytes, GuestAddress(blob.address))?;
     }
 
-    let (events_tx, events) = mpsc::unbounded_channel();
-    let i8042 = Arc::new(I8042Device::new(events_tx.clone()));
-    let mut pio_devices: Vec<(Range<u64>, Arc<dyn BusDevice>)> = vec![(
-        layout::I8042_PORTS,
-        Arc::clone(&i8042) as Arc<dyn BusDevice>,
-    )];
-    let mut mmio_devices: Vec<(Range<u64>, Arc<dyn BusDevice>)> = Vec::new();
-    let mut mmio_transports: Vec<Arc<MmioTransport>> = Vec::new();
-    let mut blocks = Vec::new();
-    let mut block_quiesce = Vec::new();
-    let mut captured_blocks = Vec::new();
-    let mut devices = DeviceManager::new();
-    for (disk, grant) in plan.spec.disks.iter().zip(&plan.devices) {
-        let (resources, handle, quiesce_handle) =
-            BlockResources::open(disk.id.as_ref().unwrap(), &disk.path, disk.read_only, None)?;
-        vm.register_ioevent(
-            &handle.queue_notifier,
-            &IoEventAddress::Mmio(grant.mmio.start() + NOTIFY_OFFSET),
-            0u32,
-        )?;
-        vm.register_irqfd_with_resample(
-            handle.interrupt.irq_fd(),
-            handle.interrupt.resample_fd(),
-            grant.gsi.0,
-        )?;
-        let stop = devices.stop_signal();
-        devices.spawn(
-            format!("irq-{}", grant.gsi.0),
-            DeviceRole::GuestAffecting,
-            Arc::clone(&handle.interrupt).resample(stop),
-        );
-        let transport = Arc::new(MmioTransport::new(
-            handle.desc,
-            Arc::clone(&memory),
-            handle.activator,
-            handle.interrupt,
-            vec![handle.queue_notifier],
-        ));
-        mmio_devices.push((
-            grant.mmio.into(),
-            Arc::clone(&transport) as Arc<dyn BusDevice>,
-        ));
-        mmio_transports.push(transport);
-        block_quiesce.push(quiesce_handle);
-        captured_blocks.push(BlockQuiesced::Inactive);
-        blocks.push((disk.id.as_ref().unwrap().clone(), resources));
-    }
-
-    let mut raw_mode = None;
-    let mut serial_handle = None;
-    if plan.spec.console == ConsoleConfig::Stdio {
-        let input = console::open_input()?;
-        let fd = input.map(|input| {
-            raw_mode = input.raw_mode;
-            input.fd
-        });
-        let (output, drain) = console::output(console::DEFAULT_OUTPUT_CAPACITY);
-        let (serial, handle) = SerialDevice::with_input(fd, output)?;
-        let handle = Arc::new(handle);
-        vm.register_irqfd(&handle.irq_fd, layout::COM1_GSI.0)?;
-        pio_devices.push((
-            layout::COM1_PORTS,
-            Arc::clone(&handle) as Arc<dyn BusDevice>,
-        ));
-        serial_handle = Some(handle);
-        let stop = devices.stop_signal();
-        devices.spawn(
-            "console-input",
-            DeviceRole::GuestAffecting,
-            serial.run(stop),
-        );
-        let stop = devices.stop_signal();
-        devices.spawn(
-            "console-output",
-            DeviceRole::HostOnly,
-            drain.run_stdout(stop),
-        );
-    }
-    let pio = Arc::new(Bus::new(pio_devices)?);
-    let mmio = Arc::new(Bus::new(mmio_devices)?);
-    let mut fds = Vec::with_capacity(plan.spec.cpus as usize);
+    let mut vcpus = Vec::with_capacity(plan.spec.cpus as usize);
     for index in 0..plan.spec.cpus {
         let vcpu = vm.create_vcpu(u64::from(index)).context("create vCPU")?;
         let caps = context.capabilities();
@@ -275,18 +248,58 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
             })?;
         }
         vcpu.set_lapic(&lapic::configure_lint(vcpu.get_lapic()?))?;
-        fds.push(vcpu);
+        vcpus.push(vcpu);
     }
-    for (name, resources) in blocks {
-        devices.spawn_on(
-            name,
-            Placement::Io,
-            DeviceRole::HostOnly,
-            move |stop| async move { resources.into_device()?.run(stop).await },
-        )?;
+    assemble(plan, memory, vm, vcpus, None)
+}
+
+/// Attaches the platform and the planned devices, then starts the vCPU threads,
+/// which park until resumed. Building and restoring share this path.
+///
+/// The vCPUs must already be configured or restored: a restored device can
+/// interrupt the guest as soon as it is attached, and restoring the LAPIC after
+/// that would drop the interrupt.
+pub(super) fn assemble(
+    plan: MachinePlan,
+    memory: SharedGuestMemory,
+    // After `memory`, so an early return drops the VM before the mapping it uses.
+    vm: VmFd,
+    vcpus: Vec<VcpuFd>,
+    restore: Option<Restore>,
+) -> Result<Machine> {
+    let (events_tx, events) = mpsc::unbounded_channel();
+    let mut tasks = DeviceManager::new();
+    let mut pio_bus = Vec::new();
+    let mut mmio_bus = Vec::new();
+    let (platform_state, device_states) = match restore {
+        Some(restore) => (Some(restore.platform), restore.devices),
+        None => (None, Vec::new()),
+    };
+    let platform = Platform::attach(
+        plan.spec.console,
+        &vm,
+        &events_tx,
+        &mut tasks,
+        &mut pio_bus,
+        platform_state,
+    )?;
+    // Empty when building, so every device attaches fresh.
+    let mut device_states = device_states.into_iter();
+    let mut devices = Vec::with_capacity(plan.devices.len());
+    for device in &plan.devices {
+        devices.push(AttachedDevice::attach(
+            device,
+            &vm,
+            &memory,
+            &mut tasks,
+            &mut mmio_bus,
+            device_states.next(),
+        )?);
     }
-    let mut handles = Vec::with_capacity(fds.len());
-    for (index, fd) in fds.into_iter().enumerate() {
+    let pio = Arc::new(Bus::new(pio_bus)?);
+    let mmio = Arc::new(Bus::new(mmio_bus)?);
+    let mut handles = Vec::with_capacity(vcpus.len());
+    for (index, fd) in vcpus.into_iter().enumerate() {
         handles.push(VcpuHandle::spawn(
             index as u8,
             fd,
@@ -298,17 +311,14 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
     }
     Ok(Machine {
         vcpus: Some(Vcpus::new(handles)),
-        devices,
+        tasks,
         events,
-        serial_handle,
-        i8042: Some(i8042),
-        mmio_transports,
+        plan,
+        platform,
+        devices,
         pio,
         mmio,
         vm,
         memory,
-        raw_mode,
-        block_quiesce,
-        captured_blocks,
     })
 }

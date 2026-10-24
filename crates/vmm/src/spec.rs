@@ -1,8 +1,9 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use api::VmmCommand;
-use api::block::{AddDisk, BlockDevConfig};
+use api::block::AddDisk;
 use api::boot::{KernelConfig, SetKernel};
 use api::machine::{ConsoleConfig, MemorySizeMib, SetConsole, SetCpus, SetMemory, VcpuCount};
 
@@ -15,7 +16,30 @@ pub struct MachineSpec {
     pub memory_mib: u32,
     pub console: ConsoleConfig,
     pub kernel: Option<KernelConfig>,
-    pub disks: Vec<BlockDevConfig>,
+    pub devices: Vec<DeviceSpec>,
+}
+
+/// A configured device, classified by kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceSpec {
+    Block(BlockSpec),
+}
+
+impl DeviceSpec {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Block(block) => &block.id,
+        }
+    }
+}
+
+/// A disk as configured, with its id already normalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpec {
+    pub id: String,
+    pub path: PathBuf,
+    pub read_only: bool,
+    pub root: bool,
 }
 
 impl Default for MachineSpec {
@@ -25,12 +49,19 @@ impl Default for MachineSpec {
             memory_mib: 128,
             console: ConsoleConfig::Stdio,
             kernel: None,
-            disks: Vec::new(),
+            devices: Vec::new(),
         }
     }
 }
 
 impl MachineSpec {
+    /// The configured disks, in configuration order.
+    pub fn blocks(&self) -> impl Iterator<Item = &BlockSpec> {
+        self.devices.iter().map(|device| match device {
+            DeviceSpec::Block(block) => block,
+        })
+    }
+
     pub fn apply(&self, command: VmmCommand) -> Result<Self> {
         let mut next = self.clone();
         match command {
@@ -53,20 +84,25 @@ impl MachineSpec {
                 }
                 next.kernel = Some(value);
             }
-            VmmCommand::AddDisk(AddDisk(mut disk), ()) => {
+            VmmCommand::AddDisk(AddDisk(disk), ()) => {
                 if disk.path.as_os_str().is_empty() {
                     bail!("disk path must be nonempty");
                 }
                 let id = disk
                     .id
-                    .get_or_insert_with(|| format!("disk{}", next.disks.len()));
-                if id.is_empty() || next.disks.iter().any(|disk| disk.id.as_ref() == Some(id)) {
+                    .unwrap_or_else(|| format!("disk{}", next.blocks().count()));
+                if id.is_empty() || next.devices.iter().any(|device| device.id() == id) {
                     bail!("disk id must be nonempty and unique");
                 }
-                if disk.root && next.disks.iter().any(|disk| disk.root) {
+                if disk.root && next.blocks().any(|block| block.root) {
                     bail!("only one root disk is allowed");
                 }
-                next.disks.push(disk);
+                next.devices.push(DeviceSpec::Block(BlockSpec {
+                    id,
+                    path: disk.path,
+                    read_only: disk.read_only,
+                    root: disk.root,
+                }));
             }
             _ => bail!("operation is not a machine configuration command"),
         }
@@ -98,19 +134,9 @@ impl MachineSpec {
                 bail!("guest memory exceeds supported physical address width");
             }
         }
-        if self
-            .disks
-            .iter()
-            .any(|disk| disk.id.as_deref().is_none_or(str::is_empty))
-        {
-            bail!("disk ids must be normalized before planning");
-        }
         let mut ids = HashSet::new();
-        if self.disks.iter().any(|disk| !ids.insert(disk.id.as_ref())) {
-            bail!("duplicate disk ids");
-        }
-        if self.disks.iter().filter(|disk| disk.root).count() > 1 {
-            bail!("multiple root disks");
+        if !self.devices.iter().all(|device| ids.insert(device.id())) {
+            bail!("duplicate device ids");
         }
         Ok(())
     }
@@ -119,6 +145,7 @@ impl MachineSpec {
 #[cfg(test)]
 mod tests {
     use api::RawVmmOp;
+    use api::block::BlockDevConfig;
 
     use super::*;
 
@@ -153,7 +180,15 @@ mod tests {
         let spec = MachineSpec::default()
             .apply(AddDisk(disk.clone()).into_vmm_command())
             .unwrap();
-        assert_eq!(spec.disks[0].id.as_deref(), Some("disk0"));
+        assert_eq!(
+            spec.devices,
+            [DeviceSpec::Block(BlockSpec {
+                id: "disk0".into(),
+                path: "/test/disk".into(),
+                read_only: false,
+                root: true,
+            })]
+        );
         assert!(spec.apply(AddDisk(disk).into_vmm_command()).is_err());
     }
 }

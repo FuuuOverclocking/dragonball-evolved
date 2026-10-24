@@ -46,6 +46,13 @@ pub struct MmioRegs {
     pub queues: Vec<QueueRegs>,
 }
 
+/// A transport's guest-visible state, captured for a restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmioTransportSnapshot {
+    pub regs: MmioRegs,
+    pub interrupt_status: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
     Activate,
@@ -193,21 +200,21 @@ impl MmioTransport {
         }
     }
 
-    /// Construct a transport with previously captured register and interrupt
-    /// state, used during snapshot restore.
-    pub fn with_state(
+    /// Construct a transport in a previously captured state, for a restore.
+    pub fn restore(
         desc: DeviceDesc,
         memory: SharedGuestMemory,
         activator: Activator,
         interrupt: Arc<IrqTrigger>,
         queue_notifiers: Vec<EventFd>,
-        regs: MmioRegs,
-        interrupt_status: u32,
+        snapshot: MmioTransportSnapshot,
     ) -> Self {
-        interrupt.status().store(interrupt_status, Ordering::SeqCst);
+        interrupt
+            .status()
+            .store(snapshot.interrupt_status, Ordering::SeqCst);
         Self {
             state: Mutex::new(TransportState {
-                regs,
+                regs: snapshot.regs,
                 session: None,
             }),
             desc,
@@ -270,14 +277,13 @@ impl MmioTransport {
         Ok(())
     }
 
-    /// Return a clone of the transport's register state and the current
-    /// interrupt status word. Intended for snapshot capture.
-    pub fn snapshot(&self) -> (MmioRegs, u32) {
+    /// Return the transport's guest-visible state, for a snapshot.
+    pub fn snapshot(&self) -> MmioTransportSnapshot {
         let state = self.state.lock().unwrap();
-        (
-            state.regs.clone(),
-            self.interrupt.status().load(Ordering::SeqCst),
-        )
+        MmioTransportSnapshot {
+            regs: state.regs.clone(),
+            interrupt_status: self.interrupt.status().load(Ordering::SeqCst),
+        }
     }
 
     /// Inject a previously created [`SessionControl`] into the transport,
