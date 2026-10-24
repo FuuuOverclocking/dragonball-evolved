@@ -1,5 +1,5 @@
 use std::fmt;
-use std::ops::Range;
+use std::range::Range;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -37,7 +37,7 @@ impl Bus {
     pub fn new(mut devices: Vec<(Range<u64>, Arc<dyn BusDevice>)>) -> Result<Self, BusError> {
         devices.sort_unstable_by_key(|(range, _)| range.start);
         for (range, _) in &devices {
-            if range.start >= range.end {
+            if range.is_empty() {
                 return Err(BusError::Empty {
                     start: range.start,
                     end: range.end,
@@ -45,8 +45,7 @@ impl Bus {
             }
         }
         for pair in devices.windows(2) {
-            let left = &pair[0].0;
-            let right = &pair[1].0;
+            let (left, right) = (pair[0].0, pair[1].0);
             if left.end > right.start {
                 return Err(BusError::Overlap {
                     left_start: left.start,
@@ -129,8 +128,8 @@ mod tests {
         let first = Arc::new(Device::default());
         let second = Arc::new(Device::default());
         let bus = Bus::new(vec![
-            (0x2000..0x2100, second.clone()),
-            (0x1000..0x1100, first.clone()),
+            (Range::from(0x2000..0x2100), second.clone()),
+            (Range::from(0x1000..0x1100), first.clone()),
         ])
         .unwrap();
         let mut data = [0; 2];
@@ -146,11 +145,15 @@ mod tests {
     fn rejects_empty_and_overlapping_ranges() {
         let device: Arc<dyn BusDevice> = Arc::new(Device::default());
         assert_eq!(
-            Bus::new(vec![(1..1, Arc::clone(&device))]).unwrap_err(),
+            Bus::new(vec![(Range::from(1..1), Arc::clone(&device))]).unwrap_err(),
             BusError::Empty { start: 1, end: 1 }
         );
         assert_eq!(
-            Bus::new(vec![(10..20, Arc::clone(&device)), (19..30, device)]).unwrap_err(),
+            Bus::new(vec![
+                (Range::from(10..20), Arc::clone(&device)),
+                (Range::from(19..30), device),
+            ])
+            .unwrap_err(),
             BusError::Overlap {
                 left_start: 10,
                 left_end: 20,

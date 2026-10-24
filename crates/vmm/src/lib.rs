@@ -5,6 +5,7 @@ mod kvm_context;
 mod lifecycle;
 pub mod machine;
 mod process_ctx;
+pub mod resources;
 pub mod spec;
 mod vmm_server;
 

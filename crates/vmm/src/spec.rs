@@ -6,7 +6,7 @@ use api::block::{AddDisk, BlockDevConfig};
 use api::boot::{KernelConfig, SetKernel};
 use api::machine::{ConsoleConfig, MemorySizeMib, SetConsole, SetCpus, SetMemory, VcpuCount};
 
-use crate::arch::x86_64::layout::{LEGACY_GSI_END, LEGACY_GSI_START, ram_regions};
+use crate::arch::x86_64::layout::ram_regions;
 use crate::kvm_context::HostCapabilities;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,9 +97,6 @@ impl MachineSpec {
             if bits < 64 && regions.last().unwrap().end() > (1u64 << bits) {
                 bail!("guest memory exceeds supported physical address width");
             }
-        }
-        if self.disks.len() > (LEGACY_GSI_END - LEGACY_GSI_START + 1) as usize {
-            bail!("too many virtio-mmio disks for available IRQs");
         }
         if self
             .disks

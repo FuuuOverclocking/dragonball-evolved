@@ -427,6 +427,7 @@ mod tests {
     use std::io::{self, Write};
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::path::Path;
+    use std::range::Range;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -438,7 +439,7 @@ mod tests {
     use crate::KvmContext;
     use crate::arch::x86_64::cpuid::normalize;
     use crate::arch::x86_64::lapic::configure_lint;
-    use crate::arch::x86_64::layout::{TSS_START, ram_regions};
+    use crate::arch::x86_64::layout::{COM1_GSI, COM1_PORTS, I8042_PORTS, TSS_START, ram_regions};
     use crate::arch::x86_64::msr::boot_msrs;
     use crate::arch::x86_64::regs::{boot_fpu, boot_regs, boot_sregs};
     use crate::devices::legacy::i8042::I8042Device;
@@ -554,7 +555,9 @@ mod tests {
             release: Mutex::new(release_rx),
         });
         let pio = Arc::new(Bus::empty());
-        let mmio = Arc::new(Bus::new(vec![(MMIO_ADDRESS..MMIO_ADDRESS + 4, device)]).unwrap());
+        let mmio = Arc::new(
+            Bus::new(vec![(Range::from(MMIO_ADDRESS..MMIO_ADDRESS + 4), device)]).unwrap(),
+        );
         let (event_tx, _event_rx) = tokio_mpsc::unbounded_channel();
         let handle = VcpuHandle::spawn(0, vcpu, &vm, pio, mmio, event_tx).unwrap();
 
@@ -659,11 +662,11 @@ mod tests {
         let (input, _input_writer) = pipe();
         let (_serial_task, serial) =
             SerialDevice::new(input, SharedWriter(output.clone())).unwrap();
-        vm.register_irqfd(&serial.irq_fd, 4).unwrap();
+        vm.register_irqfd(&serial.irq_fd, COM1_GSI.0).unwrap();
         let (event_tx, mut event_rx) = tokio_mpsc::unbounded_channel();
         let serial: Arc<dyn BusDevice> = Arc::new(serial);
         let i8042: Arc<dyn BusDevice> = Arc::new(I8042Device::new(event_tx.clone()));
-        let pio = Arc::new(Bus::new(vec![(0x3f8..0x400, serial), (0x60..0x65, i8042)]).unwrap());
+        let pio = Arc::new(Bus::new(vec![(COM1_PORTS, serial), (I8042_PORTS, i8042)]).unwrap());
         let mmio = Arc::new(Bus::empty());
         let vcpus = Vcpus::new(vec![
             VcpuHandle::spawn(0, vcpu, &vm, pio, mmio, event_tx).unwrap(),

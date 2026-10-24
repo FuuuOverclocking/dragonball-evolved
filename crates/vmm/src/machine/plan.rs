@@ -3,24 +3,41 @@ use linux_loader::cmdline::Cmdline;
 use vm_memory::GuestAddress;
 
 use crate::arch::x86_64::layout::{
-    CMDLINE_MAX_SIZE, LEGACY_GSI_START, MemoryRegion, VIRTIO_MMIO_LEN, VIRTIO_MMIO_START,
-    ram_regions,
+    CMDLINE_MAX_SIZE, MemoryRegion, VIRTIO_MMIO_LEN, ram_regions, resource_book,
 };
 use crate::kvm_context::HostCapabilities;
+use crate::resources::{GpaRange, Gsi, ResourceBook, ResourceError};
 use crate::spec::MachineSpec;
 
 pub const DEFAULT_CMDLINE: &str =
     "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd";
 
-pub struct DeviceLocation {
-    pub address: u64,
-    pub gsi: u32,
+/// The register window and interrupt line granted to one virtio-mmio device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMmioGrant {
+    pub mmio: GpaRange,
+    pub gsi: Gsi,
+}
+
+impl VirtioMmioGrant {
+    fn allocate(book: &ResourceBook) -> Result<(Self, ResourceBook), ResourceError> {
+        let (mmio, virtio_mmio) = book
+            .virtio_mmio
+            .allocate(VIRTIO_MMIO_LEN, VIRTIO_MMIO_LEN)?;
+        let (gsi, legacy_gsi) = book.legacy_gsi.allocate()?;
+        let book = ResourceBook {
+            virtio_mmio,
+            legacy_gsi,
+        };
+        Ok((Self { mmio, gsi }, book))
+    }
 }
 
 pub struct MachinePlan {
     pub spec: MachineSpec,
     pub ram: Vec<MemoryRegion>,
-    pub devices: Vec<DeviceLocation>,
+    /// One grant per disk, in `spec.disks` order.
+    pub devices: Vec<VirtioMmioGrant>,
     pub cmdline: Cmdline,
 }
 
@@ -40,23 +57,27 @@ impl MachinePlan {
                     .unwrap_or(DEFAULT_CMDLINE),
             )
             .context("build kernel command line")?;
+        let mut book = resource_book();
         let mut devices = Vec::with_capacity(spec.disks.len());
-        for (index, disk) in spec.disks.iter().enumerate() {
-            let location = DeviceLocation {
-                address: VIRTIO_MMIO_START + index as u64 * VIRTIO_MMIO_LEN,
-                gsi: LEGACY_GSI_START + index as u32,
-            };
+        for disk in &spec.disks {
+            let (grant, next) = VirtioMmioGrant::allocate(&book).with_context(|| {
+                format!(
+                    "allocate virtio-mmio resources for disk {}",
+                    disk.id.as_deref().unwrap_or_default()
+                )
+            })?;
+            book = next;
             cmdline.add_virtio_mmio_device(
-                VIRTIO_MMIO_LEN,
-                GuestAddress(location.address),
-                location.gsi,
+                grant.mmio.len(),
+                GuestAddress(grant.mmio.start()),
+                grant.gsi.0,
                 None,
             )?;
             if disk.root {
                 cmdline.insert("root", "/dev/vda")?;
                 cmdline.insert_str(if disk.read_only { "ro" } else { "rw" })?;
             }
-            devices.push(location);
+            devices.push(grant);
         }
         Ok(Self {
             spec,
@@ -102,6 +123,17 @@ mod tests {
         }
     }
 
+    fn data_disks(count: usize) -> Vec<BlockDevConfig> {
+        (0..count)
+            .map(|index| BlockDevConfig {
+                id: Some(format!("disk{index}")),
+                path: format!("/disk{index}").into(),
+                read_only: false,
+                root: false,
+            })
+            .collect()
+    }
+
     #[test]
     fn root_disk_is_first_and_cmdline_matches_the_resource_layout() {
         let mut spec = fixture();
@@ -122,13 +154,52 @@ mod tests {
         ];
         let plan = MachinePlan::new(spec, &host()).unwrap();
         assert_eq!(plan.spec.disks[0].id.as_deref(), Some("root"));
-        assert_eq!(plan.devices[0].address, VIRTIO_MMIO_START);
-        assert_eq!(plan.devices[1].gsi, LEGACY_GSI_START + 1);
+        assert_eq!(
+            plan.devices,
+            [
+                VirtioMmioGrant {
+                    mmio: GpaRange::new(0xc000_0000, 0xc000_1000),
+                    gsi: Gsi(5),
+                },
+                VirtioMmioGrant {
+                    mmio: GpaRange::new(0xc000_1000, 0xc000_2000),
+                    gsi: Gsi(6),
+                },
+            ]
+        );
         assert_eq!(plan.ram.len(), 2);
         let cmdline = plan.cmdline.as_cstring().unwrap();
         let cmdline = cmdline.to_str().unwrap();
         assert!(cmdline.contains("virtio_mmio.device=4K@0xc0000000:5"));
+        assert!(cmdline.contains("virtio_mmio.device=4K@0xc0001000:6"));
         assert!(cmdline.contains("root=/dev/vda ro"));
+    }
+
+    #[test]
+    fn disks_beyond_the_legacy_gsis_exhaust_the_pool() {
+        let mut spec = fixture();
+        spec.disks = data_disks(19);
+        let plan = MachinePlan::new(spec.clone(), &host()).unwrap();
+        assert_eq!(
+            plan.devices.last(),
+            Some(&VirtioMmioGrant {
+                mmio: GpaRange::new(0xc001_2000, 0xc001_3000),
+                gsi: Gsi(23),
+            })
+        );
+
+        spec.disks = data_disks(20);
+        let Err(error) = MachinePlan::new(spec, &host()) else {
+            panic!("planned more disks than legacy GSIs");
+        };
+        assert_eq!(
+            error.downcast_ref::<ResourceError>(),
+            Some(&ResourceError::Exhausted { pool: "legacy GSI" })
+        );
+        assert!(
+            format!("{error:#}").ends_with("disk19: legacy GSI pool exhausted"),
+            "{error:#}"
+        );
     }
 
     #[test]

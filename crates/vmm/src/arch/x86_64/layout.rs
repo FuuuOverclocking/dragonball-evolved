@@ -1,4 +1,8 @@
+use std::range::{Range, RangeInclusive};
+
 use thiserror::Error;
+
+use crate::resources::{AddressPool, GpaRange, Gsi, IdPool, ResourceBook};
 
 pub const GDT_START: u64 = 0x500;
 pub const IDT_START: u64 = 0x520;
@@ -15,10 +19,23 @@ pub const MMIO32_END: u64 = 0x1_0000_0000;
 pub const IOAPIC_START: u64 = 0xfec0_0000;
 pub const LAPIC_START: u64 = 0xfee0_0000;
 pub const TSS_START: u64 = 0xfffb_d000;
-pub const VIRTIO_MMIO_START: u64 = MMIO32_START;
+// Bounded: never reaches the IOAPIC, LAPIC or TSS, and leaves the rest of the hole free.
+pub const VIRTIO_MMIO_WINDOW: GpaRange = GpaRange::new(MMIO32_START, MMIO32_START + (16 << 20));
+const _: () = assert!(VIRTIO_MMIO_WINDOW.end() <= IOAPIC_START);
 pub const VIRTIO_MMIO_LEN: u64 = 0x1000;
-pub const LEGACY_GSI_START: u32 = 5;
-pub const LEGACY_GSI_END: u32 = 23;
+pub const LEGACY_GSIS: RangeInclusive<Gsi> = RangeInclusive {
+    start: Gsi(5),
+    last: Gsi(23),
+};
+pub const I8042_PORTS: Range<u64> = Range {
+    start: 0x60,
+    end: 0x65,
+};
+pub const COM1_PORTS: Range<u64> = Range {
+    start: 0x3f8,
+    end: 0x400,
+};
+pub const COM1_GSI: Gsi = Gsi(4);
 pub const PAGE_SIZE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +83,13 @@ pub fn ram_regions(size: u64) -> Result<Vec<MemoryRegion>, LayoutError> {
             len: high_len,
         },
     ])
+}
+
+pub fn resource_book() -> ResourceBook {
+    ResourceBook {
+        virtio_mmio: AddressPool::new("virtio-mmio", VIRTIO_MMIO_WINDOW),
+        legacy_gsi: IdPool::new("legacy GSI", LEGACY_GSIS),
+    }
 }
 
 pub fn align_down(value: u64, alignment: u64) -> u64 {

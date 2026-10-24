@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Read;
+use std::range::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -168,30 +169,32 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
 
     let (events_tx, events) = mpsc::unbounded_channel();
     let i8042 = Arc::new(I8042Device::new(events_tx.clone()));
-    let mut pio_devices: Vec<(std::ops::Range<u64>, Arc<dyn BusDevice>)> =
-        vec![(0x60..0x65, Arc::clone(&i8042) as Arc<dyn BusDevice>)];
-    let mut mmio_devices: Vec<(std::ops::Range<u64>, Arc<dyn BusDevice>)> = Vec::new();
+    let mut pio_devices: Vec<(Range<u64>, Arc<dyn BusDevice>)> = vec![(
+        layout::I8042_PORTS,
+        Arc::clone(&i8042) as Arc<dyn BusDevice>,
+    )];
+    let mut mmio_devices: Vec<(Range<u64>, Arc<dyn BusDevice>)> = Vec::new();
     let mut mmio_transports: Vec<Arc<MmioTransport>> = Vec::new();
     let mut blocks = Vec::new();
     let mut block_quiesce = Vec::new();
     let mut captured_blocks = Vec::new();
     let mut devices = DeviceManager::new();
-    for (disk, location) in plan.spec.disks.iter().zip(&plan.devices) {
+    for (disk, grant) in plan.spec.disks.iter().zip(&plan.devices) {
         let (resources, handle, quiesce_handle) =
             BlockResources::open(disk.id.as_ref().unwrap(), &disk.path, disk.read_only, None)?;
         vm.register_ioevent(
             &handle.queue_notifier,
-            &IoEventAddress::Mmio(location.address + NOTIFY_OFFSET),
+            &IoEventAddress::Mmio(grant.mmio.start() + NOTIFY_OFFSET),
             0u32,
         )?;
         vm.register_irqfd_with_resample(
             handle.interrupt.irq_fd(),
             handle.interrupt.resample_fd(),
-            location.gsi,
+            grant.gsi.0,
         )?;
         let stop = devices.stop_signal();
         devices.spawn(
-            format!("irq-{}", location.gsi),
+            format!("irq-{}", grant.gsi.0),
             DeviceRole::GuestAffecting,
             Arc::clone(&handle.interrupt).resample(stop),
         );
@@ -203,7 +206,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
             vec![handle.queue_notifier],
         ));
         mmio_devices.push((
-            location.address..location.address + layout::VIRTIO_MMIO_LEN,
+            grant.mmio.into(),
             Arc::clone(&transport) as Arc<dyn BusDevice>,
         ));
         mmio_transports.push(transport);
@@ -223,8 +226,11 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         let (output, drain) = console::output(console::DEFAULT_OUTPUT_CAPACITY);
         let (serial, handle) = SerialDevice::with_input(fd, output)?;
         let handle = Arc::new(handle);
-        vm.register_irqfd(&handle.irq_fd, 4)?;
-        pio_devices.push((0x3f8..0x400, Arc::clone(&handle) as Arc<dyn BusDevice>));
+        vm.register_irqfd(&handle.irq_fd, layout::COM1_GSI.0)?;
+        pio_devices.push((
+            layout::COM1_PORTS,
+            Arc::clone(&handle) as Arc<dyn BusDevice>,
+        ));
         serial_handle = Some(handle);
         let stop = devices.stop_signal();
         devices.spawn(
