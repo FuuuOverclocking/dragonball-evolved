@@ -6,6 +6,7 @@ pub mod plan;
 pub mod platform;
 pub mod snapshot;
 pub mod vcpu;
+pub mod vm;
 
 #[derive(Debug)]
 pub enum MachineEvent {

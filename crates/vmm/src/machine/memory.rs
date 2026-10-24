@@ -1,31 +1,37 @@
+//! Guest RAM: where it sits in the guest-physical address space, and the host
+//! mappings behind it.
+
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use kvm_bindings::kvm_userspace_memory_region;
-use kvm_ioctls::VmFd;
+use anyhow::{Context, Result};
 use vm_memory::mmap::MmapRegionBuilder;
 use vm_memory::{
     Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
 };
 
-use crate::arch::x86_64::layout::MemoryRegion;
+use crate::resources::GpaRange;
 
 pub type SharedGuestMemory = Arc<GuestMemoryMmap<()>>;
 
-pub fn create(regions: &[MemoryRegion]) -> Result<SharedGuestMemory> {
-    let mut mappings = Vec::with_capacity(regions.len());
-    for region in regions {
-        let end = region
-            .start
-            .checked_add(region.len)
-            .context("guest memory region address overflows")?;
-        let len = usize::try_from(region.len).context("guest memory region is too large")?;
+/// Where guest RAM sits. Guest ABI: a snapshot records it and a restore maps the
+/// same ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryPlan {
+    /// Sorted and disjoint.
+    pub regions: Vec<GpaRange>,
+}
+
+/// Maps the planned regions, zero-filled.
+pub fn create(plan: &MemoryPlan) -> Result<SharedGuestMemory> {
+    let mut mappings = Vec::with_capacity(plan.regions.len());
+    for &region in &plan.regions {
+        let len = usize::try_from(region.len()).context("guest memory region is too large")?;
         let mmap = MmapRegionBuilder::<()>::new(len)
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
             .with_mmap_flags(libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE)
             .build()
-            .with_context(|| format!("map guest memory region {:#x}..{:#x}", region.start, end))?;
-        let mapping = GuestRegionMmap::new(mmap, GuestAddress(region.start))
+            .with_context(|| format!("map guest memory region {region}"))?;
+        let mapping = GuestRegionMmap::new(mmap, GuestAddress(region.start()))
             .context("guest memory region address overflows")?;
         mappings.push(mapping);
     }
@@ -34,30 +40,15 @@ pub fn create(regions: &[MemoryRegion]) -> Result<SharedGuestMemory> {
     Ok(Arc::new(memory))
 }
 
-/// # Safety
-/// Mappings must outlive the VM and its vCPUs; slots must not overlap existing registrations.
-pub unsafe fn register(vm: &VmFd, memory: &GuestMemoryMmap<()>, max_memslots: usize) -> Result<()> {
-    let regions: Vec<_> = memory.iter().collect();
-    if regions.len() > max_memslots {
-        bail!(
-            "guest memory needs {} KVM slots, host supports {max_memslots}",
-            regions.len()
-        );
-    }
-    for (slot, region) in regions.into_iter().enumerate() {
-        let kvm_region = kvm_userspace_memory_region {
-            slot: slot as u32,
-            guest_phys_addr: region.start_addr().raw_value(),
-            memory_size: region.len(),
-            userspace_addr: region.as_ptr() as u64,
-            flags: 0,
-        };
-        // SAFETY: `memory` owns this mapping until after `vm` is dropped, every
-        // slot and GPA range is unique, and the region size is unchanged.
-        unsafe { vm.set_user_memory_region(kvm_region) }
-            .with_context(|| format!("register KVM memory slot {slot}"))?;
-    }
-    Ok(())
+/// The ranges `memory` maps, in address order.
+pub fn regions(memory: &GuestMemoryMmap<()>) -> Vec<GpaRange> {
+    memory
+        .iter()
+        .map(|region| {
+            let start = region.start_addr().raw_value();
+            GpaRange::new(start, start + region.len())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -68,17 +59,14 @@ mod tests {
 
     #[test]
     fn creates_split_guest_memory_with_read_write_access() {
-        let memory = create(&[
-            MemoryRegion {
-                start: 0,
-                len: 0x2000,
-            },
-            MemoryRegion {
-                start: 0x1_0000_0000,
-                len: 0x1000,
-            },
-        ])
-        .unwrap();
+        let plan = MemoryPlan {
+            regions: vec![
+                GpaRange::new(0, 0x2000),
+                GpaRange::new(0x1_0000_0000, 0x1_0000_1000),
+            ],
+        };
+        let memory = create(&plan).unwrap();
+        assert_eq!(regions(&memory), plan.regions);
         memory.write_obj(0x1234_u32, GuestAddress(0x1000)).unwrap();
         memory
             .write_obj(0x5678_u32, GuestAddress(0x1_0000_0000))

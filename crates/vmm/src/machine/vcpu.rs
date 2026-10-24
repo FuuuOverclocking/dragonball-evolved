@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use kvm_bindings::{
     KVM_MAX_CPUID_ENTRIES, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, Msrs, kvm_msr_entry,
 };
-use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
+use kvm_ioctls::{VcpuExit, VcpuFd};
 use logger::warn;
 use tokio::sync::mpsc as tokio_mpsc;
 use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
@@ -17,6 +17,7 @@ use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
 use super::MachineEvent;
 use super::bus::Bus;
 use super::snapshot::VcpuSnapshot;
+use super::vm::KvmVcpu;
 use crate::arch::x86_64::msr::msr_indices;
 
 static SIGNAL_HANDLER_ERRNO: OnceLock<i32> = OnceLock::new();
@@ -33,7 +34,7 @@ pub enum VcpuCommand {
 
 pub struct VcpuHandle {
     index: u8,
-    kick_fd: Mutex<VcpuFd>,
+    kick_fd: Mutex<KvmVcpu>,
     commands: mpsc::Sender<VcpuCommand>,
     exited: Option<oneshot::Receiver<()>>,
     thread: Option<thread::JoinHandle<()>>,
@@ -45,7 +46,7 @@ pub struct Vcpus {
 
 struct VcpuRunner {
     index: u8,
-    fd: VcpuFd,
+    fd: KvmVcpu,
     pio: Arc<Bus>,
     mmio: Arc<Bus>,
     commands: mpsc::Receiver<VcpuCommand>,
@@ -68,27 +69,13 @@ enum RunResult {
 impl VcpuHandle {
     pub fn spawn(
         index: u8,
-        fd: VcpuFd,
-        vm: &VmFd,
+        fd: KvmVcpu,
         pio: Arc<Bus>,
         mmio: Arc<Bus>,
         events: tokio_mpsc::UnboundedSender<MachineEvent>,
     ) -> Result<Self> {
         install_signal_handler()?;
-        // SAFETY: `fd` is live and the new descriptor is owned by the following VcpuFd.
-        let raw_fd = unsafe {
-            libc::fcntl(
-                std::os::fd::AsRawFd::as_raw_fd(&fd),
-                libc::F_DUPFD_CLOEXEC,
-                0,
-            )
-        };
-        if raw_fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("duplicate vCPU fd");
-        }
-        // SAFETY: `raw_fd` is a fresh duplicate of this VM's vCPU fd.
-        let kick_fd =
-            unsafe { vm.create_vcpu_from_rawfd(raw_fd) }.context("construct duplicate vCPU fd")?;
+        let kick_fd = fd.try_clone()?;
         let (command_tx, command_rx) = mpsc::channel();
         let (exited_tx, exited_rx) = oneshot::channel();
         let panic_events = events.clone();
@@ -472,7 +459,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, Msrs, kvm_pit_config};
+    use kvm_bindings::Msrs;
     use tokio::time;
     use vm_memory::{Bytes, GuestAddress};
 
@@ -480,16 +467,24 @@ mod tests {
     use crate::KvmContext;
     use crate::arch::x86_64::cpuid::normalize;
     use crate::arch::x86_64::lapic::configure_lint;
-    use crate::arch::x86_64::layout::{COM1_GSI, COM1_PORTS, I8042_PORTS, TSS_START, ram_regions};
+    use crate::arch::x86_64::layout::{COM1_GSI, COM1_PORTS, I8042_PORTS, ram_regions};
     use crate::arch::x86_64::msr::boot_msrs;
     use crate::arch::x86_64::regs::{boot_fpu, boot_regs, boot_sregs};
     use crate::devices::legacy::i8042::I8042Device;
     use crate::devices::legacy::serial::SerialDevice;
     use crate::machine::bus::BusDevice;
-    use crate::machine::memory;
+    use crate::machine::memory::{self, MemoryPlan};
+    use crate::machine::vm::KvmVm;
 
     const KVM_TEST_TIMEOUT: Duration = Duration::from_secs(2);
     const MMIO_READ_VALUE: u32 = 0x4433_2211;
+
+    fn test_vm(context: &KvmContext) -> Arc<KvmVm> {
+        let plan = MemoryPlan {
+            regions: ram_regions(16 << 20).unwrap(),
+        };
+        KvmVm::new(context, memory::create(&plan).unwrap()).unwrap()
+    }
 
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -540,20 +535,8 @@ mod tests {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let vm = context.kvm().create_vm().unwrap();
-        vm.set_tss_address(TSS_START as usize).unwrap();
-        vm.create_irq_chip().unwrap();
-        vm.create_pit2(kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        })
-        .unwrap();
-
-        let regions = ram_regions(16 << 20).unwrap();
-        let memory = memory::create(&regions).unwrap();
-        // SAFETY: The test stops the vCPU and explicitly drops the VM before memory.
-        unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }
-            .unwrap();
+        let vm = test_vm(&context);
+        let memory = Arc::clone(vm.memory());
 
         const ENTRY: u64 = 0x10_0000;
         const MMIO_ADDRESS: u64 = 0x1000_0000;
@@ -600,7 +583,7 @@ mod tests {
             Bus::new(vec![(Range::from(MMIO_ADDRESS..MMIO_ADDRESS + 4), device)]).unwrap(),
         );
         let (event_tx, _event_rx) = tokio_mpsc::unbounded_channel();
-        let handle = VcpuHandle::spawn(0, vcpu, &vm, pio, mmio, event_tx).unwrap();
+        let handle = VcpuHandle::spawn(0, vcpu, pio, mmio, event_tx).unwrap();
 
         let (resume_reply, resumed) = oneshot::channel();
         handle.command(VcpuCommand::Resume(resume_reply)).unwrap();
@@ -640,20 +623,8 @@ mod tests {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let vm = context.kvm().create_vm().unwrap();
-        vm.set_tss_address(TSS_START as usize).unwrap();
-        vm.create_irq_chip().unwrap();
-        vm.create_pit2(kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        })
-        .unwrap();
-
-        let regions = ram_regions(16 << 20).unwrap();
-        let memory = memory::create(&regions).unwrap();
-        // SAFETY: The test stops vCPUs and explicitly drops VM before memory.
-        unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }
-            .unwrap();
+        let vm = test_vm(&context);
+        let memory = Arc::clone(vm.memory());
 
         const ENTRY: u64 = 0x10_0000;
         const PVH_MAGIC: u32 = 0x336e_c578;
@@ -703,14 +674,14 @@ mod tests {
         let (input, _input_writer) = pipe();
         let (_serial_task, serial) =
             SerialDevice::new(input, SharedWriter(output.clone())).unwrap();
-        vm.register_irqfd(&serial.irq_fd, COM1_GSI.0).unwrap();
+        vm.fd().register_irqfd(&serial.irq_fd, COM1_GSI.0).unwrap();
         let (event_tx, mut event_rx) = tokio_mpsc::unbounded_channel();
         let serial: Arc<dyn BusDevice> = Arc::new(serial);
         let i8042: Arc<dyn BusDevice> = Arc::new(I8042Device::new(event_tx.clone()));
         let pio = Arc::new(Bus::new(vec![(COM1_PORTS, serial), (I8042_PORTS, i8042)]).unwrap());
         let mmio = Arc::new(Bus::empty());
         let vcpus = Vcpus::new(vec![
-            VcpuHandle::spawn(0, vcpu, &vm, pio, mmio, event_tx).unwrap(),
+            VcpuHandle::spawn(0, vcpu, pio, mmio, event_tx).unwrap(),
         ]);
 
         vcpus.pause().await.unwrap();
@@ -731,20 +702,8 @@ mod tests {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let vm = context.kvm().create_vm().unwrap();
-        vm.set_tss_address(TSS_START as usize).unwrap();
-        vm.create_irq_chip().unwrap();
-        vm.create_pit2(kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        })
-        .unwrap();
-
-        let regions = ram_regions(16 << 20).unwrap();
-        let memory = memory::create(&regions).unwrap();
-        // SAFETY: test drops VM before memory.
-        unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }
-            .unwrap();
+        let vm = test_vm(&context);
+        let memory = Arc::clone(vm.memory());
 
         const ENTRY: u64 = 0x10_0000;
         let vcpu = vm.create_vcpu(0).unwrap();
@@ -777,7 +736,7 @@ mod tests {
         let mmio = Arc::new(Bus::empty());
         let (event_tx, _event_rx) = tokio_mpsc::unbounded_channel();
         // vCPU starts paused, so capture_state can read immediately.
-        let handle = VcpuHandle::spawn(0, vcpu, &vm, pio, mmio, event_tx).unwrap();
+        let handle = VcpuHandle::spawn(0, vcpu, pio, mmio, event_tx).unwrap();
 
         let snapshot = handle.capture_state().unwrap();
 

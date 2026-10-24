@@ -6,9 +6,9 @@ use thiserror::Error;
 use vm_memory::ByteValued;
 
 use super::layout::{
-    HIMEM_START, MEMMAP_START, MODLIST_START, MemoryRegion, PVH_INFO_START, SYSTEM_MEM_END,
-    SYSTEM_MEM_START,
+    HIMEM_START, MEMMAP_START, MODLIST_START, PVH_INFO_START, SYSTEM_MEM_END, SYSTEM_MEM_START,
 };
+use crate::resources::GpaRange;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestBlob {
@@ -26,12 +26,10 @@ pub struct Initrd {
 pub enum PvhError {
     #[error("PVH boot requires at least 1 MiB of low guest memory")]
     InsufficientLowMemory,
-    #[error("guest memory region end overflows")]
-    RegionOverflow,
 }
 
 pub fn boot_data(
-    ram: &[MemoryRegion],
+    ram: &[GpaRange],
     cmdline_address: u64,
     initrd: Option<Initrd>,
 ) -> Result<Vec<GuestBlob>, PvhError> {
@@ -75,9 +73,9 @@ pub fn boot_data(
     Ok(blobs)
 }
 
-pub fn memory_map(ram: &[MemoryRegion]) -> Result<Vec<hvm_memmap_table_entry>, PvhError> {
+pub fn memory_map(ram: &[GpaRange]) -> Result<Vec<hvm_memmap_table_entry>, PvhError> {
     ram.first()
-        .filter(|region| region.start == 0 && region.len >= HIMEM_START)
+        .filter(|region| region.start() == 0 && region.len() >= HIMEM_START)
         .ok_or(PvhError::InsufficientLowMemory)?;
 
     let mut entries = vec![
@@ -89,13 +87,9 @@ pub fn memory_map(ram: &[MemoryRegion]) -> Result<Vec<hvm_memmap_table_entry>, P
         ),
     ];
     for region in ram {
-        let end = region
-            .start
-            .checked_add(region.len)
-            .ok_or(PvhError::RegionOverflow)?;
-        let start = region.start.max(HIMEM_START);
-        if start < end {
-            entries.push(entry(start, end - start, XEN_HVM_MEMMAP_TYPE_RAM));
+        let start = region.start().max(HIMEM_START);
+        if start < region.end() {
+            entries.push(entry(start, region.end() - start, XEN_HVM_MEMMAP_TYPE_RAM));
         }
     }
     Ok(entries)

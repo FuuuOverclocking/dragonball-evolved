@@ -20,6 +20,7 @@ use super::memory::{self, SharedGuestMemory};
 use super::plan::{self, DevicePlan, MachinePlan};
 use super::platform::PlatformSnapshot;
 use super::vcpu::{self, Vcpus};
+use super::vm::KvmVm;
 use crate::KvmContext;
 
 pub struct MachineSnapshot {
@@ -134,14 +135,14 @@ pub fn capture(machine: &Machine) -> Result<MachineSnapshot> {
         .collect::<Result<_>>()?;
     let platform = machine.platform.capture()?;
     let vcpus = capture_vcpus(machine.vcpus.as_ref().context("machine has no vCPUs")?)?;
-    let vm = capture_vm_kvm(&machine.vm)?;
+    let vm = capture_vm_kvm(machine.vm.fd())?;
     Ok(MachineSnapshot {
         plan: machine.plan.clone(),
         vm,
         vcpus,
         platform,
         devices,
-        memory: Arc::clone(&machine.memory),
+        memory: Arc::clone(machine.vm.memory()),
     })
 }
 
@@ -158,7 +159,7 @@ pub fn rebuild(snapshot: MachineSnapshot, context: &KvmContext) -> Result<Machin
     let MachineSnapshot {
         plan,
         vm: vm_state,
-        vcpus,
+        vcpus: vcpu_states,
         platform,
         devices,
         memory,
@@ -169,8 +170,8 @@ pub fn rebuild(snapshot: MachineSnapshot, context: &KvmContext) -> Result<Machin
         platform,
         devices: match_devices(&plan.devices, devices)?,
     };
-    if vcpus.len() != usize::from(plan.spec.cpus)
-        || vcpus
+    if vcpu_states.len() != usize::from(plan.spec.cpus)
+        || vcpu_states
             .iter()
             .zip(0..)
             .any(|(vcpu, index)| vcpu.index != index)
@@ -180,30 +181,28 @@ pub fn rebuild(snapshot: MachineSnapshot, context: &KvmContext) -> Result<Machin
             plan.spec.cpus
         );
     }
+    if memory::regions(&memory) != plan.memory.regions {
+        bail!("the snapshot's guest memory does not match its plan");
+    }
 
-    let vm = build::create_vm(context)?;
-    vm.set_irqchip(&vm_state.pic_master)
+    let vm = KvmVm::new(context, memory)?;
+    let fd = vm.fd();
+    fd.set_irqchip(&vm_state.pic_master)
         .context("restore PIC master")?;
-    vm.set_irqchip(&vm_state.pic_slave)
+    fd.set_irqchip(&vm_state.pic_slave)
         .context("restore PIC slave")?;
-    vm.set_irqchip(&vm_state.ioapic).context("restore IOAPIC")?;
-    vm.set_pit2(&vm_state.pit).context("restore PIT2")?;
-    // SAFETY: `memory` is declared before `vm`, so an early return drops the VM
-    // first, and the returned Machine tears the VM down before the memory.
-    unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }?;
-
-    let mut fds = Vec::with_capacity(vcpus.len());
-    for state in &vcpus {
-        let fd = vm
-            .create_vcpu(u64::from(state.index))
-            .with_context(|| format!("create vCPU {}", state.index))?;
-        vcpu::restore_state(&fd, state)?;
-        fds.push(fd);
+    fd.set_irqchip(&vm_state.ioapic).context("restore IOAPIC")?;
+    fd.set_pit2(&vm_state.pit).context("restore PIT2")?;
+    let mut vcpus = Vec::with_capacity(vcpu_states.len());
+    for state in &vcpu_states {
+        let vcpu = vm.create_vcpu(state.index)?;
+        vcpu::restore_state(&vcpu, state)?;
+        vcpus.push(vcpu);
     }
     // After the vCPUs are restored, before anything runs.
-    vm.set_clock(&vm_state.clock).context("restore VM clock")?;
+    fd.set_clock(&vm_state.clock).context("restore VM clock")?;
 
-    build::assemble(plan, memory, vm, fds, Some(restore))
+    build::assemble(plan, vm, vcpus, Some(restore))
 }
 
 /// Puts the captured device states in plan order, so a restore attaches each
@@ -237,14 +236,12 @@ fn match_devices(
 mod tests {
     use std::path::Path;
 
-    use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
-
     use super::*;
     use crate::KvmContext;
-    use crate::arch::x86_64::layout::{TSS_START, ram_regions};
+    use crate::arch::x86_64::layout::ram_regions;
     use crate::devices::virtio::mmio::{MmioRegs, MmioTransportSnapshot};
     use crate::machine::block::BlockPlan;
-    use crate::machine::memory;
+    use crate::machine::memory::MemoryPlan;
     use crate::machine::plan::VirtioMmioGrant;
     use crate::resources::{GpaRange, Gsi};
 
@@ -254,22 +251,12 @@ mod tests {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let vm = context.kvm().create_vm().unwrap();
-        vm.set_tss_address(TSS_START as usize).unwrap();
-        vm.create_irq_chip().unwrap();
-        vm.create_pit2(kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        })
-        .unwrap();
+        let plan = MemoryPlan {
+            regions: ram_regions(16 << 20).unwrap(),
+        };
+        let vm = KvmVm::new(&context, memory::create(&plan).unwrap()).unwrap();
 
-        let regions = ram_regions(16 << 20).unwrap();
-        let mem = memory::create(&regions).unwrap();
-        // SAFETY: test drops VM before memory.
-        unsafe { memory::register(&vm, mem.as_ref(), context.capabilities().max_memslots) }
-            .unwrap();
-
-        let state = capture_vm_kvm(&vm).unwrap();
+        let state = capture_vm_kvm(vm.fd()).unwrap();
         assert_eq!(state.pic_master.chip_id, 0);
         assert_eq!(state.pic_slave.chip_id, 1);
         assert_eq!(state.ioapic.chip_id, 2);

@@ -38,18 +38,6 @@ pub const COM1_PORTS: Range<u64> = Range {
 pub const COM1_GSI: Gsi = Gsi(4);
 pub const PAGE_SIZE: u64 = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryRegion {
-    pub start: u64,
-    pub len: u64,
-}
-
-impl MemoryRegion {
-    pub fn end(self) -> u64 {
-        self.start + self.len
-    }
-}
-
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LayoutError {
     #[error("guest memory size must be non-zero")]
@@ -58,30 +46,20 @@ pub enum LayoutError {
     Overflow,
 }
 
-pub fn ram_regions(size: u64) -> Result<Vec<MemoryRegion>, LayoutError> {
+/// Lays `size` bytes of RAM out around the 32-bit MMIO hole.
+pub fn ram_regions(size: u64) -> Result<Vec<GpaRange>, LayoutError> {
     if size == 0 {
         return Err(LayoutError::Empty);
     }
     if size <= MMIO32_START {
-        return Ok(vec![MemoryRegion {
-            start: 0,
-            len: size,
-        }]);
+        return Ok(vec![GpaRange::new(0, size)]);
     }
-
-    let high_len = size - MMIO32_START;
-    MMIO32_END
-        .checked_add(high_len)
+    let high_end = MMIO32_END
+        .checked_add(size - MMIO32_START)
         .ok_or(LayoutError::Overflow)?;
     Ok(vec![
-        MemoryRegion {
-            start: 0,
-            len: MMIO32_START,
-        },
-        MemoryRegion {
-            start: MMIO32_END,
-            len: high_len,
-        },
+        GpaRange::new(0, MMIO32_START),
+        GpaRange::new(MMIO32_END, high_end),
     ])
 }
 
@@ -105,10 +83,7 @@ mod tests {
     fn ram_stays_contiguous_below_the_mmio_hole() {
         assert_eq!(
             ram_regions(128 << 20).unwrap(),
-            [MemoryRegion {
-                start: 0,
-                len: 128 << 20,
-            }]
+            [GpaRange::new(0, 128 << 20)]
         );
     }
 
@@ -116,16 +91,7 @@ mod tests {
     fn ram_continues_above_four_gib() {
         assert_eq!(
             ram_regions(4 << 30).unwrap(),
-            [
-                MemoryRegion {
-                    start: 0,
-                    len: 3 << 30,
-                },
-                MemoryRegion {
-                    start: 4 << 30,
-                    len: 1 << 30,
-                },
-            ]
+            [GpaRange::new(0, 3 << 30), GpaRange::new(4 << 30, 5 << 30)]
         );
     }
 

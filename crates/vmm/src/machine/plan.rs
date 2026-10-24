@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use linux_loader::cmdline::Cmdline;
 
 use super::block::{self, BlockPlan};
-use crate::arch::x86_64::layout::{
-    CMDLINE_MAX_SIZE, MemoryRegion, VIRTIO_MMIO_LEN, ram_regions, resource_book,
-};
+use super::memory::MemoryPlan;
+use crate::arch::x86_64::layout::{CMDLINE_MAX_SIZE, VIRTIO_MMIO_LEN, ram_regions, resource_book};
 use crate::kvm_context::HostCapabilities;
 use crate::resources::{GpaRange, Gsi, ResourceBook, ResourceError};
 use crate::spec::MachineSpec;
@@ -45,7 +44,7 @@ impl VirtioMmioGrant {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MachinePlan {
     pub spec: MachineSpec,
-    pub ram: Vec<MemoryRegion>,
+    pub memory: MemoryPlan,
     /// In the order the guest probes them.
     pub devices: Vec<DevicePlan>,
     pub cmdline: Cmdline,
@@ -68,7 +67,9 @@ impl DevicePlan {
 impl MachinePlan {
     pub fn new(spec: MachineSpec, host: &HostCapabilities) -> Result<Self> {
         spec.validate(host)?;
-        let ram = ram_regions(u64::from(spec.memory_mib) << 20)?;
+        let memory = MemoryPlan {
+            regions: ram_regions(u64::from(spec.memory_mib) << 20)?,
+        };
         let mut cmdline = Cmdline::new(CMDLINE_MAX_SIZE)?;
         cmdline
             .insert_str(
@@ -84,7 +85,7 @@ impl MachinePlan {
         let devices = blocks.into_iter().map(DevicePlan::Block).collect();
         Ok(Self {
             spec,
-            ram,
+            memory,
             devices,
             cmdline,
         })
@@ -184,7 +185,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(plan.ram.len(), 2);
+        assert_eq!(plan.memory.regions.len(), 2);
         let cmdline = plan.cmdline.as_cstring().unwrap();
         let cmdline = cmdline.to_str().unwrap();
         assert!(cmdline.contains("virtio_mmio.device=4K@0xc0000000:5"));

@@ -4,10 +4,8 @@ use std::range::Range;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use kvm_bindings::{
-    KVM_MP_STATE_UNINITIALIZED, KVM_PIT_SPEAKER_DUMMY, Msrs, kvm_mp_state, kvm_pit_config,
-};
-use kvm_ioctls::{VcpuFd, VmFd};
+use kvm_bindings::{KVM_MP_STATE_UNINITIALIZED, Msrs, kvm_mp_state};
+use kvm_ioctls::VmFd;
 use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{KernelLoader, PvhBootCapability, load_cmdline};
 use tokio::sync::mpsc;
@@ -21,6 +19,7 @@ use super::plan::{DevicePlan, MachinePlan};
 use super::platform::{Platform, PlatformSnapshot};
 use super::snapshot::DeviceSnapshot;
 use super::vcpu::{VcpuHandle, Vcpus};
+use super::vm::{KvmVcpu, KvmVm};
 use crate::KvmContext;
 use crate::arch::x86_64::{cpuid, lapic, layout, mptable, msr, pvh, regs};
 use crate::devices::DeviceManager;
@@ -34,10 +33,8 @@ pub struct Machine {
     pub(super) platform: Platform,
     /// In plan order.
     pub(super) devices: Vec<AttachedDevice>,
-    pio: Arc<Bus>,
     mmio: Arc<Bus>,
-    pub(crate) vm: VmFd,
-    pub(crate) memory: SharedGuestMemory,
+    pub(super) vm: Arc<KvmVm>,
 }
 
 /// A device attached to a machine, by kind.
@@ -127,36 +124,13 @@ impl Machine {
             Ok(())
         };
         self.tasks.stop().await;
-        drop(self.devices);
-        drop(self.platform);
-        drop(self.pio);
-        drop(self.mmio);
-        drop(self.vm);
-        drop(self.memory);
         result
     }
 }
 
-/// Creates a VM with the in-kernel interrupt controllers and PIT; a restore then
-/// loads their captured state.
-pub(super) fn create_vm(context: &KvmContext) -> Result<VmFd> {
-    let vm = context.kvm().create_vm().context("create KVM VM")?;
-    vm.set_tss_address(layout::TSS_START as usize)
-        .context("set TSS address")?;
-    vm.create_irq_chip().context("create irqchip")?;
-    vm.create_pit2(kvm_pit_config {
-        flags: KVM_PIT_SPEAKER_DUMMY,
-        ..Default::default()
-    })
-    .context("create PIT2")?;
-    Ok(vm)
-}
-
 pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
-    let memory = memory::create(&plan.ram)?;
-    let vm = create_vm(context)?;
-    // SAFETY: Machine and startup rollback both stop vCPUs and drop VM before memory.
-    unsafe { memory::register(&vm, memory.as_ref(), context.capabilities().max_memslots) }?;
+    let vm = KvmVm::new(context, memory::create(&plan.memory)?)?;
+    let memory = Arc::clone(vm.memory());
 
     let kernel = plan.spec.kernel.as_ref().unwrap();
     let mut image = File::open(&kernel.path)
@@ -185,7 +159,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         if size == 0 {
             bail!("initrd is empty");
         }
-        let low_end = plan.ram[0].end();
+        let low_end = plan.memory.regions[0].end();
         let address = layout::align_down(
             low_end
                 .checked_sub(size)
@@ -213,7 +187,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         GuestAddress(layout::CMDLINE_START),
         &plan.cmdline,
     )?;
-    for blob in pvh::boot_data(&plan.ram, layout::CMDLINE_START, initrd)?
+    for blob in pvh::boot_data(&plan.memory.regions, layout::CMDLINE_START, initrd)?
         .into_iter()
         .chain([mptable::build(plan.spec.cpus)?])
     {
@@ -222,7 +196,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
 
     let mut vcpus = Vec::with_capacity(plan.spec.cpus as usize);
     for index in 0..plan.spec.cpus {
-        let vcpu = vm.create_vcpu(u64::from(index)).context("create vCPU")?;
+        let vcpu = vm.create_vcpu(index)?;
         let caps = context.capabilities();
         vcpu.set_cpuid2(&cpuid::normalize(
             &caps.supported_cpuid,
@@ -250,7 +224,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         vcpu.set_lapic(&lapic::configure_lint(vcpu.get_lapic()?))?;
         vcpus.push(vcpu);
     }
-    assemble(plan, memory, vm, vcpus, None)
+    assemble(plan, vm, vcpus, None)
 }
 
 /// Attaches the platform and the planned devices, then starts the vCPU threads,
@@ -261,10 +235,8 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
 /// that would drop the interrupt.
 pub(super) fn assemble(
     plan: MachinePlan,
-    memory: SharedGuestMemory,
-    // After `memory`, so an early return drops the VM before the mapping it uses.
-    vm: VmFd,
-    vcpus: Vec<VcpuFd>,
+    vm: Arc<KvmVm>,
+    vcpus: Vec<KvmVcpu>,
     restore: Option<Restore>,
 ) -> Result<Machine> {
     let (events_tx, events) = mpsc::unbounded_channel();
@@ -277,7 +249,7 @@ pub(super) fn assemble(
     };
     let platform = Platform::attach(
         plan.spec.console,
-        &vm,
+        vm.fd(),
         &events_tx,
         &mut tasks,
         &mut pio_bus,
@@ -289,8 +261,8 @@ pub(super) fn assemble(
     for device in &plan.devices {
         devices.push(AttachedDevice::attach(
             device,
-            &vm,
-            &memory,
+            vm.fd(),
+            vm.memory(),
             &mut tasks,
             &mut mmio_bus,
             device_states.next(),
@@ -299,11 +271,10 @@ pub(super) fn assemble(
     let pio = Arc::new(Bus::new(pio_bus)?);
     let mmio = Arc::new(Bus::new(mmio_bus)?);
     let mut handles = Vec::with_capacity(vcpus.len());
-    for (index, fd) in vcpus.into_iter().enumerate() {
+    for (index, vcpu) in vcpus.into_iter().enumerate() {
         handles.push(VcpuHandle::spawn(
             index as u8,
-            fd,
-            &vm,
+            vcpu,
             Arc::clone(&pio),
             Arc::clone(&mmio),
             events_tx.clone(),
@@ -316,9 +287,7 @@ pub(super) fn assemble(
         plan,
         platform,
         devices,
-        pio,
         mmio,
         vm,
-        memory,
     })
 }
