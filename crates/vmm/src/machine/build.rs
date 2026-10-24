@@ -10,8 +10,8 @@ use kvm_bindings::{
 use kvm_ioctls::{IoEventAddress, VmFd};
 use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{KernelLoader, PvhBootCapability, load_cmdline};
+use logger::warn_unlimited;
 use tokio::sync::mpsc;
-use virtio_queue::QueueState;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
 
 use super::bus::{Bus, BusDevice};
@@ -23,7 +23,7 @@ use crate::arch::x86_64::{cpuid, lapic, layout, mptable, msr, pvh, regs};
 use crate::devices::legacy::console::{self, ConsoleOut, RawModeGuard};
 use crate::devices::legacy::i8042::I8042Device;
 use crate::devices::legacy::serial::{SerialDevice, SerialHandle};
-use crate::devices::virtio::block::{BlockQuiesceHandle, BlockResources};
+use crate::devices::virtio::block::{BlockQuiesceHandle, BlockQuiesced, BlockResources};
 use crate::devices::virtio::mmio::{MmioTransport, NOTIFY_OFFSET};
 use crate::devices::{DeviceManager, DeviceRole, Placement};
 
@@ -40,18 +40,24 @@ pub struct Machine {
     pub(crate) memory: memory::SharedGuestMemory,
     pub(super) raw_mode: Option<RawModeGuard>,
     pub(crate) block_quiesce: Vec<BlockQuiesceHandle>,
-    pub(crate) captured_block_queues: Vec<QueueState>,
+    /// Each block device's state as of the last pause (or as built / restored),
+    /// index-aligned with `block_quiesce` and `mmio_transports`.
+    pub(crate) captured_blocks: Vec<BlockQuiesced>,
 }
 
 impl Machine {
     pub async fn pause(&mut self) -> Result<()> {
         self.vcpus.as_ref().unwrap().pause().await?;
-        // Quiesce block devices cooperatively and capture their queue state.
-        let mut block_queues = Vec::new();
+        // Quiesce block devices cooperatively and record what each one was doing.
+        let mut captured = Vec::with_capacity(self.block_quiesce.len());
         for handle in &self.block_quiesce {
-            block_queues.extend(handle.quiesce().await?);
+            let quiesced = handle.quiesce().await;
+            if quiesced == BlockQuiesced::Exited {
+                warn_unlimited!("block device {} has exited; pausing without it", handle.id);
+            }
+            captured.push(quiesced);
         }
-        self.captured_block_queues = block_queues;
+        self.captured_blocks = captured;
         // Quiesce gate-based devices (irq resampler, serial).
         self.devices.quiesce().await;
         Ok(())
@@ -60,7 +66,7 @@ impl Machine {
     pub async fn resume(&mut self) -> Result<()> {
         self.devices.resume().await;
         for handle in &self.block_quiesce {
-            handle.resume().await?;
+            handle.resume().await;
         }
         self.vcpus.as_ref().unwrap().resume().await
     }
@@ -168,6 +174,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
     let mut mmio_transports: Vec<Arc<MmioTransport>> = Vec::new();
     let mut blocks = Vec::new();
     let mut block_quiesce = Vec::new();
+    let mut captured_blocks = Vec::new();
     let mut devices = DeviceManager::new();
     for (disk, location) in plan.spec.disks.iter().zip(&plan.devices) {
         let (resources, handle, quiesce_handle) =
@@ -201,6 +208,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         ));
         mmio_transports.push(transport);
         block_quiesce.push(quiesce_handle);
+        captured_blocks.push(BlockQuiesced::Inactive);
         blocks.push((disk.id.as_ref().unwrap().clone(), resources));
     }
 
@@ -295,6 +303,6 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         memory,
         raw_mode,
         block_quiesce,
-        captured_block_queues: Vec::new(),
+        captured_blocks,
     })
 }

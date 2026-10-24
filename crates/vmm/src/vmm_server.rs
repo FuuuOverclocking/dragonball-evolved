@@ -8,15 +8,40 @@ use tokio::sync::mpsc;
 
 use crate::VmmExitStatus;
 
+/// What the control plane delivered to the vmm thread.
+pub(crate) enum Inbound {
+    Request(VmmRequest),
+    /// Every client has gone away; reported once.
+    Detached,
+}
+
 /// The vmm thread's end of the request channel.
-pub(crate) struct VmmServer(pub(crate) mpsc::UnboundedReceiver<VmmRequest>);
+pub(crate) struct VmmServer {
+    /// `None` once `Detached` has been reported.
+    rx: Option<mpsc::UnboundedReceiver<VmmRequest>>,
+}
 
 impl VmmServer {
-    /// Wait for the next request, or `None` once every client has gone away.
+    pub(crate) fn new(rx: mpsc::UnboundedReceiver<VmmRequest>) -> Self {
+        Self { rx: Some(rx) }
+    }
+
+    /// Wait for the next request, or `Detached` once every client has gone away.
     ///
+    /// `Detached` is reported exactly once; later calls never resolve, because a
+    /// closed channel would otherwise turn every `select!` round into a spin.
     /// Cancel-safe, so it can sit directly in a `select!` arm.
-    pub(crate) async fn next_request(&mut self) -> Option<VmmRequest> {
-        self.0.recv().await
+    pub(crate) async fn next_inbound(&mut self) -> Inbound {
+        let Some(rx) = self.rx.as_mut() else {
+            return std::future::pending().await;
+        };
+        match rx.recv().await {
+            Some(request) => Inbound::Request(request),
+            None => {
+                self.rx = None;
+                Inbound::Detached
+            }
+        }
     }
 }
 
@@ -108,8 +133,15 @@ mod tests {
                 thread_handle: Arc::new(Mutex::new(None)),
                 tx,
             },
-            VmmServer(rx),
+            VmmServer::new(rx),
         )
+    }
+
+    async fn next_request(server: &mut VmmServer) -> VmmRequest {
+        match server.next_inbound().await {
+            Inbound::Request(request) => request,
+            Inbound::Detached => panic!("every client detached"),
+        }
     }
 
     fn instance_info() -> InstanceInfo {
@@ -133,8 +165,9 @@ mod tests {
         for with_timeout in [false, true] {
             let (client, mut server) = client_server();
             let worker = thread::spawn(move || {
-                respond(server.0.blocking_recv().unwrap());
-                respond(server.0.blocking_recv().unwrap());
+                let rx = server.rx.as_mut().unwrap();
+                respond(rx.blocking_recv().unwrap());
+                respond(rx.blocking_recv().unwrap());
             });
             let info = if with_timeout {
                 client.call_timeout(GetInstanceInfo, Duration::from_secs(5))
@@ -169,8 +202,8 @@ mod tests {
     async fn async_calls_preserve_responses_and_operation_errors() {
         let (client, mut server) = client_server();
         let worker = tokio::spawn(async move {
-            respond(server.next_request().await.unwrap());
-            respond(server.next_request().await.unwrap());
+            respond(next_request(&mut server).await);
+            respond(next_request(&mut server).await);
         });
         assert_eq!(
             client.call_async(GetInstanceInfo).await.unwrap(),
@@ -218,7 +251,8 @@ mod tests {
     fn sync_calls_report_a_dropped_reply() {
         for with_timeout in [false, true] {
             let (client, mut server) = client_server();
-            let worker = thread::spawn(move || drop(server.0.blocking_recv().unwrap()));
+            let worker =
+                thread::spawn(move || drop(server.rx.as_mut().unwrap().blocking_recv().unwrap()));
             let error = if with_timeout {
                 client.call_timeout(GetInstanceInfo, Duration::from_secs(5))
             } else {
@@ -240,7 +274,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn async_calls_report_a_dropped_reply() {
         let (client, mut server) = client_server();
-        let worker = tokio::spawn(async move { drop(server.next_request().await.unwrap()) });
+        let worker = tokio::spawn(async move { drop(next_request(&mut server).await) });
         let error = client.call_async(GetInstanceInfo).await.unwrap_err();
         assert!(error.is::<oneshot::RecvError>());
         worker.await.unwrap();
@@ -255,7 +289,7 @@ mod tests {
                 error.downcast_ref::<oneshot::RecvTimeoutError>(),
                 Some(&oneshot::RecvTimeoutError::Timeout)
             );
-            respond(server.0.try_recv().unwrap());
+            respond(server.rx.as_mut().unwrap().try_recv().unwrap());
         }
     }
 
@@ -268,7 +302,21 @@ mod tests {
                     .await
                     .is_err()
             );
-            respond(server.0.try_recv().unwrap());
+            respond(server.rx.as_mut().unwrap().try_recv().unwrap());
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn losing_every_client_detaches_once_then_stays_pending() {
+        let (client, mut server) = client_server();
+        let clone = client.clone();
+        drop(client);
+        drop(clone);
+        assert!(matches!(server.next_inbound().await, Inbound::Detached));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), server.next_inbound())
+                .await
+                .is_err()
+        );
     }
 }

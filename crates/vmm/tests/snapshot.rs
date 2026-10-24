@@ -4,15 +4,22 @@
 //! from the snapshot, and resumed with the guest continuing to execute.
 //!
 //! Checkpoint 6: verify that block device reactivation works after a rebuild
-//! when the transport was in DRIVER_OK state.
+//! for the disks whose device had an active session, where the plan put them.
 
+mod common;
 #[allow(dead_code)]
 #[path = "common/elf.rs"]
 mod elf;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
+use common::guest::{
+    AVAIL_RING, DESC_TABLE, GuestDriver, SECTOR_SIZE, Segment, USED_RING, VIRTIO_BLK_S_OK,
+    VIRTIO_BLK_T_IN,
+};
+use common::{TempDisk, settle, wait_until};
 use tokio::time;
 use vmm::KvmContext;
 use vmm::machine::build;
@@ -32,6 +39,37 @@ fn inc_eax_payload() -> Vec<u8> {
         0xff, 0xc0, // inc eax
         0xeb, 0xfc, // jmp -4 (back to inc)
     ]
+}
+
+/// Negotiate a virtio-mmio transport up to DRIVER_OK the way a guest driver
+/// would: status 0→1→3, set features, status 3→11, set the queue addresses,
+/// set queue ready, status 11→15.
+fn negotiate_driver_ok(
+    transport: &vmm::devices::virtio::mmio::MmioTransport,
+    desc: u64,
+    avail: u64,
+    used: u64,
+) {
+    for (offset, value) in [
+        // status = ACKNOWLEDGE, then ACKNOWLEDGE | DRIVER
+        (0x70, 1u32),
+        (0x70, 3),
+        // driver_features_sel = 1 (high word), then VERSION_1 (its bit 0)
+        (0x24, 1),
+        (0x20, 1),
+        // status = ACKNOWLEDGE | DRIVER | FEATURES_OK
+        (0x70, 11),
+        // queue size, then the low words of desc table, avail ring, used ring
+        (0x38, 16),
+        (0x80, desc as u32),
+        (0x90, avail as u32),
+        (0xa0, used as u32),
+        // queue ready, then status = DRIVER_OK
+        (0x44, 1),
+        (0x70, 15),
+    ] {
+        transport.write(offset, &value.to_le_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +179,7 @@ async fn block_reactivation_after_rebuild_on_kvm() {
 
     // Create a small disk image (2 sectors).
     let disk_contents = vec![0xab_u8; 1024];
-    let disk = common::TempDisk::new("snap-blk", &disk_contents);
+    let disk = TempDisk::new("snap-blk", &disk_contents);
 
     let spec = MachineSpec {
         cpus: 1,
@@ -167,37 +205,7 @@ async fn block_reactivation_after_rebuild_on_kvm() {
     // simulate the guest having negotiated DRIVER_OK. We do this by writing
     // through the MMIO transport bus device to perform the negotiation
     // sequence.
-    //
-    // virtio-mmio negotiation: status 0→1→3, set features, status 3→11→15,
-    // set queue addresses, set queue ready, status = 15 (DRIVER_OK).
-    if !machine.mmio_transports.is_empty() {
-        let transport = &machine.mmio_transports[0];
-
-        // Write status = ACKNOWLEDGE (1)
-        transport.write(0x70, &1u32.to_le_bytes());
-        // Write status = ACKNOWLEDGE | DRIVER (3)
-        transport.write(0x70, &3u32.to_le_bytes());
-        // Select driver_features_sel = 1 (high)
-        transport.write(0x24, &1u32.to_le_bytes());
-        // Write VERSION_1 bit (bit 0 of high word)
-        transport.write(0x20, &1u32.to_le_bytes());
-        // Write status = ACKNOWLEDGE | DRIVER | FEATURES_OK (11)
-        transport.write(0x70, &11u32.to_le_bytes());
-
-        // Configure the queue: use a small reserved area in guest memory.
-        // Queue size
-        transport.write(0x38, &16u32.to_le_bytes());
-        // desc table low
-        transport.write(0x80, &0x4000u32.to_le_bytes());
-        // avail ring low
-        transport.write(0x90, &0x5000u32.to_le_bytes());
-        // used ring low
-        transport.write(0xa0, &0x6000u32.to_le_bytes());
-        // Queue ready = 1
-        transport.write(0x44, &1u32.to_le_bytes());
-        // Write status = DRIVER_OK (15)
-        transport.write(0x70, &15u32.to_le_bytes());
-    }
+    negotiate_driver_ok(&machine.mmio_transports[0], 0x4000, 0x5000, 0x6000);
 
     // Let the device start processing.
     time::sleep(Duration::from_millis(50)).await;
@@ -225,7 +233,11 @@ async fn block_reactivation_after_rebuild_on_kvm() {
     assert_eq!(
         snap.devices.block_queues.len(),
         1,
-        "expected one captured block queue"
+        "expected one block record per disk"
+    );
+    assert!(
+        snap.devices.block_queues[0].is_some(),
+        "the activated disk should have captured its queue"
     );
 
     machine.teardown().await.unwrap();
@@ -253,31 +265,197 @@ async fn block_reactivation_after_rebuild_on_kvm() {
     restored.teardown().await.unwrap();
 }
 
-// Test helper module.
-#[allow(dead_code)]
-mod common {
-    use std::path::{Path, PathBuf};
+// ---------------------------------------------------------------------------
+// Rebuild replays the plan's layout and each disk's own activation
+// ---------------------------------------------------------------------------
 
-    pub struct TempDisk {
-        path: PathBuf,
+/// Restore must attach every disk where the plan placed it and reactivate
+/// exactly the disks that had a session, even when the plan reorders the
+/// spec's disks and an inactive disk precedes an active one.
+///
+/// The spec lists data disk A first and root disk B second; the plan puts the
+/// root disk first, so the plan order is [B, A]. Only A is activated. After
+/// capture, teardown and rebuild, a read kicked through the transport at A's
+/// original address must be served from A's file, and B must stay inactive.
+#[tokio::test(flavor = "local")]
+async fn rebuild_keeps_plan_layout_and_per_disk_activation_on_kvm() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
     }
 
-    impl TempDisk {
-        pub fn new(name: &str, contents: &[u8]) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("dragonball-test-{}-{name}", std::process::id()));
-            std::fs::write(&path, contents).expect("write temp disk");
-            Self { path }
-        }
+    use api::block::BlockDevConfig;
+    use api::boot::KernelConfig;
+    use api::machine::ConsoleConfig;
+    use vmm::machine::plan::MachinePlan;
 
-        pub fn path(&self) -> &Path {
-            &self.path
-        }
+    let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+    let kernel = elf::TempFile::new(&elf::image(&inc_eax_payload(), true));
+    // Every sector of both disks differs, so neither the wrong disk nor the
+    // wrong offset can produce the expected bytes.
+    let disk_a = TempDisk::new(
+        "snap-order-a",
+        &[[0xa0; SECTOR_SIZE], [0xa1; SECTOR_SIZE]].concat(),
+    );
+    let disk_b = TempDisk::new(
+        "snap-order-b",
+        &[[0xb0; SECTOR_SIZE], [0xb1; SECTOR_SIZE]].concat(),
+    );
+    let disk = |id: &str, path: &Path, root| BlockDevConfig {
+        id: Some(id.into()),
+        path: path.into(),
+        read_only: false,
+        root,
+    };
+    let spec = MachineSpec {
+        cpus: 1,
+        memory_mib: 16,
+        console: ConsoleConfig::None,
+        kernel: Some(KernelConfig {
+            path: kernel.path().into(),
+            cmdline: None,
+            initrd: None,
+        }),
+        disks: vec![
+            disk("disk-a", disk_a.path(), false),
+            disk("disk-b", disk_b.path(), true),
+        ],
+    };
+    let plan = MachinePlan::new(spec.clone(), context.capabilities()).unwrap();
+    // Plan indices are also the disks' indices in the machine's device vectors.
+    assert_eq!(
+        plan.spec
+            .disks
+            .iter()
+            .map(|disk| disk.id.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["disk-b", "disk-a"]
+    );
+    let (b, a) = (0, 1);
+    let mut machine = build::build(plan, &context).unwrap();
+    negotiate_driver_ok(
+        &machine.mmio_transports[a],
+        DESC_TABLE,
+        AVAIL_RING,
+        USED_RING,
+    );
+
+    machine.pause().await.unwrap();
+    let snap = snapshot::capture(&machine).unwrap();
+    machine.teardown().await.unwrap();
+
+    // Play A's guest driver in the restored VM's RAM.
+    let mut guest = GuestDriver::with_memory(Arc::clone(&snap.memory));
+    let mut restored = rebuild(snap, &spec, &context).unwrap();
+    // Let the reactivated device finish its first drain, so that the kick
+    // below is what delivers the request.
+    settle().await;
+
+    let header = guest.request_header(VIRTIO_BLK_T_IN, 1);
+    let data = guest.alloc(SECTOR_SIZE as u32);
+    let status = guest.alloc(1);
+    guest.write_bytes(status, &[0xff]);
+    let head = guest.submit(&[
+        Segment::readable(header, 16),
+        Segment::writable(data, SECTOR_SIZE as u32),
+        Segment::writable(status, 1),
+    ]);
+    // QueueNotify on the transport at A's original address.
+    restored.mmio_transports[a].write(0x50, &0u32.to_le_bytes());
+
+    wait_until("disk A to complete a read kicked after rebuild", || {
+        guest.used_idx() == 1
+    })
+    .await;
+    assert_eq!(
+        guest.used_entry(0),
+        (u32::from(head), SECTOR_SIZE as u32 + 1)
+    );
+    assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_OK]);
+    assert_eq!(
+        guest.read_bytes(data, SECTOR_SIZE),
+        [0xa1; SECTOR_SIZE],
+        "the read was not served from disk A"
+    );
+
+    // B was never activated, so the restore must not have activated it either.
+    let mut device_status = [0; 4];
+    restored.mmio_transports[b].read(0x70, &mut device_status);
+    assert_eq!(u32::from_le_bytes(device_status), 0);
+    restored.pause().await.unwrap();
+    let snap = snapshot::capture(&restored).unwrap();
+    assert_eq!(snap.devices.block_queues[b], None, "disk B was activated");
+    assert_eq!(
+        snap.devices.block_queues[a].map(|queue| queue.next_used),
+        Some(1),
+        "disk A did not keep its session"
+    );
+    restored.teardown().await.unwrap();
+}
+
+/// A guest can make its block device task fail. Pausing must survive that,
+/// but a machine with a dead device is not snapshotted.
+#[tokio::test(flavor = "local")]
+async fn pause_survives_an_exited_disk_but_capture_refuses_it_on_kvm() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
     }
 
-    impl Drop for TempDisk {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
+    use api::block::BlockDevConfig;
+    use api::boot::KernelConfig;
+    use api::machine::ConsoleConfig;
+    use vm_memory::{Bytes, GuestAddress};
+    use vmm::machine::plan::MachinePlan;
+
+    let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+    let kernel = elf::TempFile::new(&elf::image(&inc_eax_payload(), true));
+    let disk = TempDisk::new("snap-exited", &[0; SECTOR_SIZE]);
+    let spec = MachineSpec {
+        cpus: 1,
+        memory_mib: 16,
+        console: ConsoleConfig::None,
+        kernel: Some(KernelConfig {
+            path: kernel.path().into(),
+            cmdline: None,
+            initrd: None,
+        }),
+        disks: vec![BlockDevConfig {
+            id: Some("failing-disk".into()),
+            path: disk.path().into(),
+            read_only: false,
+            root: false,
+        }],
+    };
+    let plan = MachinePlan::new(spec, context.capabilities()).unwrap();
+    let mut machine = build::build(plan, &context).unwrap();
+    negotiate_driver_ok(
+        &machine.mmio_transports[0],
+        DESC_TABLE,
+        AVAIL_RING,
+        USED_RING,
+    );
+
+    // Reach the guest RAM through a snapshot taken while the device is healthy.
+    machine.pause().await.unwrap();
+    let memory = snapshot::capture(&machine).unwrap().memory;
+    machine.resume().await.unwrap();
+
+    // An available index past the queue size makes the device task fail.
+    memory
+        .write_obj(17u16, GuestAddress(AVAIL_RING + 2))
+        .unwrap();
+    machine.mmio_transports[0].write(0x50, &0u32.to_le_bytes());
+    let exit = time::timeout(Duration::from_secs(5), machine.devices.next_exit())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exit.name, "failing-disk");
+    assert!(exit.result.is_err());
+
+    machine.pause().await.unwrap();
+    let Err(error) = snapshot::capture(&machine) else {
+        panic!("captured a machine whose block device has exited");
+    };
+    assert!(error.to_string().contains("has exited"), "{error:#}");
+    machine.resume().await.unwrap();
+    machine.teardown().await.unwrap();
 }

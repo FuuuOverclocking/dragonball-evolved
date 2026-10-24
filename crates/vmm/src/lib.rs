@@ -21,14 +21,14 @@ use crate::lifecycle::{BusyCtx, BusyEvent, Controller, Event, Step, handle_busy,
 pub use crate::process_ctx::ProcessCtx;
 use crate::spec::MachineSpec;
 pub use crate::vmm_server::VmmClient;
-use crate::vmm_server::VmmServer;
+use crate::vmm_server::{Inbound, VmmServer};
 
 pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     let thread_handle = thread::Builder::new()
         .name("vmm-main".into())
-        .spawn(move || vmm_main(VmmServer(rx), ctx))
+        .spawn(move || vmm_main(VmmServer::new(rx), ctx))
         .context("spawn vmm-main thread")?;
 
     Ok(VmmClient {
@@ -48,7 +48,10 @@ async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
                 let event = select! {
                     biased;
                     event = vm.next_event() => event,
-                    request = server.next_request() => Event::Request(request),
+                    inbound = server.next_inbound() => match inbound {
+                        Inbound::Request(request) => Event::Request(request),
+                        Inbound::Detached => Event::Detached,
+                    },
                 };
                 let (next, step) = handle_idle(vm, event, &ctx).await;
                 match step {
@@ -66,7 +69,10 @@ async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
                 let event = select! {
                     biased;
                     completion = &mut operation.future => BusyEvent::Completion(Box::new(completion)),
-                    request = server.next_request() => BusyEvent::Request(request),
+                    inbound = server.next_inbound() => match inbound {
+                        Inbound::Request(request) => BusyEvent::Request(request),
+                        Inbound::Detached => BusyEvent::Detached,
+                    },
                 };
                 let (next, step) =
                     handle_busy(stable, operation, event, &BusyCtx::from(&ctx)).await;

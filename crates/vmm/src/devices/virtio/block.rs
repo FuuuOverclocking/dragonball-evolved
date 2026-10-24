@@ -84,10 +84,21 @@ pub struct BlockHandle {
     pub desc: DeviceDesc,
 }
 
+/// What a block device was doing when asked to quiesce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockQuiesced {
+    /// Parked before the guest driver activated it, so there is no queue.
+    Inactive,
+    /// Parked mid-session, with the state of its single queue.
+    Active(QueueState),
+    /// The device task is gone, so nothing could be parked or captured.
+    Exited,
+}
+
 /// Command sent through the block device's own quiesce channel.
 enum BlockQuiesceCmd {
-    /// Pause I/O and reply with the current queue state.
-    Quiesce(oneshot::Sender<Vec<QueueState>>),
+    /// Pause I/O and reply with what the device was doing.
+    Quiesce(oneshot::Sender<BlockQuiesced>),
     /// Resume I/O from where it left off.
     Resume,
 }
@@ -102,25 +113,26 @@ pub struct BlockQuiesceHandle {
 }
 
 impl BlockQuiesceHandle {
-    /// Ask the block device to quiesce and return its queue states.
-    pub async fn quiesce(&self) -> anyhow::Result<Vec<QueueState>> {
+    /// Ask the block device to quiesce and report what it was doing.
+    ///
+    /// A device task that has already exited is reported, not treated as an
+    /// error: whether that matters is up to the caller.
+    pub async fn quiesce(&self) -> BlockQuiesced {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
+        if self
+            .tx
             .send(BlockQuiesceCmd::Quiesce(reply_tx))
             .await
-            .map_err(|_| anyhow::anyhow!("block device {} is not running", self.id))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("block device {} dropped quiesce reply", self.id))
+            .is_err()
+        {
+            return BlockQuiesced::Exited;
+        }
+        reply_rx.await.unwrap_or(BlockQuiesced::Exited)
     }
 
-    /// Resume the block device after a quiesce.
-    pub async fn resume(&self) -> anyhow::Result<()> {
-        self.tx
-            .send(BlockQuiesceCmd::Resume)
-            .await
-            .map_err(|_| anyhow::anyhow!("block device {} is not running", self.id))?;
-        Ok(())
+    /// Resume the block device after a quiesce; an exited device is ignored.
+    pub async fn resume(&self) {
+        let _ = self.tx.send(BlockQuiesceCmd::Resume).await;
     }
 }
 
@@ -223,9 +235,11 @@ impl BlockDevice {
                 select! {
                     biased;
                     () = stop.requested() => return Ok(()),
+                    // An activation the transport already sent must not be reported as Inactive.
+                    activation = self.activation.recv() => break activation,
                     Some(cmd) = self.quiesce_rx.recv() => {
                         if let BlockQuiesceCmd::Quiesce(reply) = cmd {
-                            let _ = reply.send(Vec::new());
+                            let _ = reply.send(BlockQuiesced::Inactive);
                             // Park until resume or stop.
                             loop {
                                 select! {
@@ -234,7 +248,7 @@ impl BlockDevice {
                                     cmd = self.quiesce_rx.recv() => match cmd {
                                         Some(BlockQuiesceCmd::Resume) => break,
                                         Some(BlockQuiesceCmd::Quiesce(reply)) => {
-                                            let _ = reply.send(Vec::new());
+                                            let _ = reply.send(BlockQuiesced::Inactive);
                                         }
                                         None => return Ok(()),
                                     },
@@ -242,7 +256,6 @@ impl BlockDevice {
                             }
                         }
                     }
-                    activation = self.activation.recv() => break activation,
                 }
             };
             let Some(Activation {
@@ -289,7 +302,7 @@ impl BlockDevice {
                 () = session.requested() => return Ok(()),
                 Some(cmd) = self.quiesce_rx.recv() => match cmd {
                     BlockQuiesceCmd::Quiesce(reply) => {
-                        let _ = reply.send(vec![active.queue.state()]);
+                        let _ = reply.send(BlockQuiesced::Active(active.queue.state()));
                         // Park until resume or stop.
                         loop {
                             select! {
@@ -298,7 +311,8 @@ impl BlockDevice {
                                 cmd = self.quiesce_rx.recv() => match cmd {
                                     Some(BlockQuiesceCmd::Resume) => break,
                                     Some(BlockQuiesceCmd::Quiesce(reply)) => {
-                                        let _ = reply.send(vec![active.queue.state()]);
+                                        let _ = reply
+                                            .send(BlockQuiesced::Active(active.queue.state()));
                                     }
                                     None => return Ok(()),
                                 },

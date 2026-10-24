@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use kvm_bindings::{
     CpuId, KVM_PIT_SPEAKER_DUMMY, Msrs, kvm_clock_data, kvm_debugregs, kvm_irqchip,
     kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_pit_config, kvm_pit_state2, kvm_regs,
@@ -21,13 +21,14 @@ use super::build::Machine;
 use super::bus::{Bus, BusDevice};
 use super::memory;
 use super::memory::SharedGuestMemory;
+use super::plan::MachinePlan;
 use super::vcpu::{VcpuHandle, Vcpus};
 use crate::KvmContext;
 use crate::arch::x86_64::layout;
 use crate::devices::legacy::console;
 use crate::devices::legacy::i8042::{I8042Device, I8042State};
 use crate::devices::legacy::serial::SerialDevice;
-use crate::devices::virtio::block::BlockResources;
+use crate::devices::virtio::block::{BlockQuiesced, BlockResources};
 use crate::devices::virtio::mmio::{MmioRegs, MmioTransport, NOTIFY_OFFSET};
 use crate::devices::virtio::{Activation, session_channel};
 use crate::devices::{DeviceManager, DeviceRole, Placement};
@@ -68,8 +69,11 @@ pub struct VcpuSnapshot {
 pub struct DeviceSnapshots {
     pub serial: Option<SerialSnapshot>,
     pub i8042: I8042State,
+    /// One per disk, in plan order.
     pub transports: Vec<MmioTransportSnapshot>,
-    pub block_queues: Vec<QueueState>,
+    /// One per disk, in plan order: the queue of a device that had an active
+    /// session when the machine paused, or `None`.
+    pub block_queues: Vec<Option<QueueState>>,
 }
 
 pub struct SerialSnapshot {
@@ -125,9 +129,10 @@ pub fn capture_vcpus(vcpus: &Vcpus) -> Result<Vec<VcpuSnapshot>> {
 
 /// Capture mutex-reachable device state.
 ///
-/// Block queue states come from `machine.captured_block_queues`, which are
-/// filled in during [`Machine::pause`] via cooperative quiesce.
-pub fn capture_devices(machine: &Machine) -> DeviceSnapshots {
+/// Block device state comes from `machine.captured_blocks`, which is recorded
+/// during [`Machine::pause`]. A machine with an exited block device is refused:
+/// there is no state to capture for it, and restoring it would hide the failure.
+pub fn capture_devices(machine: &Machine) -> Result<DeviceSnapshots> {
     let serial = machine.serial_handle.as_ref().map(|h| {
         let state = h.uart.lock().unwrap().state();
         SerialSnapshot {
@@ -153,17 +158,31 @@ pub fn capture_devices(machine: &Machine) -> DeviceSnapshots {
         })
         .collect();
 
-    DeviceSnapshots {
+    let block_queues = machine
+        .captured_blocks
+        .iter()
+        .zip(&machine.block_quiesce)
+        .map(|(captured, handle)| match *captured {
+            BlockQuiesced::Inactive => Ok(None),
+            BlockQuiesced::Active(queue) => Ok(Some(queue)),
+            BlockQuiesced::Exited => Err(anyhow!(
+                "block device {} has exited; refusing to snapshot",
+                handle.id
+            )),
+        })
+        .collect::<Result<_>>()?;
+
+    Ok(DeviceSnapshots {
         serial,
         i8042,
         transports,
-        block_queues: machine.captured_block_queues.clone(),
-    }
+        block_queues,
+    })
 }
 
 /// Capture the full machine snapshot (VM KVM state, vCPUs, devices, memory).
 pub fn capture(machine: &Machine) -> Result<MachineSnapshot> {
-    let devices = capture_devices(machine);
+    let devices = capture_devices(machine)?;
     let vcpus = capture_vcpus(machine.vcpus.as_ref().unwrap())?;
     let vm = capture_vm_kvm(&machine.vm)?;
     let memory = Arc::clone(&machine.memory);
@@ -179,21 +198,28 @@ pub fn capture(machine: &Machine) -> Result<MachineSnapshot> {
 // Rebuild
 // ---------------------------------------------------------------------------
 
-/// The status value a fully activated virtio-mmio device should have:
-/// ACKNOWLEDGE(1) | DRIVER(2) | FEATURES_OK(4) | DRIVER_OK(8).
-const DRIVER_OK_STATUS: u32 = 15;
-
 /// Reconstruct a [`Machine`] from a [`MachineSnapshot`] and the original
 /// [`MachineSpec`].
 ///
 /// The returned machine is in a paused-equivalent state: vCPUs are spawned
-/// paused, devices are live, and block devices whose transport was in
-/// `DRIVER_OK` state are reactivated with the captured queue state.
+/// paused, devices are live, and block devices that had an active session when
+/// captured are reactivated with their captured queue state.
 pub fn rebuild(
     snapshot: MachineSnapshot,
     spec: &MachineSpec,
     context: &KvmContext,
 ) -> Result<Machine> {
+    // Until snapshots record the plan, re-plan so each disk keeps build()'s address and GSI.
+    let plan = MachinePlan::new(spec.clone(), context.capabilities())?;
+    let disks = plan.spec.disks.len();
+    if snapshot.devices.transports.len() != disks || snapshot.devices.block_queues.len() != disks {
+        bail!(
+            "snapshot has {} transport and {} block records for {disks} disks",
+            snapshot.devices.transports.len(),
+            snapshot.devices.block_queues.len(),
+        );
+    }
+
     // 1. Create KVM VM.
     let vm = context.kvm().create_vm().context("create KVM VM")?;
     vm.set_tss_address(layout::TSS_START as usize)
@@ -238,29 +264,32 @@ pub fn rebuild(
     let mut mmio_transports: Vec<Arc<MmioTransport>> = Vec::new();
     let mut blocks = Vec::new();
     let mut block_quiesce = Vec::new();
+    let mut captured_blocks = Vec::new();
     let mut devices = DeviceManager::new();
 
-    // Track disk locations using the same layout logic as build/plan.
-    for (disk_index, disk) in spec.disks.iter().enumerate() {
-        let location_address =
-            layout::VIRTIO_MMIO_START + disk_index as u64 * layout::VIRTIO_MMIO_LEN;
-        let gsi = layout::LEGACY_GSI_START + disk_index as u32;
-
+    let records = snapshot
+        .devices
+        .transports
+        .iter()
+        .zip(&snapshot.devices.block_queues);
+    for ((disk, location), (transport_snapshot, queue_state)) in
+        plan.spec.disks.iter().zip(&plan.devices).zip(records)
+    {
         let (resources, handle, quiesce_handle) =
             BlockResources::open(disk.id.as_ref().unwrap(), &disk.path, disk.read_only, None)?;
         vm.register_ioevent(
             &handle.queue_notifier,
-            &IoEventAddress::Mmio(location_address + NOTIFY_OFFSET),
+            &IoEventAddress::Mmio(location.address + NOTIFY_OFFSET),
             0u32,
         )?;
         vm.register_irqfd_with_resample(
             handle.interrupt.irq_fd(),
             handle.interrupt.resample_fd(),
-            gsi,
+            location.gsi,
         )?;
         let stop = devices.stop_signal();
         devices.spawn(
-            format!("irq-{gsi}"),
+            format!("irq-{}", location.gsi),
             DeviceRole::GuestAffecting,
             Arc::clone(&handle.interrupt).resample(stop),
         );
@@ -269,59 +298,32 @@ pub fn rebuild(
         // we can pass it into the reactivation path if needed.
         let interrupt_for_activation = Arc::clone(&handle.interrupt);
 
-        // Use captured register state if available, otherwise default.
-        let transport = if let Some(ts) = snapshot.devices.transports.get(disk_index) {
-            Arc::new(MmioTransport::with_state(
-                handle.desc,
-                Arc::clone(&snapshot.memory),
-                handle.activator.clone(),
-                handle.interrupt,
-                vec![handle.queue_notifier],
-                ts.regs.clone(),
-                ts.interrupt_status,
-            ))
-        } else {
-            Arc::new(MmioTransport::new(
-                handle.desc,
-                Arc::clone(&snapshot.memory),
-                handle.activator.clone(),
-                handle.interrupt,
-                vec![handle.queue_notifier],
-            ))
-        };
+        let transport = Arc::new(MmioTransport::with_state(
+            handle.desc,
+            Arc::clone(&snapshot.memory),
+            handle.activator.clone(),
+            handle.interrupt,
+            vec![handle.queue_notifier],
+            transport_snapshot.regs.clone(),
+            transport_snapshot.interrupt_status,
+        ));
         mmio_devices.push((
-            location_address..location_address + layout::VIRTIO_MMIO_LEN,
+            location.address..location.address + layout::VIRTIO_MMIO_LEN,
             Arc::clone(&transport) as Arc<dyn BusDevice>,
         ));
-        mmio_transports.push(transport);
-
-        // If this transport was in DRIVER_OK state, we need to reactivate the
-        // block device with the captured queue state.
-        let needs_reactivation = snapshot
-            .devices
-            .transports
-            .get(disk_index)
-            .is_some_and(|ts| ts.regs.status == DRIVER_OK_STATUS);
-        let queue_state = if needs_reactivation {
-            snapshot.devices.block_queues.get(disk_index).cloned()
-        } else {
-            None
-        };
-        let driver_features = snapshot
-            .devices
-            .transports
-            .get(disk_index)
-            .map_or(0, |ts| ts.regs.driver_features);
-
+        mmio_transports.push(Arc::clone(&transport));
         block_quiesce.push(quiesce_handle);
+        captured_blocks.push(queue_state.map_or(BlockQuiesced::Inactive, BlockQuiesced::Active));
+
+        // The block record, not the transport status, decides reactivation.
         blocks.push((
             disk.id.as_ref().unwrap().clone(),
             resources,
             handle.activator,
-            queue_state,
-            driver_features,
+            *queue_state,
+            transport_snapshot.regs.driver_features,
             interrupt_for_activation,
-            Arc::clone(mmio_transports.last().unwrap()),
+            transport,
         ));
     }
 
@@ -464,7 +466,7 @@ pub fn rebuild(
         memory: snapshot.memory,
         raw_mode: None,
         block_quiesce,
-        captured_block_queues: Vec::new(),
+        captured_blocks,
     })
 }
 

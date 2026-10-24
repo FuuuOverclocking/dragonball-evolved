@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::guest::{
-    GuestDriver, SECTOR_SIZE, Segment, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP,
-    VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
+    AVAIL_RING, GuestDriver, SECTOR_SIZE, Segment, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK,
+    VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN,
+    VIRTIO_BLK_T_OUT,
 };
 use common::{TempDisk, settle, wait_until};
 use vmm::devices::async_fd::AsyncEventFd;
-use vmm::devices::virtio::block::{BlockDevice, BlockHandle};
+use vmm::devices::virtio::block::{BlockDevice, BlockHandle, BlockQuiesced};
 use vmm::devices::virtio::{Activation, SessionControl, session_channel};
 use vmm::devices::{DeviceManager, DeviceRole};
 
@@ -573,17 +574,18 @@ async fn block_quiesce_pauses_and_resume_completes_same_session() {
     assert_eq!(guest.used_idx(), 1);
 
     // Quiesce via the block-specific channel and verify QueueState.
-    let states = tokio::time::timeout(Duration::from_secs(5), quiesce_handle.quiesce())
+    let quiesced = tokio::time::timeout(Duration::from_secs(5), quiesce_handle.quiesce())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(states.len(), 1, "block device has exactly one queue");
+    let BlockQuiesced::Active(state) = quiesced else {
+        panic!("an activated device reported {quiesced:?}");
+    };
     assert_eq!(
-        states[0].next_avail, 1,
+        state.next_avail, 1,
         "next_avail should reflect 1 submitted request"
     );
     assert_eq!(
-        states[0].next_used, 1,
+        state.next_used, 1,
         "next_used should reflect 1 completed request"
     );
 
@@ -605,7 +607,6 @@ async fn block_quiesce_pauses_and_resume_completes_same_session() {
     // Resume via the block-specific channel.
     tokio::time::timeout(Duration::from_secs(5), quiesce_handle.resume())
         .await
-        .unwrap()
         .unwrap();
 
     // The request completes in the same activation/session.
@@ -652,24 +653,89 @@ async fn block_quiesce_returns_queue_state_reflecting_completed_requests() {
     wait_until("all three requests to complete", || guest.used_idx() == 3).await;
 
     // Quiesce and verify the exported QueueState.
-    let states = tokio::time::timeout(Duration::from_secs(5), quiesce_handle.quiesce())
+    let quiesced = tokio::time::timeout(Duration::from_secs(5), quiesce_handle.quiesce())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(states.len(), 1);
+    let BlockQuiesced::Active(state) = quiesced else {
+        panic!("an activated device reported {quiesced:?}");
+    };
     assert_eq!(
-        states[0].next_avail, 3,
+        state.next_avail, 3,
         "next_avail should reflect 3 submitted requests"
     );
     assert_eq!(
-        states[0].next_used, 3,
+        state.next_used, 3,
         "next_used should reflect 3 completed requests"
     );
 
     // Resume and stop cleanly.
     tokio::time::timeout(Duration::from_secs(5), quiesce_handle.resume())
         .await
+        .unwrap();
+    devices.stop().await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn quiesce_reports_an_exited_device_and_resume_ignores_it() {
+    use vm_memory::{Bytes, GuestAddress};
+    use vmm::devices::Placement;
+    use vmm::devices::virtio::block::BlockResources;
+    let disk = TempDisk::new("exited-quiesce", &[0; SECTOR_SIZE]);
+    let (resources, handle, quiesce_handle) =
+        BlockResources::open("exited-quiesce", disk.path(), true, None).unwrap();
+    let guest = GuestDriver::new();
+    // An available index past the queue size makes the device task fail.
+    guest
+        .mem
+        .write_obj(17u16, GuestAddress(AVAIL_RING + 2))
+        .unwrap();
+    let mut devices = DeviceManager::new();
+    devices
+        .spawn_on(
+            "exited-quiesce",
+            Placement::Io,
+            DeviceRole::GuestAffecting,
+            move |stop| async move { resources.into_device()?.run(stop).await },
+        )
+        .unwrap();
+    let _session = activate(&handle, &guest);
+    let exit = tokio::time::timeout(Duration::from_secs(1), devices.next_exit())
+        .await
         .unwrap()
         .unwrap();
+    assert!(exit.result.is_err());
+
+    let quiesced = tokio::time::timeout(Duration::from_secs(1), quiesce_handle.quiesce())
+        .await
+        .unwrap();
+    assert_eq!(quiesced, BlockQuiesced::Exited);
+    tokio::time::timeout(Duration::from_secs(1), quiesce_handle.resume())
+        .await
+        .unwrap();
+    devices.stop().await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn quiesce_racing_activation_reports_the_session() {
+    let disk = TempDisk::new("activate-then-quiesce", &[0; SECTOR_SIZE]);
+    let (device, handle, quiesce_handle) =
+        BlockDevice::new("test-blk", disk.path(), false, None).unwrap();
+    let mut devices = DeviceManager::new();
+    let stop = devices.stop_signal();
+    devices.spawn("block", DeviceRole::GuestAffecting, device.run(stop));
+
+    // The device task has not been polled yet, so it first sees the activation
+    // and the quiesce together, as after a DRIVER_OK write right before Pause.
+    let guest = GuestDriver::new();
+    let _session = activate(&handle, &guest);
+    let quiesced = tokio::time::timeout(Duration::from_secs(5), quiesce_handle.quiesce())
+        .await
+        .unwrap();
+    assert!(
+        matches!(quiesced, BlockQuiesced::Active(_)),
+        "an activated device reported {quiesced:?}"
+    );
+
+    quiesce_handle.resume().await;
     devices.stop().await;
 }

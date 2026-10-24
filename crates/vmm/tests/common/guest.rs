@@ -17,9 +17,9 @@ pub const QUEUE_SIZE: u16 = 16;
 pub const SECTOR_SIZE: usize = 512;
 
 const MEM_SIZE: usize = 4 * 1024 * 1024;
-const DESC_TABLE: u64 = 0x1000;
-const AVAIL_RING: u64 = 0x2000;
-const USED_RING: u64 = 0x3000;
+pub const DESC_TABLE: u64 = 0x1000;
+pub const AVAIL_RING: u64 = 0x2000;
+pub const USED_RING: u64 = 0x3000;
 const BUFFER_AREA: u64 = 0x10000;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
@@ -77,8 +77,13 @@ impl GuestDriver {
     pub fn new() -> Self {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)])
             .expect("map fake guest memory");
+        Self::with_memory(Arc::new(mem))
+    }
+
+    /// Lay the queue out in memory someone else owns, such as a VM's RAM.
+    pub fn with_memory(mem: SharedGuestMemory) -> Self {
         Self {
-            mem: Arc::new(mem),
+            mem,
             next_desc: 0,
             next_avail: 0,
             next_buffer: BUFFER_AREA,

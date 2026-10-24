@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use api::instance_info::{InstanceInfo, VmState};
 use api::{ApiError, ApiResult, Reply, VmmCommand, VmmRequest};
-use logger::{info_unlimited, warn_unlimited};
+use logger::{error_unlimited, info_unlimited, warn_unlimited};
 use tokio::select;
 
 use crate::devices::DeviceExit;
@@ -68,34 +68,25 @@ impl Vm {
     }
 }
 
-pub(crate) fn vm_from_state(state: VmState, machine: Machine) -> Vm {
-    match state {
-        VmState::Running => Vm::Running(machine),
-        VmState::Paused => Vm::Paused(machine),
-        VmState::NotStarted => Vm::Running(machine),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Operation: an in-flight lifecycle action that exclusively owns the Machine.
 // ---------------------------------------------------------------------------
 
 /// The result returned by an operation future when it completes.
+///
+/// By then the operation has already answered the request that started it.
 pub(crate) struct OperationCompletion {
-    /// The Machine handed back so the Controller can wrap it in a Vm again.
-    pub machine: Machine,
-    /// The Vm state to set on success.
-    pub target_state: VmState,
-    /// `Ok(())` if the operation succeeded, or an error.
-    pub result: anyhow::Result<()>,
+    /// The Vm the Controller goes back to, built by the operation itself.
+    pub vm: Vm,
+    /// What the main loop should do next.
+    pub step: Step,
 }
 
-/// A lifecycle operation in progress. The future exclusively owns the Machine.
+/// A lifecycle operation in progress. The future exclusively owns the Machine
+/// and the reply channel of the request that started it.
 pub(crate) struct Operation {
     /// The future performing the actual work. `'static + !Send`.
     pub future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>>,
-    /// Reply channel for the lifecycle request that started this operation.
-    pub reply: Option<Reply<ApiResult<()>>>,
     /// The sender half -- stored so Shutdown can trigger cancellation.
     pub cancel_tx: Option<oneshot::Sender<()>>,
 }
@@ -131,14 +122,22 @@ impl Step {
 
 /// Events the main loop selects on.
 pub(crate) enum Event {
-    Request(Option<VmmRequest>),
+    Request(VmmRequest),
+    /// Every client has gone away.
+    Detached,
     Machine(MachineEvent),
     Device(DeviceExit),
+}
+
+fn warn_detached() {
+    warn_unlimited!("all VMM clients are gone; control plane detached, VM continues as-is");
 }
 
 // ---------------------------------------------------------------------------
 // Operation constructors for Pause, Resume, Start.
 // ---------------------------------------------------------------------------
+
+const INTERRUPTED: &str = "interrupted by shutdown";
 
 fn make_pause_operation(mut machine: Machine, reply: Reply<ApiResult<()>>) -> (VmState, Operation) {
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -154,23 +153,33 @@ fn make_pause_operation(mut machine: Machine, reply: Reply<ApiResult<()>>) -> (V
                 }
             };
             match outcome {
-                None => OperationCompletion {
-                    machine,
-                    target_state: VmState::Running,
-                    result: Err(anyhow::anyhow!("interrupted by shutdown")),
-                },
-                Some(result) => OperationCompletion {
-                    machine,
-                    target_state: VmState::Paused,
-                    result,
-                },
+                Some(Ok(())) => {
+                    reply.send(Ok(()));
+                    OperationCompletion {
+                        vm: Vm::Paused(machine),
+                        step: Step::Continue,
+                    }
+                }
+                Some(Err(error)) => {
+                    reply.send(Err(ApiError::msg(format!("{error:#}"))));
+                    OperationCompletion {
+                        vm: Vm::Running(machine),
+                        step: Step::error(&error),
+                    }
+                }
+                None => {
+                    reply.send(Err(ApiError::msg(INTERRUPTED)));
+                    OperationCompletion {
+                        vm: Vm::Running(machine),
+                        step: Step::Continue,
+                    }
+                }
             }
         });
     (
         VmState::Running,
         Operation {
             future,
-            reply: Some(reply),
             cancel_tx: Some(cancel_tx),
         },
     )
@@ -193,29 +202,43 @@ fn make_resume_operation(
                 }
             };
             match outcome {
-                None => OperationCompletion {
-                    machine,
-                    target_state: VmState::Paused,
-                    result: Err(anyhow::anyhow!("interrupted by shutdown")),
-                },
-                Some(result) => OperationCompletion {
-                    machine,
-                    target_state: VmState::Running,
-                    result,
-                },
+                Some(Ok(())) => {
+                    reply.send(Ok(()));
+                    OperationCompletion {
+                        vm: Vm::Running(machine),
+                        step: Step::Continue,
+                    }
+                }
+                Some(Err(error)) => {
+                    reply.send(Err(ApiError::msg(format!("{error:#}"))));
+                    OperationCompletion {
+                        vm: Vm::Paused(machine),
+                        step: Step::error(&error),
+                    }
+                }
+                None => {
+                    reply.send(Err(ApiError::msg(INTERRUPTED)));
+                    OperationCompletion {
+                        vm: Vm::Paused(machine),
+                        step: Step::Continue,
+                    }
+                }
             }
         });
     (
         VmState::Paused,
         Operation {
             future,
-            reply: Some(reply),
             cancel_tx: Some(cancel_tx),
         },
     )
 }
 
-fn make_start_operation(machine: Machine, reply: Reply<ApiResult<()>>) -> (VmState, Operation) {
+fn make_start_operation(
+    spec: MachineSpec,
+    machine: Machine,
+    reply: Reply<ApiResult<()>>,
+) -> (VmState, Operation) {
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
         Box::pin(async move {
@@ -229,28 +252,39 @@ fn make_start_operation(machine: Machine, reply: Reply<ApiResult<()>>) -> (VmSta
                 }
             };
             match outcome {
-                None => OperationCompletion {
-                    machine,
-                    target_state: VmState::NotStarted,
-                    result: Err(anyhow::anyhow!("interrupted by shutdown")),
-                },
-                Some(Ok(())) => OperationCompletion {
-                    machine,
-                    target_state: VmState::Running,
-                    result: Ok(()),
-                },
-                Some(Err(error)) => OperationCompletion {
-                    machine,
-                    target_state: VmState::NotStarted,
-                    result: Err(error),
-                },
+                Some(Ok(())) => {
+                    reply.send(Ok(()));
+                    OperationCompletion {
+                        vm: Vm::Running(machine),
+                        step: Step::Continue,
+                    }
+                }
+                Some(Err(error)) => {
+                    if let Err(teardown_error) = machine.teardown().await {
+                        error_unlimited!(
+                            "tear down machine after failed start: {teardown_error:#}"
+                        );
+                    }
+                    reply.send(Err(ApiError::msg(format!("start vCPUs: {error:#}"))));
+                    OperationCompletion {
+                        vm: Vm::NotStarted(spec),
+                        step: Step::Continue,
+                    }
+                }
+                None => {
+                    reply.send(Err(ApiError::msg(INTERRUPTED)));
+                    OperationCompletion {
+                        // The variant only selects teardown; the vCPUs may never have run.
+                        vm: Vm::Running(machine),
+                        step: Step::Continue,
+                    }
+                }
             }
         });
     (
         VmState::NotStarted,
         Operation {
             future,
-            reply: Some(reply),
             cancel_tx: Some(cancel_tx),
         },
     )
@@ -273,16 +307,11 @@ impl Controller {
                 mut operation,
                 stable: _,
             } => {
-                // Cancel the operation and await it to get the machine back.
+                // Cancel the operation and await it to get the Vm back.
                 if let Some(cancel_tx) = operation.cancel_tx.take() {
                     let _ = cancel_tx.send(());
                 }
-                let completion = operation.future.await;
-                // Send error to the lifecycle reply.
-                if let Some(reply) = operation.reply.take() {
-                    reply.send(Err(ApiError::msg("interrupted by shutdown")));
-                }
-                completion.machine.teardown().await
+                operation.future.await.vm.teardown().await
             }
         }
     }
@@ -294,8 +323,19 @@ impl Controller {
 
 pub(crate) async fn handle_idle(vm: Vm, event: Event, ctx: &ProcessCtx) -> (Controller, Step) {
     let request = match event {
-        Event::Request(Some(request)) => request,
-        Event::Request(None) | Event::Machine(MachineEvent::GuestReset) => {
+        Event::Request(request) => request,
+        Event::Detached => {
+            let step = match vm {
+                // No guest to protect, so the vmm thread need not outlive its clients.
+                Vm::NotStarted(_) => Step::Stop(VmmExitStatus::Ok),
+                Vm::Running(_) | Vm::Paused(_) => {
+                    warn_detached();
+                    Step::Continue
+                }
+            };
+            return (Controller::Idle(vm), step);
+        }
+        Event::Machine(MachineEvent::GuestReset) => {
             return (Controller::Idle(vm), Step::Stop(VmmExitStatus::Ok));
         }
         Event::Machine(MachineEvent::VcpuFailed { index, error }) => {
@@ -364,7 +404,7 @@ pub(crate) async fn handle_idle(vm: Vm, event: Event, ctx: &ProcessCtx) -> (Cont
                     .and_then(|plan| build(plan, &ctx.kvm_ctx));
                 match result {
                     Ok(machine) => {
-                        let (stable, operation) = make_start_operation(machine, reply);
+                        let (stable, operation) = make_start_operation(spec, machine, reply);
                         (Controller::Busy { stable, operation }, Step::Continue)
                     }
                     Err(error) => {
@@ -424,7 +464,9 @@ pub(crate) enum BusyAction {
 /// What the main loop observed while Busy.
 pub(crate) enum BusyEvent {
     Completion(Box<OperationCompletion>),
-    Request(Option<VmmRequest>),
+    Request(VmmRequest),
+    /// Every client has gone away.
+    Detached,
 }
 
 /// Subset of [`ProcessCtx`] fields that the busy handler needs. Avoids
@@ -448,20 +490,9 @@ impl<'a> From<&'a ProcessCtx> for BusyCtx<'a> {
 pub(crate) fn handle_busy_request(
     stable: VmState,
     mut operation: Operation,
-    request: Option<VmmRequest>,
+    request: VmmRequest,
     ctx: &BusyCtx<'_>,
 ) -> BusyAction {
-    let request = match request {
-        Some(r) => r,
-        None => {
-            // All clients dropped. Cancel the operation.
-            if let Some(cancel_tx) = operation.cancel_tx.take() {
-                let _ = cancel_tx.send(());
-            }
-            return BusyAction::Shutdown(operation);
-        }
-    };
-
     match request {
         VmmRequest::GetInstanceInfo(_, reply) => {
             reply.send(InstanceInfo {
@@ -511,30 +542,9 @@ fn reject_busy_request(request: VmmRequest) {
     }
 }
 
-/// Complete an operation: transition back to Idle, send the reply.
-pub(crate) fn complete_operation(
-    stable: VmState,
-    mut operation: Operation,
-    completion: OperationCompletion,
-) -> (Controller, Step) {
-    let reply = operation.reply.take();
-    match completion.result {
-        Ok(()) => {
-            let vm = vm_from_state(completion.target_state, completion.machine);
-            if let Some(reply) = reply {
-                reply.send(Ok(()));
-            }
-            (Controller::Idle(vm), Step::Continue)
-        }
-        Err(error) => {
-            let vm = vm_from_state(stable, completion.machine);
-            let step = Step::error(&error);
-            if let Some(reply) = reply {
-                reply.send(Err(ApiError::msg(format!("{error:#}"))));
-            }
-            (Controller::Idle(vm), step)
-        }
-    }
+/// Complete an operation: transition back to Idle with the Vm it produced.
+pub(crate) fn complete_operation(completion: OperationCompletion) -> (Controller, Step) {
+    (Controller::Idle(completion.vm), completion.step)
 }
 
 /// Handle one event while the Controller is Busy.
@@ -545,7 +555,11 @@ pub(crate) async fn handle_busy(
     ctx: &BusyCtx<'_>,
 ) -> (Controller, Step) {
     match event {
-        BusyEvent::Completion(completion) => complete_operation(stable, operation, *completion),
+        BusyEvent::Completion(completion) => complete_operation(*completion),
+        BusyEvent::Detached => {
+            warn_detached();
+            (Controller::Busy { stable, operation }, Step::Continue)
+        }
         BusyEvent::Request(request) => {
             match handle_busy_request(stable.clone(), operation, request, ctx) {
                 BusyAction::Continue(op) => (
@@ -555,13 +569,12 @@ pub(crate) async fn handle_busy(
                     },
                     Step::Continue,
                 ),
-                BusyAction::Shutdown(mut op) => {
+                BusyAction::Shutdown(op) => {
                     let completion = op.future.await;
-                    if let Some(reply) = op.reply.take() {
-                        reply.send(Err(ApiError::msg("interrupted by shutdown")));
-                    }
-                    let vm = vm_from_state(stable, completion.machine);
-                    (Controller::Idle(vm), Step::Stop(VmmExitStatus::Ok))
+                    (
+                        Controller::Idle(completion.vm),
+                        Step::Stop(VmmExitStatus::Ok),
+                    )
                 }
             }
         }
@@ -574,12 +587,15 @@ pub(crate) async fn handle_busy(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use api::RawVmmOp;
     use api::instance_info::GetInstanceInfo;
     use api::lifecycle::{Pause, Shutdown};
     use api::machine::{MemorySizeMib, SetMemory};
 
     use super::*;
+    use crate::KvmContext;
 
     #[test]
     fn shutdown_reply_means_request_accepted() {
@@ -593,7 +609,8 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Controller unit tests using controllable futures (no KVM required).
+    // Controller unit tests using controllable futures (no guest required;
+    // idle handling takes a whole ProcessCtx, which opens /dev/kvm).
     // ------------------------------------------------------------------
 
     fn test_busy_ctx() -> BusyCtx<'static> {
@@ -604,52 +621,51 @@ mod tests {
         }
     }
 
-    /// Create a pending operation with a controllable completion channel.
-    fn mock_operation(
-        stable: VmState,
-    ) -> (VmState, Operation, oneshot::Sender<OperationCompletion>) {
-        let (completion_tx, completion_rx) = oneshot::channel();
-        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
-        let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
-            Box::pin(async move { completion_rx.await.unwrap() });
-        let (reply_tx, _reply_rx) = oneshot::channel::<ApiResult<()>>();
-        let operation = Operation {
-            future,
-            reply: Some(Reply::from(reply_tx)),
-            cancel_tx: Some(cancel_tx),
-        };
-        (stable, operation, completion_tx)
+    fn test_process_ctx() -> Option<ProcessCtx> {
+        if !Path::new("/dev/kvm").exists() {
+            return None;
+        }
+        Some(ProcessCtx {
+            id: "test-id".into(),
+            version: "test-version".into(),
+            kvm_ctx: KvmContext::from_dev_path("/dev/kvm").unwrap(),
+            update_logger: |_| Ok(()),
+        })
     }
 
-    /// Helper: create an Operation with a proper reply channel the test can observe.
-    fn mock_operation_with_reply(
-        stable: VmState,
-    ) -> (
-        VmState,
+    /// Create a pending operation with a controllable completion channel, and
+    /// the receiver that observes whether it was cancelled.
+    fn mock_operation() -> (
         Operation,
         oneshot::Sender<OperationCompletion>,
-        oneshot::Receiver<ApiResult<()>>,
+        oneshot::Receiver<()>,
     ) {
         let (completion_tx, completion_rx) = oneshot::channel();
-        let (cancel_tx, _cancel_rx) = oneshot::channel::<()>();
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         let future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>> =
             Box::pin(async move { completion_rx.await.unwrap() });
-        let (reply_tx, reply_rx) = oneshot::channel::<ApiResult<()>>();
         let operation = Operation {
             future,
-            reply: Some(Reply::from(reply_tx)),
             cancel_tx: Some(cancel_tx),
         };
-        (stable, operation, completion_tx, reply_rx)
+        (operation, completion_tx, cancel_rx)
+    }
+
+    /// What a Start whose vCPUs failed to resume completes with.
+    fn not_started() -> OperationCompletion {
+        OperationCompletion {
+            vm: Vm::NotStarted(MachineSpec::default()),
+            step: Step::Continue,
+        }
     }
 
     #[tokio::test(flavor = "local")]
     async fn busy_get_instance_info_returns_stable_state() {
-        let (stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let (operation, _completion_tx, _cancel_rx) = mock_operation();
         let (request, receiver) = GetInstanceInfo.into_vmm_request();
         let ctx = test_busy_ctx();
 
-        let action = handle_busy_request(stable, operation, Some(request), &ctx);
+        let action = handle_busy_request(VmState::Running, operation, request, &ctx);
         assert!(matches!(action, BusyAction::Continue(_)));
 
         let info = receiver.try_recv().unwrap();
@@ -659,11 +675,11 @@ mod tests {
 
     #[tokio::test(flavor = "local")]
     async fn busy_config_request_rejected() {
-        let (stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let (operation, _completion_tx, _cancel_rx) = mock_operation();
         let (request, receiver) = SetMemory(MemorySizeMib(32)).into_vmm_request();
         let ctx = test_busy_ctx();
 
-        let action = handle_busy_request(stable, operation, Some(request), &ctx);
+        let action = handle_busy_request(VmState::Running, operation, request, &ctx);
         assert!(matches!(action, BusyAction::Continue(_)));
 
         let result = receiver.try_recv().unwrap();
@@ -678,11 +694,11 @@ mod tests {
 
     #[tokio::test(flavor = "local")]
     async fn busy_lifecycle_request_rejected() {
-        let (stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let (operation, _completion_tx, _cancel_rx) = mock_operation();
         let (request, receiver) = Pause.into_vmm_request();
         let ctx = test_busy_ctx();
 
-        let action = handle_busy_request(stable, operation, Some(request), &ctx);
+        let action = handle_busy_request(VmState::Running, operation, request, &ctx);
         assert!(matches!(action, BusyAction::Continue(_)));
 
         let result = receiver.try_recv().unwrap();
@@ -697,32 +713,87 @@ mod tests {
 
     #[tokio::test(flavor = "local")]
     async fn busy_shutdown_replies_ok_and_signals_cancel() {
-        let (_stable, operation, _completion_tx) = mock_operation(VmState::Running);
+        let (operation, _completion_tx, cancel_rx) = mock_operation();
         let (request, receiver) = Shutdown.into_vmm_request();
         let ctx = test_busy_ctx();
 
-        let action = handle_busy_request(VmState::Running, operation, Some(request), &ctx);
+        let action = handle_busy_request(VmState::Running, operation, request, &ctx);
         assert!(matches!(action, BusyAction::Shutdown(_)));
 
         let result = receiver.try_recv().unwrap();
         assert_eq!(result, Ok(()));
+        assert_eq!(cancel_rx.try_recv(), Ok(()));
     }
 
     #[tokio::test(flavor = "local")]
-    async fn client_disconnect_during_busy_triggers_cancel() {
-        let (_stable, operation, _completion_tx) = mock_operation(VmState::Running);
+    async fn client_disconnect_during_busy_lets_the_operation_complete() {
+        let (operation, completion_tx, cancel_rx) = mock_operation();
         let ctx = test_busy_ctx();
 
-        let action = handle_busy_request(VmState::Running, operation, None, &ctx);
-        assert!(matches!(action, BusyAction::Shutdown(_)));
+        let (controller, step) =
+            handle_busy(VmState::Running, operation, BusyEvent::Detached, &ctx).await;
+        assert!(matches!(step, Step::Continue));
+        let Controller::Busy {
+            stable,
+            mut operation,
+        } = controller
+        else {
+            panic!("losing every client abandoned the operation");
+        };
+        assert_eq!(cancel_rx.try_recv(), Err(oneshot::TryRecvError::Empty));
+
+        completion_tx.send(not_started()).unwrap();
+        let completion = (&mut operation.future).await;
+        let (controller, step) = handle_busy(
+            stable,
+            operation,
+            BusyEvent::Completion(Box::new(completion)),
+            &ctx,
+        )
+        .await;
+        assert!(matches!(step, Step::Continue));
+        assert!(matches!(controller, Controller::Idle(Vm::NotStarted(_))));
     }
 
     #[tokio::test(flavor = "local")]
-    async fn operation_reply_delivered_on_drop() {
-        let (_stable, operation, _completion_tx, _reply_rx) =
-            mock_operation_with_reply(VmState::Running);
+    async fn failed_start_completion_leaves_an_idle_not_started_vm() {
+        let Some(ctx) = test_process_ctx() else {
+            return;
+        };
+        let (operation, _completion_tx, _cancel_rx) = mock_operation();
 
-        // Just verify the reply channel is set.
-        assert!(operation.reply.is_some());
+        let (controller, step) = handle_busy(
+            VmState::NotStarted,
+            operation,
+            BusyEvent::Completion(Box::new(not_started())),
+            &BusyCtx::from(&ctx),
+        )
+        .await;
+        assert!(matches!(step, Step::Continue));
+        let Controller::Idle(vm) = controller else {
+            panic!("controller stayed busy after the operation completed");
+        };
+
+        let (request, receiver) = GetInstanceInfo.into_vmm_request();
+        let (controller, step) = handle_idle(vm, Event::Request(request), &ctx).await;
+        assert!(matches!(step, Step::Continue));
+        assert!(matches!(controller, Controller::Idle(Vm::NotStarted(_))));
+        assert_eq!(receiver.try_recv().unwrap().state, VmState::NotStarted);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn client_disconnect_before_start_stops_the_vmm() {
+        let Some(ctx) = test_process_ctx() else {
+            return;
+        };
+
+        let (controller, step) = handle_idle(
+            Vm::NotStarted(MachineSpec::default()),
+            Event::Detached,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(step, Step::Stop(VmmExitStatus::Ok)));
+        assert!(matches!(controller, Controller::Idle(Vm::NotStarted(_))));
     }
 }
