@@ -662,6 +662,8 @@ mod tests {
 
         // Quiesce.
         timeout(TEST_TIMEOUT, devices.quiesce()).await.unwrap();
+        // Ticks queued before the quiesce must not count as progress after resume.
+        while tick_rx.try_recv().is_ok() {}
         let at_quiesce = counter.get();
 
         // Settle to prove the future is no longer polled.
@@ -722,6 +724,8 @@ mod tests {
             .unwrap();
 
         timeout(TEST_TIMEOUT, devices.quiesce()).await.unwrap();
+        // Ticks queued before the quiesce must not count as progress after resume.
+        while tick_rx.try_recv().is_ok() {}
         let at_quiesce = counter.load(Ordering::Relaxed);
 
         settle().await;
@@ -851,6 +855,7 @@ mod tests {
         // Double quiesce should not hang.
         timeout(TEST_TIMEOUT, devices.quiesce()).await.unwrap();
         timeout(TEST_TIMEOUT, devices.quiesce()).await.unwrap();
+        while tick_rx.try_recv().is_ok() {}
 
         // Double resume should not hang.
         timeout(TEST_TIMEOUT, devices.resume()).await.unwrap();
