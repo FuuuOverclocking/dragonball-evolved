@@ -41,7 +41,7 @@ pub struct KvmContext {
 impl KvmContext {
     pub fn from_dev_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let kvm = Self::check_and_oepn(path)?;
+        let kvm = Self::check_and_open(path)?;
 
         let api_version = kvm.get_api_version();
         if api_version != KVM_API_VERSION as i32 {
@@ -81,7 +81,7 @@ impl KvmContext {
         })
     }
 
-    fn check_and_oepn(path: &Path) -> Result<Kvm> {
+    fn check_and_open(path: &Path) -> Result<Kvm> {
         let metadata = path
             .metadata()
             .with_context(|| format!("stat KVM device {}", path.display()))?;
