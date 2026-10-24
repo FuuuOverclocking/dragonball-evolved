@@ -181,7 +181,7 @@ pub fn rebuild(snapshot: MachineSnapshot, context: &KvmContext) -> Result<Machin
             plan.spec.cpus
         );
     }
-    if memory::regions(&memory) != plan.memory.regions {
+    if memory::describe(&memory).as_ref() != Some(&plan.memory) {
         bail!("the snapshot's guest memory does not match its plan");
     }
 
@@ -252,6 +252,7 @@ mod tests {
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
         let plan = MemoryPlan {
+            backing: api::machine::MemoryBacking::Anonymous,
             regions: ram_regions(16 << 20).unwrap(),
         };
         let vm = KvmVm::new(&context, memory::create(&plan).unwrap()).unwrap();

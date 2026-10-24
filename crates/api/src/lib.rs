@@ -44,6 +44,10 @@ define_schema! {
             config: ".machine.memory_mib";
             route: PUT /v1/machine/memory-mib;
         }
+        machine::SetMemoryBacking -> ApiResult<()> {
+            config: ".machine.memory_backing";
+            route: PUT /v1/machine/memory-backing;
+        }
         machine::SetConsole -> ApiResult<()> {
             config: ".machine.console";
             route: PUT /v1/machine/console;
@@ -92,6 +96,11 @@ mod tests {
                 "/v1/machine/memory-mib",
             ),
             (
+                "SetMemoryBacking",
+                Some(".machine.memory_backing"),
+                "/v1/machine/memory-backing",
+            ),
+            (
                 "SetConsole",
                 Some(".machine.console"),
                 "/v1/machine/console",
@@ -119,6 +128,7 @@ mod tests {
             "machine": {
                 "cpus": 2,
                 "memory_mib": 1024,
+                "memory_backing": "shared",
                 "console": "stdio",
                 "kernel": { "path": "/test/kernel" },
                 "disks": [
@@ -138,6 +148,7 @@ mod tests {
             vec![
                 json!({ "set-cpus": 2 }),
                 json!({ "set-memory": 1024 }),
+                json!({ "set-memory-backing": "shared" }),
                 json!({ "set-console": "stdio" }),
                 json!({ "set-kernel": {
                 "path": "/test/kernel", "cmdline": null, "initrd": null
@@ -212,6 +223,10 @@ mod tests {
             (
                 "memory_mib",
                 generator.subschema_for::<machine::SetMemory>(),
+            ),
+            (
+                "memory_backing",
+                generator.subschema_for::<machine::SetMemoryBacking>(),
             ),
             ("console", generator.subschema_for::<machine::SetConsole>()),
             ("kernel", generator.subschema_for::<boot::SetKernel>()),

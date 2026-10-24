@@ -155,6 +155,7 @@ impl DerefMut for KvmVcpu {
 mod tests {
     use std::path::Path;
 
+    use api::machine::MemoryBacking;
     use vm_memory::{Bytes, GuestAddress};
 
     use super::*;
@@ -183,20 +184,23 @@ mod tests {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let plan = MemoryPlan {
-            regions: ram_regions(16 << 20).unwrap(),
-        };
-        let vm = KvmVm::new(&context, memory::create(&plan).unwrap()).unwrap();
-        let memory = Arc::downgrade(vm.memory());
-        let vcpu = vm.create_vcpu(0).unwrap();
-        let kick = vcpu.try_clone().unwrap();
-        vm.memory().write_obj(0x5au8, GuestAddress(0x1000)).unwrap();
+        for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
+            let plan = MemoryPlan {
+                backing,
+                regions: ram_regions(16 << 20).unwrap(),
+            };
+            let vm = KvmVm::new(&context, memory::create(&plan).unwrap()).unwrap();
+            let memory = Arc::downgrade(vm.memory());
+            let vcpu = vm.create_vcpu(0).unwrap();
+            let kick = vcpu.try_clone().unwrap();
+            vm.memory().write_obj(0x5au8, GuestAddress(0x1000)).unwrap();
 
-        // Each vCPU fd keeps the VM, and so the memory, alive.
-        drop(vm);
-        drop(vcpu);
-        assert!(memory.upgrade().is_some());
-        drop(kick);
-        assert!(memory.upgrade().is_none());
+            // Each vCPU fd keeps the VM, and so the memory, alive.
+            drop(vm);
+            drop(vcpu);
+            assert!(memory.upgrade().is_some());
+            drop(kick);
+            assert!(memory.upgrade().is_none());
+        }
     }
 }

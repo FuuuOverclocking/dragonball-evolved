@@ -26,6 +26,25 @@ pub struct MemorySizeMib(pub u32);
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetMemoryBacking(pub MemoryBacking);
+
+/// What backs guest RAM on the host: `anonymous` private memory, or `shared`
+/// memory with a file descriptor that other processes, such as vhost-user
+/// backends, can map.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum MemoryBacking {
+    #[default]
+    Anonymous,
+    Shared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetConsole(pub ConsoleConfig);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +82,14 @@ mod tests {
             SetMemory(MemorySizeMib(1024))
         );
         assert_eq!(
+            serde_json::to_value(SetMemoryBacking(MemoryBacking::Shared)).unwrap(),
+            json!("shared")
+        );
+        assert_eq!(
+            serde_json::from_value::<SetMemoryBacking>(json!("anonymous")).unwrap(),
+            SetMemoryBacking(MemoryBacking::Anonymous)
+        );
+        assert_eq!(
             serde_json::to_value(SetConsole(ConsoleConfig::Stdio)).unwrap(),
             json!("stdio")
         );
@@ -88,6 +115,9 @@ mod tests {
         for value in [json!("Stdio"), json!("None"), json!({}), json!(null)] {
             assert!(serde_json::from_value::<SetConsole>(value).is_err());
         }
+        for value in [json!("Shared"), json!("memfd"), json!({}), json!(null)] {
+            assert!(serde_json::from_value::<SetMemoryBacking>(value).is_err());
+        }
     }
 
     #[cfg(feature = "schema")]
@@ -103,5 +133,8 @@ mod tests {
         let console = schemars::schema_for!(SetConsole).to_value();
         assert_eq!(console["type"], "string");
         assert_eq!(console["enum"], json!(["stdio", "none"]));
+        let backing = schemars::schema_for!(SetMemoryBacking).to_value();
+        assert_eq!(backing["type"], "string");
+        assert_eq!(backing["enum"], json!(["anonymous", "shared"]));
     }
 }

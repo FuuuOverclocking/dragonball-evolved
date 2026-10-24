@@ -68,6 +68,7 @@ impl MachinePlan {
     pub fn new(spec: MachineSpec, host: &HostCapabilities) -> Result<Self> {
         spec.validate(host)?;
         let memory = MemoryPlan {
+            backing: spec.memory_backing,
             regions: ram_regions(u64::from(spec.memory_mib) << 20)?,
         };
         let mut cmdline = Cmdline::new(CMDLINE_MAX_SIZE)?;

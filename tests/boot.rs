@@ -110,6 +110,29 @@ fn pvh_module_list_points_to_loaded_initrd() {
 }
 
 #[test]
+fn configuration_boots_a_guest_on_shared_memory() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let kernel = elf::TempFile::new(&elf::image(&elf::serial_reset_payload(false), true));
+    let config = elf::TempFile::new(
+        &serde_json::to_vec(&serde_json::json!({ "machine": {
+            "memory_mib": 16,
+            "memory_backing": "shared",
+            "kernel": { "path": kernel.path() }
+        }}))
+        .unwrap(),
+    );
+    let output = run_config(config.path(), Duration::from_secs(5));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("DBE_BOOT_OK"));
+}
+
+#[test]
 #[ignore = "requires DBE_KERNEL and optionally DBE_INITRD/DBE_ROOTFS"]
 fn linux_pvh_smoke_boot() {
     let kernel = std::env::var_os("DBE_KERNEL").expect("set DBE_KERNEL to a PVH vmlinux");

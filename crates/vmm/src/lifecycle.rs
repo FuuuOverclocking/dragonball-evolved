@@ -383,6 +383,11 @@ pub(crate) async fn handle_idle(vm: Vm, event: Event, ctx: &ProcessCtx) -> (Cont
             reply.send(result);
             (Controller::Idle(next), Step::Continue)
         }
+        VmmRequest::SetMemoryBacking(value, reply) => {
+            let (next, result) = vm.configure(VmmCommand::SetMemoryBacking(value, ()));
+            reply.send(result);
+            (Controller::Idle(next), Step::Continue)
+        }
         VmmRequest::SetConsole(value, reply) => {
             let (next, result) = vm.configure(VmmCommand::SetConsole(value, ()));
             reply.send(result);
@@ -529,6 +534,7 @@ fn reject_busy_request(request: VmmRequest) {
     match request {
         VmmRequest::SetCpus(_, reply) => reply.send(Err(error)),
         VmmRequest::SetMemory(_, reply) => reply.send(Err(error)),
+        VmmRequest::SetMemoryBacking(_, reply) => reply.send(Err(error)),
         VmmRequest::SetConsole(_, reply) => reply.send(Err(error)),
         VmmRequest::SetKernel(_, reply) => reply.send(Err(error)),
         VmmRequest::AddDisk(_, reply) => reply.send(Err(error)),

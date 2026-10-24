@@ -481,6 +481,7 @@ mod tests {
 
     fn test_vm(context: &KvmContext) -> Arc<KvmVm> {
         let plan = MemoryPlan {
+            backing: api::machine::MemoryBacking::Anonymous,
             regions: ram_regions(16 << 20).unwrap(),
         };
         KvmVm::new(context, memory::create(&plan).unwrap()).unwrap()

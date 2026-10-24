@@ -5,7 +5,10 @@ use anyhow::{Result, bail};
 use api::VmmCommand;
 use api::block::AddDisk;
 use api::boot::{KernelConfig, SetKernel};
-use api::machine::{ConsoleConfig, MemorySizeMib, SetConsole, SetCpus, SetMemory, VcpuCount};
+use api::machine::{
+    ConsoleConfig, MemoryBacking, MemorySizeMib, SetConsole, SetCpus, SetMemory, SetMemoryBacking,
+    VcpuCount,
+};
 
 use crate::arch::x86_64::layout::ram_regions;
 use crate::kvm_context::HostCapabilities;
@@ -14,6 +17,7 @@ use crate::kvm_context::HostCapabilities;
 pub struct MachineSpec {
     pub cpus: u8,
     pub memory_mib: u32,
+    pub memory_backing: MemoryBacking,
     pub console: ConsoleConfig,
     pub kernel: Option<KernelConfig>,
     pub devices: Vec<DeviceSpec>,
@@ -47,6 +51,7 @@ impl Default for MachineSpec {
         Self {
             cpus: 1,
             memory_mib: 128,
+            memory_backing: MemoryBacking::Anonymous,
             console: ConsoleConfig::Stdio,
             kernel: None,
             devices: Vec::new(),
@@ -76,6 +81,9 @@ impl MachineSpec {
                     bail!("guest memory size must be non-zero");
                 }
                 next.memory_mib = size;
+            }
+            VmmCommand::SetMemoryBacking(SetMemoryBacking(value), ()) => {
+                next.memory_backing = value;
             }
             VmmCommand::SetConsole(SetConsole(value), ()) => next.console = value,
             VmmCommand::SetKernel(SetKernel(value), ()) => {

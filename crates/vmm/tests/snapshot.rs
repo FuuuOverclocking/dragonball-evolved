@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::boot::KernelConfig;
-use api::machine::ConsoleConfig;
+use api::machine::{ConsoleConfig, MemoryBacking};
 use common::guest::{
     AVAIL_RING, DESC_TABLE, GuestDriver, SECTOR_SIZE, Segment, USED_RING, VIRTIO_BLK_S_OK,
     VIRTIO_BLK_T_IN,
@@ -47,6 +47,7 @@ fn spec(kernel: &Path, devices: Vec<DeviceSpec>) -> MachineSpec {
     MachineSpec {
         cpus: 1,
         memory_mib: 16,
+        memory_backing: MemoryBacking::Anonymous,
         console: ConsoleConfig::None,
         kernel: Some(KernelConfig {
             path: kernel.into(),
@@ -137,7 +138,8 @@ async fn read_sector(guest: &mut GuestDriver, bus: &Bus, base: u64, sector: u64)
 }
 
 /// A register-incrementing guest keeps running across capture, teardown,
-/// rebuild and resume: rax is past its captured value afterwards.
+/// rebuild and resume, on either memory backing: rax is past its captured value
+/// afterwards.
 #[tokio::test(flavor = "local")]
 async fn register_increment_round_trip_on_kvm() {
     if !Path::new("/dev/kvm").exists() {
@@ -145,28 +147,33 @@ async fn register_increment_round_trip_on_kvm() {
     }
     let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
     let kernel = elf::TempFile::new(&elf::image(&inc_eax_payload(), true));
-    let mut machine = build_machine(spec(kernel.path(), Vec::new()), &context);
+    for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
+        let mut spec = spec(kernel.path(), Vec::new());
+        spec.memory_backing = backing;
+        let mut machine = build_machine(spec, &context);
 
-    machine.vcpus.as_ref().unwrap().resume().await.unwrap();
-    time::sleep(Duration::from_millis(50)).await;
-    machine.pause().await.unwrap();
-    let snap = snapshot::capture(&machine).unwrap();
-    let rax_before = snap.vcpus[0].regs.rax;
-    assert!(rax_before > 0, "guest did not execute (rax = {rax_before})");
+        machine.vcpus.as_ref().unwrap().resume().await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        machine.pause().await.unwrap();
+        let snap = snapshot::capture(&machine).unwrap();
+        assert_eq!(snap.plan.memory.backing, backing);
+        let rax_before = snap.vcpus[0].regs.rax;
+        assert!(rax_before > 0, "guest did not execute (rax = {rax_before})");
 
-    // The snapshot's memory Arc keeps the guest RAM mapped across the teardown.
-    machine.teardown().await.unwrap();
-    let mut restored = rebuild(snap, &context).unwrap();
+        // The snapshot's memory Arc keeps the guest RAM mapped across the teardown.
+        machine.teardown().await.unwrap();
+        let mut restored = rebuild(snap, &context).unwrap();
 
-    restored.vcpus.as_ref().unwrap().resume().await.unwrap();
-    time::sleep(Duration::from_millis(50)).await;
-    restored.pause().await.unwrap();
-    let rax_after = snapshot::capture(&restored).unwrap().vcpus[0].regs.rax;
-    assert!(
-        rax_after > rax_before,
-        "guest did not advance after rebuild (rax: {rax_before} -> {rax_after})"
-    );
-    restored.teardown().await.unwrap();
+        restored.vcpus.as_ref().unwrap().resume().await.unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        restored.pause().await.unwrap();
+        let rax_after = snapshot::capture(&restored).unwrap().vcpus[0].regs.rax;
+        assert!(
+            rax_after > rax_before,
+            "{backing:?}: guest did not advance after rebuild (rax: {rax_before} -> {rax_after})"
+        );
+        restored.teardown().await.unwrap();
+    }
 }
 
 /// Restore must attach every disk where the plan placed it and reactivate
