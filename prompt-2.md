@@ -1,6 +1,6 @@
 # 下一阶段：内存设施与抽象
 
-这是 Dragonball 开源版本的 Rust 重构（/fuu.code/dragonball-evolved），当前目标为 x86-64 + KVM + Linux。参考 /fuu.code/firecracker（主要）与 /fuu.code/cloud-hypervisor（对照）。
+这是 Dragonball 开源版本的 Rust 重构（/fuu.code/dragonball-evolved），当前目标为 x86-64 + KVM + Linux。参考 .references/firecracker（主要）与 .references/cloud-hypervisor, .references/qemu。
 
 AGENTS.md 中的代码品味与架构约束继续有效。design.md 是设计背景，代码是现状；两者不一致时请指出。
 
