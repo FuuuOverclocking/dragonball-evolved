@@ -1,6 +1,6 @@
 # dragonball-evolved VMM 设计：x86-64 / KVM / Linux guest
 
-> 状态：已批准并实现首阶段代码；已用 PVH Linux 6.6.102 验证启动到 Debian 13 systemd/login。第 1 节的勾选表示范围选择；实际进度见第 14 节。每项有编号（如 `C6`），便于讨论。
+> 状态：首阶段已实现，已用 PVH Linux 6.6.102 验证启动到 Debian 13 systemd/login；其后完成了生命周期控制、状态可提取（同进程 capture / rebuild）、资源账本、guest RAM 所有权与 memfd 后端。第 1 节的勾选表示范围选择；实际进度见第 14 节。每项有编号（如 `C6`），便于讨论。
 > 第 2 节起是按建议项展开的详细设计；修改勾选后，相关章节随之调整。
 >
 > 参考：firecracker 1.18-dev（主要）、cloud-hypervisor（对照）。git 中已删除的 `docs/vmm-architecture.md` 与 blog 系列只作背景参考，不作约束。
@@ -45,9 +45,11 @@
 
 ### B. 内存与 vCPU
 
-- [x] **B1 guest RAM 为匿名私有 mmap**（`MAP_NORESERVE`），每段一个 KVM memslot。
+- [x] **B1 guest RAM 每段一个 KVM memslot**，后端由 `MemoryBacking` 选择，缺省为匿名私有 mmap（`MAP_NORESERVE`），见 §6.7。
+  memslot 编号从 `IdPool<MemSlot>` 分配，上限取 `KVM_CAP_NR_MEMSLOTS`；它是运行期资源，不进 plan，也不进快照。
 - [x] **B2 布局含 32 位 MMIO 空洞 `[3 GiB, 4 GiB)`。** 超过 3 GiB 的 RAM 从 4 GiB 处继续。布局由纯函数 `ram_regions(size)` 给出。
-- [ ] **B3 memfd / hugetlbfs backing。** vhost-user 和跨进程共享内存需要可导出的 backing；快照本身不要求 memfd。backing 在启动时决定。
+- [x] **B3 memfd backing**（`MemoryBacking::Shared`）：每段一个封印的 memfd，`MAP_SHARED` 映射，fd 经 region 的 `FileOffset` 可取得。
+  这是 vhost-user 内存表与跨进程 fd 交接需要的形式；快照本身不要求 memfd。backing 在启动时决定。hugetlbfs 尚未做。
 - [x] **B4 SMP：1–254 个 vCPU**（xAPIC + MP table 的上限，同时受 `KVM_CAP_MAX_VCPUS` 约束）。拓扑固定为 1 socket、每核 1 线程。
 - [ ] **B5 x2APIC 模式（>254 vCPU）/ 可配置拓扑（SMT、多 socket）/ NUMA。**
 - [x] **B6 CPUID 归一化**：以 `KVM_GET_SUPPORTED_CPUID` 为基线，按厂商改写（见 §7.1）。
@@ -111,30 +113,31 @@
 ### E. 生命周期与 API
 
 - [x] **E1 VM 状态 `NotStarted → Running ⇄ Paused → 退出`。**
-  状态是一个拥有所有权的值，在主循环中流转：`vm = vm.handle(event).await`。"该做什么"由对（状态，输入）的穷举 match 决定，副作用随后顺序执行。
+  主循环持有 `Controller`（§4.1）：空闲时它拥有 `Vm`，执行生命周期操作时由操作 future 拥有 `Machine`。"该做什么"由对（状态，输入）的穷举 match 决定，副作用随后顺序执行。
 - [ ] **E2 完整 reducer + `Effect` 枚举 + executor + 完成事件回流**（已删除的 vmm-architecture.md 方案）。
   更彻底，但在当前规模下样板较多；与 E1 二选一。
-- [x] **E3 配置累积为纯数据**：`MachineSpec::apply(op) -> Result<MachineSpec>`；`Start` 时依次执行 `validate → plan → build`。
+- [x] **E3 配置累积为纯数据**：`MachineSpec::apply(op) -> Result<MachineSpec>`；`Start` 时依次执行 `MachinePlan::new`（先 `validate`）→ `build`。
 - [x] **E4 新增/补全 API 操作**（见 §9）：
-  - 配置：`machine.cpus`、`machine.memory_mib`、`machine.console`、`machine.kernel`、`machine.disks[]`（补全 `AddDisk`）；
+  - 配置：`machine.cpus`、`machine.memory_mib`、`machine.memory_backing`、`machine.console`、`machine.kernel`、`machine.disks[]`（补全 `AddDisk`）；
   - 生命周期：`Start / Pause / Resume / Shutdown`，均带 HTTP 路由；
   - `GetInstanceInfo` 反映真实状态。
 - [x] **E5 自动启动**：配置文件含 `machine.kernel` 时，main 在依次下发全部配置命令后，自动发送 `Start`。
-- [x] **E6 API `Shutdown` 为硬停**：收到请求后立即回复 `Ok(())`，表示“已接收”；随后关闭请求入口，并按“停 vCPU → quiesce 设备 → 释放机器”完成拆除。回复不表示机器已经关闭，拆除失败只反映在最终 `VmmExitStatus`。
+- [x] **E6 API `Shutdown` 为硬停**：收到请求后立即回复 `Ok(())`，表示“已接收”；随后关闭请求入口，并按“停 vCPU → 停设备任务 → 释放机器”完成拆除（§4.5）。回复不表示机器已经关闭，拆除失败只反映在最终 `VmmExitStatus`。
 - [x] **E7 退出原因**：
   - guest 复位 → VMM 正常退出；
   - vCPU 内部错误 → VMM 以错误状态退出；
-  - 设备任务失败只记录日志，不停机。
+  - 设备任务失败只记录日志，不停机；
+  - 全部客户端断开：VM 未启动（含断开后 `Start` 失败）→ 正常退出；已启动 → 告警，guest 继续运行。
 - [ ] **E8 真正的 reboot**（guest 复位后在同一进程内重建机器）。
 - [ ] **E9 启动后修改配置 / 热插拔。** 不做时，启动后的配置类请求一律返回错误。
 - [x] **E10 `HandoverState`（热升级）先返回 unsupported。**
 
 ### F. 工程与测试
 
-- [x] **F1 代码全部放在 `crates/vmm` 内**：`arch::x86_64`（纯：无 fd、无 tokio）、`machine`（副作用）、`devices`。
+- [x] **F1 代码全部放在 `crates/vmm` 内**：`arch::x86_64`（纯：无 fd、无 tokio）、`spec` 与 `resources`（纯数据）、`machine`（副作用；其中 plan 为纯）、`devices`。
 - [ ] **F2 把纯 arch 代码拆成独立 crate。** 编译隔离更强，但现阶段边界仍在变化。
 - [x] **F3 新依赖**：`kvm-ioctls 0.25`、`kvm-bindings 0.14`（`fam-wrappers`）、`linux-loader 0.14`（只启用 `elf`；PVH 模块随之提供，没有独立 `pvh` feature）。tokio 不新增特性：控制台走 `AsyncFd`（属于已启用的 `net` 特性）。
-  不引入 `vm-allocator`：布局一次算出，不需要运行时分配器。
+  不引入 `vm-allocator`：资源由自写的值类型池分配（`resources.rs`，§6.6），结果记录在 plan 中，恢复时重放。
 - [x] **F4 纯函数单测**：布局、memmap、MP table（含校验和）、CPUID 归一化、寄存器、transport 状态机、cmdline、`MachineSpec` 校验。
 - [x] **F5 KVM 集成测试**：测试代码现场生成一个 mini PVH ELF（几十字节手写 32 位代码 + Xen note）。
   - 验证内容：32 位入口、`rbx` 指向的 start_info magic、串口输出、i8042 复位退出、pause/resume。
@@ -151,7 +154,7 @@
 - [ ] **G3** 限速接入 API（`TokenBucket` POC 保留，不接线）
 - [ ] **G4** PCI / virtio-pci
 - [ ] **G5** vhost-user / VFIO
-- [ ] **G6** 快照 / 迁移
+- [ ] **G6** 快照持久化（序列化、格式版本）/ 迁移。同进程 capture / rebuild 已实现（§8.8），用来验证状态可提取。
 - [ ] **G7** aarch64
 - [ ] **G8** TUI / GUI
 
@@ -171,7 +174,7 @@
 
 | 边界      | 方向                      | 载体                                            | 备注                       |
 | --------- | ------------------------- | ----------------------------------------------- | -------------------------- |
-| 请求      | main / api → vmm-main     | `mpsc::UnboundedSender<VmmRequest>`             | 已有，请求自带 `Reply`     |
+| 请求      | main / api → vmm-main     | `mpsc::UnboundedSender<VmmRequest>`             | 请求自带 `Reply`；发送端全部 drop 后上报一次 `Detached` |
 | 机器事件  | vcpu-N、i8042 → vmm-main  | `mpsc::UnboundedSender<MachineEvent>`           | 非运行时线程可直接 `send`  |
 | vCPU 控制 | vmm-main → vcpu-N         | `std::sync::mpsc` + `immediate_exit` + SIGRTMIN | 回复用 `oneshot`           |
 | 设备激活  | transport（vcpu-N）→ 设备任务 | `Activator`（已有）                         | 每次激活附带会话结束信号   |
@@ -184,23 +187,36 @@
 ## 3. 纯核与副作用的分界
 
 ```text
-配置类 VmmCommand ──apply──▶ MachineSpec           纯：可比较、可序列化
-MachineSpec + HostCaps ──validate──▶ ValidSpec     纯
-ValidSpec ──plan──▶ MachinePlan                    纯：RAM 区段、设备地址与 GSI、cmdline
-MachinePlan + 内核/initrd ──build──▶ Machine       副作用：ioctl、mmap、fd、线程、任务
+配置类 VmmCommand ──apply──▶ MachineSpec                 纯：可比较
+MachineSpec + HostCaps ──MachinePlan::new──▶ MachinePlan  纯：validate，再定 RAM 区段、设备 grant、cmdline
+MachinePlan + 内核/initrd ──build──▶ Machine             副作用：ioctl、mmap、fd、线程、任务
+暂停的 Machine ──capture──▶ MachineSnapshot              读取：设备、平台、vCPU、VM 状态 + 内存引用
+MachineSnapshot ──rebuild──▶ Machine                     副作用：重放快照里 plan 的 grant，再恢复状态
 ```
 
 - **`HostCaps`**：打开 `/dev/kvm` 时一次性取得的纯数据投影。包括：
-  - API 版本、必需能力、`KVM_CAP_MAX_VCPUS`；
+  - API 版本、必需能力、`KVM_CAP_MAX_VCPUS`、`KVM_CAP_NR_MEMSLOTS`；
   - `KVM_GET_SUPPORTED_CPUID`；
   - 需要透传的宿主 CPUID 叶。
 
   `validate` 与 CPUID 归一化只依赖它，不碰 fd。
-- **`MachinePlan`**：机器的全部布局决定，完全由 `ValidSpec` 推出，构建后不再变化。
+- **`MachinePlan`**：机器的全部布局决定，构建后不再变化。
+
+  ```rust
+  pub struct MachinePlan {
+      pub spec: MachineSpec,
+      pub memory: MemoryPlan,          // backing + 有序不相交的 RAM 区段（§6.7）
+      pub devices: Vec<DevicePlan>,    // guest 探测顺序；每项带自己的 grant（§6.6）
+      pub cmdline: Cmdline,
+  }
+  ```
+
+  `MachinePlan::new` 先 `spec.validate(host)`（没有单独的 `ValidSpec` 类型），再经资源账本为每个设备分配 grant。快照携带 plan；restore 不重新分配，而是用 `plan::replay` 在新账本上 reserve 记录过的 grant 来校验它们。
 - **启动数据**：cmdline、`hvm_start_info`、memmap、modlist、MP table、GDT/IDT 由纯函数生成为一组 `(GuestAddress, Vec<u8>)`，`build` 只负责逐条写入。
   内核本身由 linux-loader 直接加载到 guest memory，这是唯一不经过中间数据的写入。
 - **vCPU 状态**：CPUID、MSR、`kvm_regs`、`kvm_sregs`、`kvm_fpu`、LAPIC 寄存器都由纯函数计算，`build` 只调用对应的 `KVM_SET_*`。
 - **`build` 是直线代码**：按 plan 顺序执行副作用，不含决策逻辑。中途失败时，已创建的资源随 RAII 释放；状态保持 `NotStarted`，错误作为 `Start` 的回复返回。
+- **一条组装路径**：`build` 与 `rebuild` 只在"vCPU 怎样得到初始状态"上不同（配置 vs 恢复），之后共用 `assemble`：挂平台设备与 plan 中的设备，再启动处于 Paused 的 vCPU 线程。
 
 ## 4. 主循环与生命周期
 
@@ -220,14 +236,25 @@ enum Controller {
 
 struct Operation {
     future: Pin<Box<dyn Future<Output = OperationCompletion> + 'static>>,
-    reply: Option<Reply<ApiResult<()>>>,
     cancel_tx: Option<oneshot::Sender<()>>,
 }
 
-enum Event {
-    Request(Option<VmmRequest>),
+struct OperationCompletion {
+    vm: Vm,          // 操作自己决定回到哪个 Vm
+    step: Step,      // Continue / Stop(VmmExitStatus)
+}
+
+enum Event {                              // Idle 时
+    Request(VmmRequest),
+    Detached,                             // 全部客户端已断开
     Machine(MachineEvent),
     Device(DeviceExit),
+}
+
+enum BusyEvent {                          // Busy 时
+    Completion(Box<OperationCompletion>),
+    Request(VmmRequest),
+    Detached,
 }
 
 enum MachineEvent {
@@ -236,26 +263,34 @@ enum MachineEvent {
 }
 ```
 
-`Machine` 拥有一次启动所需的全部运行时资源：`VmFd`、guest memory、两条 Bus、vCPU 句柄、`DeviceManager`（含 io 线程）、`MachineEvent` 接收端。
+`Machine` 拥有一次启动所需的全部运行时资源：`Arc<KvmVm>`（VM fd 与 guest memory，§6.7）、MMIO Bus、平台设备（i8042、COM1）、按 kind 挂上的设备、vCPU 句柄、`DeviceManager`（含 io 线程）、`MachineEvent` 接收端，以及构建它的 `MachinePlan`。
 
 **`Controller`** 是主循环实际持有的顶层状态。`Idle(Vm)` 时，`Vm` 拥有 `Machine`。`Busy` 时，`Machine` 的所有权已移入 `Operation` 的 future 中，外层只记住转入前的 `stable: VmState`（`NotStarted` / `Running` / `Paused`）。
 
 - **Idle**：主循环对机器事件和请求做 `select!`，全部处理逻辑在 `handle_idle` 中穷举。
-- **Busy**：一个生命周期操作（Pause / Resume / Start 的 vCPU resume 阶段）正在进行中。主循环对操作 future 和请求做 biased `select!`。查询与 `UpdateLogger` 仍立即处理；其他写 / 生命周期请求返回错误 `"lifecycle operation in progress"`。`GetInstanceInfo` 返回 `stable` 中记录的前一稳定态。操作完成后带回 `Machine`，Controller 回到 `Idle`。
+- **Busy**：一个生命周期操作（Pause / Resume / Start 的 vCPU resume 阶段）正在进行中。主循环对操作 future 和请求做 biased `select!`。查询与 `UpdateLogger` 仍立即处理；其他写 / 生命周期请求返回错误 `"lifecycle operation in progress"`。`GetInstanceInfo` 返回 `stable` 中记录的前一稳定态。操作完成后带回 `Vm`，Controller 回到 `Idle`。
 
-`Operation` 的 future 是 `'static + !Send` 的 `Pin<Box<dyn Future>>`，因此不需要 tokio `Send` bound，可安全地在 `LocalRuntime` 上 `.await`。`cancel_tx` 用于 Shutdown 时中断操作：发送后，future 内的 `select!` 立即退出并归还 `Machine`。
+`Operation` 的 future 是 `'static + !Send` 的 `Pin<Box<dyn Future>>`，因此不需要 tokio `Send` bound，可安全地在 `LocalRuntime` 上 `.await`。请求方的 `Reply` 由 future 自己持有并发送；`Operation` 只保存 future 与 `cancel_tx`。`cancel_tx` 用于 Shutdown 时中断操作：发送后，future 内的 `select!` 立即退出，向请求方回复 `"interrupted by shutdown"`，并在 `OperationCompletion` 中归还 `Vm`。
 
 ### 4.2 主循环
 
 ```rust
 let mut controller = Controller::new(MachineSpec::default());
-let mut status = 'main: loop {
+let mut status = loop {
     match controller {
         Controller::Idle(mut vm) => {
+            // Start 在全部客户端离开后失败：没有人能再启动它。
+            if server.is_detached() && matches!(vm, Vm::NotStarted(_)) {
+                controller = Controller::Idle(vm);
+                break VmmExitStatus::Ok;
+            }
             let event = select! {
                 biased;
                 event = vm.next_event() => event,
-                request = server.next_request() => Event::Request(request),
+                inbound = server.next_inbound() => match inbound {
+                    Inbound::Request(request) => Event::Request(request),
+                    Inbound::Detached => Event::Detached,
+                },
             };
             let (next, step) = handle_idle(vm, event, &ctx).await;
             match step {
@@ -264,30 +299,18 @@ let mut status = 'main: loop {
             }
         }
         Controller::Busy { stable, mut operation } => {
-            let (next, step) = select! {
+            let event = select! {
                 biased;
-                completion = &mut operation.future => {
-                    complete_operation(stable, operation, completion)
-                }
-                request = server.next_request() => {
-                    match handle_busy_request(stable, operation, request) {
-                        BusyAction::Continue(op) => {
-                            controller = Controller::Busy { stable, operation: op };
-                            continue;
-                        }
-                        BusyAction::Shutdown(mut op) => {
-                            let completion = op.future.await;
-                            // 向生命周期请求者发送中断错误
-                            if let Some(reply) = op.reply.take() { reply.send(Err(..)); }
-                            (Controller::Idle(vm_from_state(stable, completion.machine)),
-                             Step::Stop(VmmExitStatus::Ok))
-                        }
-                    }
-                }
+                completion = &mut operation.future => BusyEvent::Completion(Box::new(completion)),
+                inbound = server.next_inbound() => match inbound {
+                    Inbound::Request(request) => BusyEvent::Request(request),
+                    Inbound::Detached => BusyEvent::Detached,
+                },
             };
+            let (next, step) = handle_busy(stable, operation, event, &BusyCtx::from(&ctx)).await;
             match step {
                 Step::Continue => controller = next,
-                Step::Stop(s) => { controller = next; break 'main s; }
+                Step::Stop(s) => { controller = next; break s; }
             }
         }
     }
@@ -299,16 +322,20 @@ if let Err(error) = controller.teardown().await {
 status
 ```
 
-- **Idle 分支**：机器事件排在请求之前（biased `select!`），guest 已经复位时不再处理排队的请求。`handle_idle` 消费旧 `Vm`、返回新 `Controller`。生命周期请求（Pause / Resume / Start 的 vCPU resume）将 `Machine` 移入 `Operation`，返回 `Controller::Busy`。
-- **Busy 分支**：操作 future 排在请求之前。future 完成时，`complete_operation` 将 `Machine` 交还给 `Vm`，回到 `Idle`。请求到达时，`handle_busy_request` 只处理查询、`UpdateLogger` 和 `Shutdown`，其余返回错误。`Shutdown` 发送 cancel 后返回 `BusyAction::Shutdown`，主循环等待 future 完成，归还 Machine，以 `Idle` 状态进入 teardown。
-- `select!` 的借用在得出 `Event` / completion / request 时已经结束，`handle_*` 消费旧状态、返回新状态，没有 `&mut` 共享。
+- **Idle 分支**：机器事件与设备退出（`machine.tasks.next_exit()`）排在请求之前（biased `select!`），guest 已经复位时不再处理排队的请求。`handle_idle` 消费旧 `Vm`、返回新 `Controller`。生命周期请求（Pause / Resume / Start 的 vCPU resume）将 `Machine` 移入 `Operation`，返回 `Controller::Busy`。
+- **Busy 分支**：两个分支都只产出一个 `BusyEvent`，由 `handle_busy` 穷举：
+  - `Completion` → `complete_operation`：回到 `Idle(completion.vm)`，按 `completion.step` 继续或停止；
+  - `Request` → `handle_busy_request`：查询与 `UpdateLogger` 立即处理；`Shutdown` 发送 cancel、等待 future 归还 `Vm`，再以 `Idle` 进入拆除；其余请求被拒绝；
+  - `Detached` → 告警，操作继续。
+- **请求入口**：`VmmServer::next_inbound()` 在全部发送端 drop 后返回一次 `Detached`，之后永远 pending，主循环不会因为已关闭的入口而空转。断开后，一个未启动的 VM 没有人能再启动：Idle 时直接退出，Busy 中的 `Start` 失败回到 `NotStarted` 时由循环开头的检查退出。
+- `select!` 的借用在得出事件时已经结束，`handle_*` 消费旧状态、返回新状态，没有 `&mut` 共享。
 
 ### 4.3 请求 × 状态
 
 | 请求                                       | NotStarted                             | Running            | Paused             | Busy                          |
 | ------------------------------------------ | -------------------------------------- | ------------------ | ------------------ | ----------------------------- |
-| 配置类（cpus / memory / console / kernel / disk） | `spec.apply(op)`                | 错误：已启动（E9） | 错误：已启动       | 错误：操作进行中              |
-| `Start`                                    | validate → plan → build → Busy(resume) | 错误               | 错误               | 错误：操作进行中              |
+| 配置类（cpus / memory / memory_backing / console / kernel / disk） | `spec.apply(op)`     | 错误：已启动（E9） | 错误：已启动       | 错误：操作进行中              |
+| `Start`                                    | `MachinePlan::new` → build → Busy(vCPU resume)；build 失败则回复错误、保持 NotStarted；resume 失败则拆除机器、回到 NotStarted（可重试） | 错误 | 错误 | 错误：操作进行中 |
 | `Pause`                                    | 错误：未启动                           | → Busy(pause)      | 成功（幂等）       | 错误：操作进行中              |
 | `Resume`                                   | 错误：未启动                           | 成功（幂等）       | → Busy(resume)     | 错误：操作进行中              |
 | `Shutdown`                                 | 回复”已接收”，然后退出                 | 回复”已接收”，然后拆除并退出 | 同左               | 回复”已接收”，cancel → teardown |
@@ -318,13 +345,14 @@ status
 
 不合法的组合直接以错误回复，状态不变。Busy 时的错误回复文本为 `”lifecycle operation in progress”`。
 
-### 4.4 机器事件
+### 4.4 机器事件与客户端断开
 
 | 事件                 | 处理                                    |
 | -------------------- | --------------------------------------- |
 | `GuestReset`         | 拆除，`VmmExitStatus::Ok`（E7）         |
 | `VcpuFailed`         | 拆除，`VmmExitStatus::Error`            |
-| `DeviceExit`         | 记录日志，继续运行                      |
+| `DeviceExit`         | 记录日志，继续运行。已退出的块设备不阻碍 pause（记录为 `Exited`），但 capture 拒绝这台机器（§8.8） |
+| `Detached`           | NotStarted：退出，`Ok`；Running / Paused：告警，guest 继续运行；Busy：告警，操作继续（结果见 §4.2） |
 
 ### 4.5 拆除顺序
 
@@ -334,15 +362,17 @@ status
 
 1. **接收 `Shutdown` 时回复**：立即发送 `Ok(())`，只确认请求已进入停止流程；然后关闭请求入口。
 2. **停 vCPU**：向全部 vCPU 发 `Stop` 并踢出 → `.await` 每个线程的"已退出"通知 → 在 blocking pool 中 `join`。
-3. **停设备**：`devices.stop()`——设置 stop watch，向全部 guest gate 发 `Stop`，`.await` 全部 `DeviceExit`（含 io 线程上的）→ 结束 io 线程。
-4. **drop `Machine`**：Bus 与 transport、ioeventfd/irqfd 注册、`VmFd`。
-5. **释放 guest memory**：最后一个 `Arc` 在这里释放。拆除结果写入最终 `VmmExitStatus`，不再修改已经发送的 Shutdown 回复。
+3. **停设备**：`tasks.stop()`——设置 stop watch，向全部 guest gate 发 `Stop`，`.await` 全部 `DeviceExit`（含 io 线程上的）→ 结束 io 线程。
+4. **drop `Machine`**：Bus 与 transport、ioeventfd/irqfd 注册、vCPU fd、`KvmVm`。
+5. **释放 guest memory**：由所有权结构保证，拆除代码不再手工排序（§6.7）。`KvmVm` 拥有 VM fd 与 memory 且先关 fd；每个 `KvmVcpu`（含踢出用的复制 fd）持有 `Arc<KvmVm>`。所以映射只会在 VM fd 与全部 vCPU fd 关闭之后解除。快照另持有 memory 的 `Arc`，RAM 因此可以跨过源机器的拆除。
+
+拆除结果写入最终 `VmmExitStatus`，不再修改已经发送的 Shutdown 回复。
 
 **从 Busy 状态拆除**（Shutdown 到达时有操作在执行）：
 
 1. **回复 `Ok(())`**：同上。
-2. **Cancel**：发送 `cancel_tx`，操作 future 内的 biased `select!` 立即退出，归还 `Machine`。
-3. **向生命周期请求发送中断错误**：被中断的 Pause / Resume / Start 的 reply 收到 `"interrupted by shutdown"`。
+2. **Cancel**：发送 `cancel_tx`，操作 future 内的 biased `select!` 立即退出。
+3. **向生命周期请求发送中断错误**：future 自己向被中断的 Pause / Resume / Start 回复 `"interrupted by shutdown"`，并在 `OperationCompletion` 中归还 `Vm`。
 4. **Controller 回到 `Idle`**，随后执行上述 Idle 拆除流程。
 
 ## 5. vCPU
@@ -362,7 +392,7 @@ status
 // vcpu-N 线程独占
 struct VcpuRunner {
     index: u8,
-    fd: VcpuFd,
+    fd: KvmVcpu,                     // VcpuFd + Arc<KvmVm>（§6.7）
     pio: Arc<Bus>,
     mmio: Arc<Bus>,
     commands: std::sync::mpsc::Receiver<VcpuCommand>,
@@ -371,10 +401,11 @@ struct VcpuRunner {
 
 // vmm-main 持有
 struct VcpuHandle {
-    kick_fd: VcpuFd,                 // dup 出的 fd，只用于写 immediate_exit
-    thread: JoinHandle<()>,
+    index: u8,
+    kick_fd: Mutex<KvmVcpu>,         // KvmVcpu::try_clone 复制的 fd：写 immediate_exit，暂停时读状态
     commands: std::sync::mpsc::Sender<VcpuCommand>,
-    exited: oneshot::Receiver<()>,   // 线程返回前触发，用于异步 join
+    exited: Option<oneshot::Receiver<()>>,   // 线程返回前触发，用于异步 join
+    thread: Option<JoinHandle<()>>,
 }
 
 enum VcpuCommand {
@@ -386,6 +417,7 @@ enum VcpuCommand {
 
 - 线程名为 `vcpu-N`，以 Paused 状态启动：阻塞在 `commands.recv()`。
 - 发送命令 = `send` + 踢出（B10）。`Vcpus::pause()` 并发等待全部回复。
+- 状态读写：`VcpuHandle::capture_state()` 在 vCPU 暂停时经 kick fd 读取（`get_mp_state` 最先）；`vcpu::restore_state(fd, snapshot)` 按 Firecracker 的顺序写回（§8.8）。
 - SIGRTMIN 的处理函数只做一个 `fence`，进程内经 `Once` 只安装一次，且在第一个 vCPU 线程启动前完成。
 - 其他发往进程的信号（SIGINT、SIGTERM）也可能落到 vCPU 线程，使 `KVM_RUN` 返回 `EINTR`。处理方式与踢出相同：处理命令后继续运行。
 
@@ -444,7 +476,7 @@ Running  ──run_once() → Stop──▶ 线程结束
 | `0x0009_fc00`–`0x000e_0000` | 系统数据区（MP table），memmap 中为 reserved              |
 | `0x0010_0000`               | 高端内存起点；内核按 ELF `p_paddr` 加载（通常为 16 MiB） |
 | 低端 RAM 顶部               | initrd（页对齐）                                         |
-| `0xc000_0000` 起            | virtio-mmio 设备，每个 4 KiB，按顺序分配                 |
+| `0xc000_0000`–`0xc100_0000` | virtio-mmio 窗口（16 MiB，`VIRTIO_MMIO_WINDOW`）：每个设备一个 4 KiB grant，从 `AddressPool` 分配并记在 plan 中（§6.6） |
 | `0xc000_0000`–`0x1_0000_0000` | 32 位 MMIO 空洞（B2）                                  |
 | `0xfec0_0000`               | IOAPIC                                                   |
 | `0xfee0_0000`               | LAPIC                                                    |
@@ -459,7 +491,7 @@ Running  ──run_once() → Stop──▶ 线程结束
 | `0x40`–`0x43`、`0x61` | PIT（内核态，speaker dummy）    | 0            |
 | `0x60`–`0x64`   | i8042（C6）                           | 1（C7 才用） |
 | `0x3f8`–`0x3ff` | COM1（C2）                            | 4            |
-| —               | virtio-mmio 设备，按顺序分配           | 5–23（最多 19 个） |
+| —               | virtio-mmio 设备：从 `LEGACY_GSIS`（`IdPool<Gsi>`）分配，记在 plan 中 | 5–23（最多 19 个） |
 
 ### 6.3 memmap
 
@@ -506,6 +538,58 @@ MP table（A4），按 MP Spec 1.4 生成字节，并计算两处校验和：
 3. 有 initrd 时读入低端 RAM 顶部（页对齐）；放不下则报错。
 4. 由纯函数生成启动数据（§3），一次写入。
 5. 配置 vCPU（§5.1）。
+
+### 6.6 资源账本（`resources.rs`）
+
+```rust
+pub struct GpaRange(std::range::Range<u64>);   // guest 物理地址区间；与 PIO 端口、GSI 用不同类型
+pub struct Gsi(pub u32);
+pub struct MemSlot(pub u32);                    // machine/vm.rs
+
+pub struct AddressPool { /* name, window: GpaRange, allocated: Vec<GpaRange> */ }
+impl AddressPool {
+    pub fn allocate(&self, len: u64, align: u64) -> Result<(GpaRange, Self), ResourceError>;
+    pub fn reserve(&self, range: GpaRange) -> Result<Self, ResourceError>;
+    pub fn release(&self, range: GpaRange) -> Result<Self, ResourceError>;
+}
+pub struct IdPool<T> { /* name, ids: RangeInclusive<T>, allocated */ }   // allocate / reserve / release，同上
+
+pub struct ResourceBook { pub virtio_mmio: AddressPool, pub legacy_gsi: IdPool<Gsi> }
+pub struct VirtioMmioGrant { pub mmio: GpaRange, pub gsi: Gsi }          // machine/plan.rs
+```
+
+- **值类型**：每次分配返回结果与新的池，旧值不变；失败时调用方手中的旧账本仍然有效，不需要回滚。
+- **plan 记录 grant**：`MachinePlan::new` 经账本为每个设备分配 `VirtioMmioGrant`，记在 `DevicePlan` 中；账本本身不保存。
+- **恢复时重放，不重算**：`plan::replay` 在 `resource_book()` 给出的新账本上逐个 `reserve` 记录的 grant。重叠或越出窗口的 grant 在挂任何设备之前就被拒绝，设备随后挂在记录的位置，而不是按 spec 重新排出的位置。
+- **memslot** 由 `KvmVm::new` 从 `IdPool<MemSlot>` 分配（上限 `KVM_CAP_NR_MEMSLOTS`），只属于运行期，不进 plan 与快照。
+- 窗口与池的范围是 arch 数据：`layout::VIRTIO_MMIO_WINDOW`（编译期断言它止于 IOAPIC 之下）、`layout::LEGACY_GSIS`。
+
+### 6.7 guest RAM：plan、后端与所有权
+
+```rust
+pub struct MemoryPlan {
+    pub backing: MemoryBacking,      // Anonymous（缺省）| Shared
+    pub regions: Vec<GpaRange>,      // 有序、不相交；属于 guest ABI，快照记录、恢复照搬
+}
+pub fn create(plan: &MemoryPlan) -> Result<SharedGuestMemory>;
+pub fn describe(memory: &GuestMemoryMmap) -> Option<MemoryPlan>;   // 实际映射出的 plan
+
+pub struct KvmVm {
+    fd: VmFd,                        // 先声明，先关闭
+    memory: SharedGuestMemory,
+}
+impl KvmVm {
+    pub fn new(context: &KvmContext, memory: SharedGuestMemory) -> Result<Arc<Self>>; // TSS、irqchip、PIT2、memslot
+    pub fn create_vcpu(self: &Arc<Self>, index: u8) -> Result<KvmVcpu>;
+}
+pub struct KvmVcpu { fd: VcpuFd, vm: Arc<KvmVm> }   // Deref<Target = VcpuFd>；try_clone 给踢出用
+```
+
+- **后端**：
+  - `Anonymous`：`MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`。
+  - `Shared`：每段一个 memfd（`MFD_CLOEXEC | MFD_ALLOW_SEALING`，内核支持时加 `MFD_NOEXEC_SEAL`，6.3 之前的内核拒绝该标志则去掉重试），封印 `SHRINK | GROW | SEAL`，以 `MAP_SHARED | MAP_NORESERVE` 映射；fd 经 region 的 `FileOffset` 取得。
+- **所有权**："映射只在 VM fd 与全部 vCPU fd 关闭之后解除"由类型保证，而不是靠拆除代码的顺序。KVM 在任一 vCPU fd 打开时保持 VM 存活，所以每个 `KvmVcpu`（含复制的 fd）持有 `Arc<KvmVm>`；`KvmVm` 内 fd 先于 memory 声明。两处 unsafe（`set_user_memory_region`、`create_vcpu_from_rawfd`）只出现在 `machine/vm.rs`。
+- **快照与恢复**：快照持有 memory 的另一个 `Arc`。`rebuild` 先用 `describe` 核对快照中的内存与 `plan.memory` 一致，再交给新的 `KvmVm`。
 
 ## 7. CPUID、MSR、寄存器
 
@@ -627,19 +711,18 @@ vcpu-N ──PIO──▶ Mutex<Serial<IrqTrigger, FifoEvents, ConsoleOut>>
 ```rust
 struct MmioRegs {
     status: u32,
-    device_features_sel: u32,
+    features_sel: u32,
     driver_features_sel: u32,
     driver_features: u64,
     queue_sel: u32,
     queues: Vec<QueueRegs>,      // size / ready / desc / avail / used
-    config_generation: u32,
 }
 
-/// 设备的静态描述：类型、特性、各队列最大长度、配置空间。
-struct DeviceDesc { device_type: u32, features: u64, queue_max: Vec<u16>, config: Arc<[u8]> }
+/// 设备提供给 guest 的描述：类型、特性、各队列最大长度、配置空间。
+struct DeviceDesc { device_type: u32, features: u64, queue_max: Vec<u16>, config: Vec<u8> }
 
-fn read(regs: &MmioRegs, dev: &DeviceDesc, irq_status: u32, offset: u64) -> u32;
-fn write(regs: MmioRegs, dev: &DeviceDesc, offset: u64, value: u32) -> (MmioRegs, Option<Transition>);
+fn read(regs: &MmioRegs, desc: &DeviceDesc, irq_status: u32, offset: u64) -> u32;
+fn write(regs: MmioRegs, desc: &DeviceDesc, offset: u64, value: u32) -> (MmioRegs, Option<Transition>);
 
 enum Transition { Activate, Reset, AckInterrupt(u32), Notify(u16) }
 ```
@@ -682,13 +765,29 @@ enum Transition { Activate, Reset, AckInterrupt(u32), Notify(u16) }
   - 一个 `KVM_IRQFD` 对应设备的 GSI；
   - 中断状态 `0x60` 读自 `IrqTrigger` 的原子位，`0x64` 写入时清位。
 - **cmdline**：经 linux-loader 的 `add_virtio_mmio_device` 追加 `virtio_mmio.device=4K@0x<base>:<gsi>`。
+- **快照与恢复**：
+
+  ```rust
+  pub struct MmioTransportSnapshot { pub desc: DeviceDesc, pub regs: MmioRegs, pub interrupt_status: u32 }
+
+  impl MmioTransport {
+      pub fn snapshot(&self) -> MmioTransportSnapshot;
+      /// 后端现在提供的 desc 与快照不同（例如磁盘大小变了）时拒绝。
+      pub fn restore(desc, memory, activator, interrupt, queue_notifiers, snapshot) -> Result<Self>;
+      /// 恢复一个已激活的会话，使 guest 的 reset 能到达它。
+      pub fn inject_session(&self, control: SessionControl);
+  }
+  ```
+
+  快照记录 desc，是因为 guest 驱动在探测时已经读过它并依赖它：restore 不在驱动脚下改变设备。
 
 ### 8.5 virtio-blk（C9、C11）
 
 - **配置空间**：`capacity`（le64，单位为 512 B 扇区）。镜像大小不是 512 的整数倍时，向下取整并告警。
 - **特性**：`VERSION_1`、`FLUSH`（bit 9）；只读盘加 `RO`（bit 5）。队列长度上限 256。
 - **请求**：沿用 POC 的处理（IN / OUT / FLUSH / GET_ID、越界、方向错误、只读、不支持的类型）；每个错误都写入状态字节，不影响设备本身。
-- **根盘**：`root = true` 的盘排在设备列表第一位，因而是 `/dev/vda`，并追加 `root=/dev/vda rw|ro`。至多一个根盘。
+- **根盘**：`root = true` 的盘在 plan 中排第一，因而是 `/dev/vda`，并追加 `root=/dev/vda rw|ro`。至多一个根盘。
+- **id**：`AddDisk` 未给 id 时，`apply` 一次性规范化为 `disk{n}`，之后各阶段不再处理缺省；id 在全部设备中唯一，快照按 id 对应设备状态。
 - **构造拆分**：POC 的 `BlockDevice::new` 在构造时创建 `AsyncEventFd`，要求调用方处在 reactor 中。改为两步：
   1. vmm-main 上创建纯资源（`Send`）：打开的 `File`、队列 `EventFd`、`Arc<IrqTrigger>`、`ActivationRx`；
   2. 工厂闭包在目标线程上把 `EventFd` 包成 `AsyncEventFd`，再运行设备循环。
@@ -699,8 +798,8 @@ enum Transition { Activate, Reset, AckInterrupt(u32), Notify(u16) }
 pub enum Placement { VmmMain, Io }
 
 pub enum DeviceRole {
-    GuestAffecting,   // 块 I/O、串口输入、IRQ 重采样——guest 可观察
-    HostOnly,         // 控制台输出排空——仅宿主可见
+    GuestAffecting,   // 串口输入、IRQ 重采样：guest 可观察，由 gate 冻结
+    HostOnly,         // 不经 gate：控制台输出排空（仅宿主可见），以及自己协作 quiesce 的块设备后端（§8.8）
 }
 
 impl DeviceManager {
@@ -727,8 +826,8 @@ impl DeviceManager {
 
 | 角色              | 说明                              | quiesce 行为       | stop 行为          |
 | ----------------- | --------------------------------- | ------------------ | ------------------ |
-| `GuestAffecting`  | 块 I/O、串口输入、IRQ resample    | 冻结 future        | 终止               |
-| `HostOnly`        | 控制台输出排空                    | 不受影响           | 终止               |
+| `GuestAffecting`  | 串口输入、IRQ resample            | gate 冻结 future   | 终止               |
+| `HostOnly`        | 控制台输出排空；块设备后端        | 不经 gate（块设备由 `Machine` 协作 quiesce） | 终止 |
 
 **gate 机制**：`GuestAffecting` 设备在 spawn 时被包裹在一个 supervisor 函数 `gated(gate_rx, device)` 中。gate 是一个 biased `select!` 循环，不修改原 future：
 
@@ -755,47 +854,52 @@ gate 是纯 supervisor 层控制，不修改也不替换原始 future；quiesce 
 
 **与 Machine 的配合**：
 
-- `Machine::pause()`：先 `vcpus.pause()`（vCPU 暂停保证不再产生新的 I/O 退出），再 `devices.quiesce()`。
-- `Machine::resume()`：先 `devices.resume()`（设备就绪），再 `vcpus.resume()`（guest 可以立即发起 I/O）。
-- `Machine::teardown()`：`vcpus.stop()` → `devices.stop()` → drop Bus / VM / memory。
+- `Machine::pause()`：`vcpus.pause()`（不再产生新的 I/O 退出）→ 每个已挂设备协作 quiesce 并记录自己的状态（块设备：`BlockQuiesced`）→ `tasks.quiesce()`（gate 类任务）。
+- `Machine::resume()`：`tasks.resume()` → 设备 resume（清除记录的状态）→ `vcpus.resume()`（guest 可以立即发起 I/O）。
+- `Machine::teardown()`：`vcpus.stop()` → `tasks.stop()` → drop；内存何时释放由所有权决定（§6.7）。
+
+**按 kind 纵切**：每类设备一个 `machine/<kind>.rs`（目前是 `block.rs`；i8042 与 COM1 合在 `platform.rs`），负责该类设备的 plan、attach（新建或恢复）、quiesce、capture。`DeviceSpec`、`DevicePlan`、`AttachedDevice`、`DeviceSnapshot` 都是按 kind 的 enum：新增一类设备即各加一个变体，由穷举 match 让编译器指出所有要补的地方。
 
 ### 8.8 状态可提取性：capture / rebuild
 
-**MachineSnapshot 纯数据容器**
+**MachineSnapshot**：一次 capture 的全部内容。字段都是普通数据，不加 serde derive（同进程 round-trip 不需要序列化，见 G6），不持有任何内核对象。
 
-`MachineSnapshot` 是一次 capture 的完整快照，所有字段均为普通 struct，不加 serde derive——同进程 round-trip 不需要序列化。
+```rust
+pub struct MachineSnapshot {
+    pub plan: MachinePlan,              // 布局与 grant；rebuild 只需要快照，不再需要 spec
+    pub vm: VmKvmState,                 // irqchip×3（PIC master / slave、IOAPIC）、PIT2、clock
+    pub vcpus: Vec<VcpuSnapshot>,       // mp_state、regs、sregs、XSAVE、xcrs、debug_regs、lapic、CPUID、MSR、vcpu_events
+    pub platform: PlatformSnapshot,     // i8042；COM1（console 为 None 时没有）
+    pub devices: Vec<DeviceSnapshot>,   // plan 顺序；Block(BlockSnapshot { id, transport, queue: Option<QueueState> })
+    pub memory: SharedGuestMemory,      // Arc 引用，同进程共享映射
+}
+```
 
-| 字段 | 内容 |
-| --- | --- |
-| `VmKvmState` | irqchip×3（PIC master、PIC slave、IOAPIC）、PIT、clock |
-| `Vec<VcpuSnapshot>` | 每 vCPU 完整寄存器组：regs、sregs、XSAVE（而非 FPU）、xcrs、debug_regs、lapic、msrs、mp_state、vcpu_events |
-| `DeviceSnapshots` | serial `SerialState`、i8042 `I8042State`、mmio transport `MmioRegs` + `interrupt_status`、block `QueueState` |
-| `SharedGuestMemory` | `Arc` 引用，同进程共享 mmap |
+**Capture 顺序**（机器必须已暂停）：
 
-**Capture 顺序**
+1. **设备**：每个设备在 pause 时已记录自己的状态。capture 拒绝仍在运行的设备（从未 pause 或已 resume：它的队列还在前进），也拒绝已退出的设备（没有状态可取，恢复它会掩盖故障）。设备排在 irqchip 之前：设备完成最后一个请求时发出的中断，应包含在随后读取的中断控制器状态中。
+2. **平台**：i8042、COM1。
+3. **vCPU**：`get_mp_state` 最先（`kvm_apic_accept_events` 有副作用），`get_vcpu_events` 最后。
+4. **VM**：irqchip → PIT → clock。
 
-1. **设备状态先**：block `QueueState` 在 pause 时由设备内部协作导出（见下文）；serial / i8042 / transport 通过 Mutex 读取。
-2. **vCPU 状态**：`get_mp_state` 最先——`kvm_apic_accept_events` 副作用；`get_vcpu_events` 最后。
-3. **VM KVM 状态**：irqchip → PIT → clock 最后。
-4. 理由：设备 capture 可能注入最后一个中断，因此必须在 vCPU 和 VM 状态之前完成。
+**Rebuild 顺序**（只接收 `MachineSnapshot`）：
 
-**Rebuild 顺序**
-
-从 `MachineSnapshot` + `MachineSpec` 重建 `Machine`：
-
-1. `create_vm` + TSS + `create_irq_chip` + `set_irqchip`×3 + `create_pit2` + `set_pit2`。
-2. `memory::register`：使用 snapshot 的 `Arc`，mmap 仍存活。
-3. 重建设备运行时：从 spec 重开文件，新建 fd，注册 ioevent / irqfd；注入纯数据状态。
-4. `create_vcpu` + 恢复寄存器：`set_cpuid2` → `set_mp_state` → regs → sregs → xsave → xcrs → debug_regs → lapic → msrs → `vcpu_events` + `kvmclock_ctrl`。
-5. `set_clock`（最后）。
-6. 重建 `DeviceManager` + spawn 设备任务 + 已激活 transport 的 block 重新 Activation。
+1. **纯校验，先于任何 KVM 对象**：`plan::replay` 校验 grant；`match_devices` 按 id 把设备状态对齐到 plan（缺失、重复、多余都报错）；vCPU 必须恰为 `0..cpus`；`memory::describe(&memory)` 必须等于 `plan.memory`。
+2. `KvmVm::new`（TSS、irqchip、PIT2、memslot）→ `set_irqchip`×3 → `set_pit2`。
+3. 每个 vCPU：`create_vcpu` + `restore_state`：`set_cpuid2` → `set_mp_state` → regs → sregs → xsave → xcrs → debug_regs → lapic → msrs → `vcpu_events`，最后 `kvmclock_ctrl`（失败只告警）。
+4. `set_clock`。
+5. `build::assemble`（与 build 共用）：恢复平台（i8042、COM1，重新接入控制台输入），在记录的 grant 上挂设备，最后启动 Paused 的 vCPU 线程。设备在 vCPU（LAPIC）恢复之后才挂上：恢复出来的设备可能立刻发中断，之后的 LAPIC 恢复会把它覆盖。挂块设备时：
+   - transport 以快照状态恢复；后端的 `DeviceDesc` 与快照不同即拒绝（§8.4）；
+   - 有 `QueueState` 的盘在 attach 时校验队列，注入会话，后端在 io 线程上以该队列重新激活；是否重新激活由后端记录的状态决定，而不是由 transport 的 status 推断；
+   - transport 记录了未确认的中断（`interrupt_status != 0`）时，重新写一次 irqfd。KVM 异步注入 irqfd 写入，capture 读到的 irqchip 可能还不含它；漏掉的话，guest 会一直等一个已经在 used ring 里的完成。重复触发是无害的：level 中断在 remote IRR 置位时不会重复投递。
 
 **Block 内部协作 quiesce**
 
-block 不使用外部 `gated()` supervisor 提取队列状态，而是在 `serve()` 的 `select!` 中处理 quiesce 信号：
+block 不使用外部 `gated()` supervisor，而是在 `serve()` 的 `select!` 中处理 quiesce 请求：
 
-- 设备用 `&mut active` 直接调 `queue.state()` 提取 `QueueState`，通过 reply oneshot 发回。
-- 随后进入 parked 等待 resume，同一 session / queue / limiter 保持完好。
+- 设备用 `&mut` 直接调 `queue.state()` 导出 `QueueState`，经 oneshot 回复 `BlockQuiesced::{Inactive, Active(QueueState), Exited}`（`Exited`：任务已不在，由句柄侧得出）。未激活时，先处理已在途的激活，再响应 quiesce。
+- 随后在 parked 循环中等待 resume，同一 session / queue / limiter 保持完好。
+- `AttachedBlock.state: Option<BlockQuiesced>` 只在 pause 到下一次 resume 之间为 `Some`。已退出的后端记录为 `Exited`：pause 照常完成（局部故障不扩散），capture 拒绝。
 
 **MSR 列表**
 
@@ -823,6 +927,10 @@ define_schema! {
         machine::SetMemory -> ApiResult<()> {
             config: ".machine.memory_mib";
             route: PUT /v1/machine/memory-mib;
+        }
+        machine::SetMemoryBacking -> ApiResult<()> {
+            config: ".machine.memory_backing";
+            route: PUT /v1/machine/memory-backing;
         }
         machine::SetConsole -> ApiResult<()> {
             config: ".machine.console";
@@ -856,13 +964,14 @@ define_schema! {
 | --- | --- | --- | --- |
 | `SetCpus(VcpuCount)` | `VcpuCount(u8)` | 整数 | 1 ≤ n ≤ min(254, `KVM_CAP_MAX_VCPUS`) |
 | `SetMemory(MemorySizeMib)` | `MemorySizeMib(u32)` | 整数，单位 MiB | 非零；放不下内核时在 `Start` 报错 |
+| `SetMemoryBacking(MemoryBacking)` | `MemoryBacking::{Anonymous, Shared}` | `"anonymous"` / `"shared"` | —（§6.7） |
 | `SetConsole(ConsoleConfig)` | `ConsoleConfig::{Stdio, None}` | `"stdio"` / `"none"` | — |
 | `SetKernel(KernelConfig)` | `KernelConfig { path, cmdline, initrd }` | 原有对象 | cmdline 加上追加片段后 ≤ 2 KiB |
-| `AddDisk(BlockDevConfig)` | `BlockDevConfig { id, path, read_only, root }` | 原有对象 | id 唯一；至多一个根盘 |
+| `AddDisk(BlockDevConfig)` | `BlockDevConfig { id, path, read_only, root }` | 原有对象 | id 缺省为 `disk{n}`，在全部设备中唯一；至多一个根盘 |
 | `UpdateLogger(LoggerConfig)` | `LoggerConfig { level, target, ... }` | 原有对象 | 缺省字段保留当前值 |
 | `Start` 等 | 单元结构体 | HTTP body 为空 | 见 §4.3 |
 
-- **默认值**：不配置时，`cpus` = 1、`memory_mib` = 128、`console` = `Stdio`。没有 `machine.kernel` 时，`Start` 报错。
+- **默认值**：不配置时，`cpus` = 1、`memory_mib` = 128、`memory_backing` = `anonymous`、`console` = `Stdio`。没有 `machine.kernel` 时，`Start` 报错。
 - **覆盖规则**：同一配置项重复设置时，后者覆盖前者（`apply` 是纯覆盖）；`AddDisk` 累加。
 - `InstanceInfo.state` 沿用现有的 `VmState`：`NotStarted / Running / Paused`。
 
@@ -872,6 +981,7 @@ define_schema! {
 [machine]
 cpus = 2
 memory_mib = 1024
+memory_backing = "shared"                             # 可选，缺省 "anonymous"
 console = "stdio"
 
 [machine.kernel]
@@ -899,44 +1009,51 @@ root = true
 ```text
 crates/vmm/src/
 ├── lib.rs                 start()、vmm_main 主循环
-├── vmm_server.rs          （已有）
-├── process_ctx.rs         （已有）
-├── exit_status.rs         （已有）
+├── vmm_server.rs          请求入口：next_inbound()（Request / Detached）
+├── process_ctx.rs
+├── exit_status.rs
 ├── kvm_context.rs         /dev/kvm：API 版本、必需能力、HostCaps 投影
-├── lifecycle.rs           Vm 状态与 handle()；请求 × 状态的穷举分派
-├── spec.rs                MachineSpec：apply / validate（纯）
+├── lifecycle.rs           Vm / Controller / Operation；handle_idle、handle_busy
+├── spec.rs                MachineSpec、DeviceSpec：apply / validate（纯）
+├── resources.rs           GpaRange、Gsi、AddressPool、IdPool、ResourceBook（纯，值类型）
 ├── arch/x86_64/           纯：无 fd、无 tokio
-│   ├── layout.rs          地址常量、ram_regions()
+│   ├── layout.rs          地址常量、资源窗口与 GSI 范围、ram_regions()、resource_book()
 │   ├── pvh.rs             start_info / memmap / modlist
 │   ├── mptable.rs         MP table 字节与校验和
 │   ├── cpuid.rs           CPUID 归一化（通用 / Intel / AMD）
 │   ├── regs.rs            PVH regs / sregs / fpu、GDT 编码
 │   ├── msr.rs             boot MSR
 │   └── lapic.rs           LINT0 / LINT1
-├── machine/               副作用侧
-│   ├── plan.rs            MachinePlan：设备地址、GSI、cmdline（纯）
-│   ├── build.rs           按 plan 物化 Machine
-│   ├── memory.rs          guest memory 创建与 memslot 注册
-│   ├── vcpu.rs            VcpuRunner / VcpuHandle / 踢出
+├── machine/               副作用侧（plan 为纯）
+│   ├── plan.rs            MachinePlan、DevicePlan、VirtioMmioGrant；replay
+│   ├── memory.rs          MemoryPlan；create / describe；memfd
+│   ├── vm.rs              KvmVm（VM fd + memory + memslot）、KvmVcpu
+│   ├── build.rs           build、assemble；Machine：pause / resume / teardown
+│   ├── block.rs           块设备纵切：plan / attach / quiesce / capture
+│   ├── platform.rs        i8042 + COM1：attach / capture
+│   ├── snapshot.rs        MachineSnapshot、capture、rebuild
+│   ├── vcpu.rs            VcpuRunner / VcpuHandle / 踢出；capture_state / restore_state
 │   └── bus.rs             不可变 Bus
 └── devices/
-    ├── mod.rs             DeviceManager（已有，增加 Placement）
+    ├── mod.rs             DeviceManager：spawn / spawn_on，quiesce / resume / stop
     ├── io_thread.rs       io 线程
-    ├── async_fd.rs        （已有）
-    ├── rate_limiter.rs    （已有，本阶段不接线）
-    ├── legacy/            serial.rs（已有）、console.rs、i8042.rs
-    └── virtio/            mod.rs、interrupt.rs、block.rs（已有）、mmio.rs
+    ├── async_fd.rs
+    ├── rate_limiter.rs    （本阶段不接线）
+    ├── legacy/            serial.rs、console.rs、i8042.rs
+    └── virtio/            mod.rs（Activation、Session）、interrupt.rs、block.rs、mmio.rs
 ```
 
-主要依赖方向：`arch` ← `machine` ← `lifecycle` ← `lib`。`devices` 只引用 `machine` 中的边界类型 `BusDevice`、`MachineEvent`，不访问机器构建、KVM 或 vCPU 管理。transport 通过 `BusDevice` 接入 Bus。
+主要依赖方向：`resources` ← `arch` ← `spec` / `machine` ← `lifecycle` ← `lib`。`devices` 只引用 `machine` 中的边界类型 `BusDevice`、`MachineEvent`，不访问机器构建、KVM 或 vCPU 管理。transport 通过 `BusDevice` 接入 Bus。
 
 ## 11. 测试（F4–F6）
 
 | 层次           | 内容                                                                                       | 运行条件      |
 | -------------- | ------------------------------------------------------------------------------------------ | ------------- |
-| 纯函数         | `ram_regions`、memmap、MP table（结构与校验和）、CPUID（每张表逐项断言）、GDT 编码、寄存器、MMIO 状态机（合法与非法转移、特性协商、reset）、i8042 状态机、cmdline 拼接、`MachineSpec` 校验 | 任意          |
-| 设备（已有形式） | 沿用 `tests/block.rs`、`tests/serial.rs`：测试扮演 guest 驱动；改为经 transport 激活，覆盖 reset 后重新激活、io 线程放置 | 任意          |
-| KVM 集成       | mini PVH ELF：32 位代码先检查 `[ebx]` 是否等于 start_info magic，再向 COM1 输出 `OK`，最后 `out 0x64, 0xFE`；断言输出与 `GuestReset`。另测 pause/resume、Shutdown 立即确认及后续拆除 | `/dev/kvm`    |
+| 纯函数         | `ram_regions`、memmap、MP table（结构与校验和）、CPUID（每张表逐项断言）、GDT 编码、寄存器、MMIO 状态机（合法与非法转移、特性协商、reset）、i8042 状态机、cmdline 拼接、`MachineSpec` 校验；资源池（分配、对齐、reserve 冲突、release）、plan（根盘排序、grant、`replay`）、快照设备按 id 对齐 | 任意          |
+| 设备（已有形式） | 沿用 `tests/block.rs`、`tests/serial.rs`：测试扮演 guest 驱动；改为经 transport 激活，覆盖 reset 后重新激活、io 线程放置、quiesce / resume | 任意          |
+| 内存           | 两种后端的分段映射与读写；memfd 能看到 guest 写入、拒绝改变大小；guest memory 比 VM 与 vCPU 活得久 | 任意 / `/dev/kvm` |
+| KVM 集成       | mini PVH ELF：32 位代码先检查 `[ebx]` 是否等于 start_info magic，再向 COM1 输出 `OK`，最后 `out 0x64, 0xFE`；断言输出与 `GuestReset`。另测 pause/resume、Shutdown 立即确认及后续拆除、配置文件选择 shared 内存后启动 | `/dev/kvm`    |
+| 快照（`crates/vmm/tests/snapshot.rs`） | 寄存器递增 guest 的 round-trip（两种后端）；plan 顺序与逐盘激活在 rebuild 后保持；修改快照中的 grant 会移动设备；已退出的盘不阻碍 pause 但被 capture 拒绝；运行中的盘被拒绝；磁盘大小变化时拒绝恢复；capture 漏掉的中断在恢复时补发 | `/dev/kvm`    |
 | 真实 Linux     | `#[ignore]`；`DBE_KERNEL`、`DBE_INITRD`、`DBE_ROOTFS`。断言串口出现约定标记，guest `reboot` 后 VMM 以 `Ok` 退出 | PVH 内核      |
 
 ## 12. 实施顺序
@@ -951,6 +1068,13 @@ crates/vmm/src/
 | M4   | virtio-mmio transport、virtio-blk 改造、io 线程                                | 状态机单测 + 设备测试        |
 | M5   | `MachineSpec` / plan / build、生命周期、API 操作、main 自动启动、schema 导出   | 用你的 PVH 内核：initramfs → rootfs |
 | M6   | 收尾：README / 文档、拆除路径与错误信息打磨                                    | `make lint`、`make test`     |
+| L    | 生命周期控制：vCPU 完成屏障、设备 quiesce gate、`Controller` / `Operation`      | Controller 单测 + KVM pause 测试 |
+| S    | 状态可提取：纯数据快照、块设备协作 quiesce、同进程 rebuild                      | 同进程 round-trip            |
+| R1   | 资源账本：值类型的池，plan 记录 grant，restore 重放                             | 池与 plan 单测               |
+| R2   | 设备按 kind 纵切；build 与 rebuild 共用 `assemble`；快照携带 plan               | grant 迁移、逐盘激活的 KVM 测试 |
+| R3   | guest RAM 所有权：`KvmVm` / `KvmVcpu`                                          | 内存比 VM 与 vCPU 活得久     |
+| R4   | memfd 共享后端 + `SetMemoryBacking`                                             | 两种后端的 round-trip 与启动 |
+| R5   | 深度 review 修复                                                                | 新增回归测试（§11）          |
 
 ## 13. 已知限制与风险
 
@@ -962,12 +1086,18 @@ crates/vmm/src/
 - `Start` 在 vmm-main 上同步读取内核与 initrd 文件（D5 的例外）。
 - 控制台 raw mode 下，Ctrl-C 不会终止 VMM。
 - Busy 期间不处理机器事件（`MachineEvent`、`DeviceExit`）：操作 future 独占 Machine，events 和 device exits 的 receiver 在 future 内部不被 poll。操作完成后回到 Idle 时才会在下一轮 select 中处理积压的事件。
-- 同进程 round-trip 已验证；跨进程序列化（含 RAM dump 到文件和格式版本控制）尚未实现。
+- 快照只在同进程内有效：没有序列化与格式版本，RAM 以 `Arc` 共享而不复制；跨进程恢复需要 dump（或交接 memfd）以及 dirty page tracking（G6）。
+- 同一个快照可以在源机器仍存活时 rebuild，结果是两台 VM 共用一块 RAM。应在类型上排除：capture 消费 `Machine`，或 rebuild 要求源机器已拆除。
+- "已暂停"没有类型表示：capture 依赖各设备记录的状态做运行时检查。
+- rebuild 不核对 plan 的内部一致性（例如 cmdline 中的 virtio-mmio 片段与 grant 是否一致）。
+- `Restore.devices` 与 plan 按位置对应（`match_devices` 已按 id 排好序），类型上没有绑定。
+- VM 级状态的恢复顺序（irqchip 与 PIT 先于 vCPU，clock 最后）尚未与 Firecracker 逐项核对。
+- 没有客户端的已暂停 VM 永远不会退出。
+- `Start` 被 Shutdown 取消时以 `Vm::Running` 归还机器，只用于选择拆除路径；其 vCPU 可能从未运行。
 - MSR 列表是硬编码的 17 项；长期应改为 `KVM_GET_MSR_INDEX_LIST` 动态发现。
-- 同进程 round-trip 共享 mmap，不复制 RAM；真正的快照需要 dirty page tracking 或完整 dump。
-- rebuild 与 build 约 60% 重复，可在后续提取共享函数。
 - block quiesce 的 parked loop 中缺少 `session.requested()` 分支（延迟清理，非正确性问题）。
 - rate limiter 的 `Instant` 在暂停期间继续流逝，resume 后第一个窗口可能不限流。
+- 部分 KVM 测试仍用固定 sleep 让 guest 运行（round-trip 中的 50 ms）。
 
 ## 14. 实现与验证进度
 
@@ -984,9 +1114,15 @@ crates/vmm/src/
 - [x] MachineSnapshot 纯数据容器：VmKvmState、VcpuSnapshot（XSAVE）、DeviceSnapshots、block QueueState 导出。
 - [x] capture 函数：设备先 → vCPU → VM KVM 状态，带 Firecracker ordering 注释。
 - [x] block device 内部协作 quiesce：serve() select! 中处理 quiesce 信号，用 &mut 直接提取 QueueState。
-- [x] rebuild 函数：从 MachineSnapshot + MachineSpec 重建 Machine，KVM 恢复顺序匹配 Firecracker，含 kvmclock_ctrl 和 XSAVE。
+- [x] rebuild 函数：从 MachineSnapshot 重建 Machine，KVM 恢复顺序匹配 Firecracker，含 kvmclock_ctrl 和 XSAVE。
 - [x] 同进程 round-trip 验证：寄存器递增 guest 经历 capture→teardown→rebuild→resume 后继续运行；block reactivation 从 captured QueueState 恢复。
 - [x] 深度 review 修复：XSAVE 替代 FPU、kvmclock_ctrl、FS/GS BASE + EFER + TSC_AUX + TSC_DEADLINE MSR、transport session 注入。
+- [x] 局部故障就地隔离（8b4b36d）：全部客户端断开不再终止已启动的 VM；已退出的块设备不阻碍 pause，capture 拒绝它；按盘记录 quiesce 状态。
+- [x] 资源账本（6368bab）：`GpaRange` / `Gsi` 类型，值类型的 `AddressPool` / `IdPool` / `ResourceBook`；plan 经账本分配并记录 grant，restore 用 `replay` 重放校验。
+- [x] 设备按 kind 纵切（3859e58）：`DeviceSpec` / `DevicePlan` / `AttachedDevice` / `DeviceSnapshot`；`machine/block.rs`、`machine/platform.rs`；build 与 rebuild 共用 `assemble`，先恢复 vCPU 再挂设备；快照携带 plan，rebuild 不再需要 spec；恢复时重新接入控制台输入。
+- [x] guest RAM 所有权（ff79a8f）：`KvmVm` 拥有 VM fd 与 memory，`KvmVcpu` 持有 `Arc<KvmVm>`；memslot 从 `IdPool<MemSlot>` 分配；`MemoryPlan` 取代 `MachinePlan.ram`。
+- [x] memfd 共享后端（f9e333f）：`SetMemoryBacking`（`.machine.memory_backing`、`PUT /v1/machine/memory-backing`）；sealed memfd；rebuild 核对内存与 plan 一致。
+- [x] 第二轮深度 review 修复（f050e2b）：恢复时补发未确认的中断；快照记录 `DeviceDesc`，恢复时拒绝变化的后端；队列在 attach 时校验；capture 拒绝运行中的设备；断开后 `Start` 失败时 vmm-main 退出；memfd 加 `MFD_NOEXEC_SEAL`。
 
 运行真实 Linux 冒烟测试：
 
@@ -1033,4 +1169,5 @@ cargo test -p dragonball-evolved --test boot linux_pvh_smoke_boot -- --ignored -
 | vCPU 踢出   | `immediate_exit` + SIGRTMIN    | SIGRTMIN + 轮询重发         | 同 firecracker（B10）          |
 | transport   | virtio-mmio + virtio-pci       | virtio-pci                  | virtio-mmio（C8）              |
 | 设备激活    | `activate_evt` eventfd         | 同步调用                    | channel + 会话（C8）           |
-| 主循环状态  | `Arc<Mutex<Vmm>>`              | `Vmm` 结构体 + epoll 循环   | 栈上的拥有所有权的状态值（E1） |
+| 主循环状态  | `Arc<Mutex<Vmm>>`              | `Vmm` 结构体 + epoll 循环   | `Controller`：`Idle(Vm)` / `Busy(Operation)`（E1） |
+| 资源分配    | 可变 `ResourceAllocator`；设备的 `MMIODeviceInfo`（地址、GSI）随快照保存，恢复时沿用 | 可变 `SystemAllocator` | 值类型账本；plan 记录 grant，恢复时 `replay`（§6.6） |
