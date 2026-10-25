@@ -19,7 +19,7 @@ const DRIVER: u32 = 2;
 const NEEDS_RESET: u32 = 64;
 const FAILED: u32 = 128;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDesc {
     pub device_type: u32,
     pub features: u64,
@@ -46,9 +46,11 @@ pub struct MmioRegs {
     pub queues: Vec<QueueRegs>,
 }
 
-/// A transport's guest-visible state, captured for a restore.
+/// A transport's guest-visible state, captured for a restore. It includes what
+/// the device offered, which the guest driver has already read and relies on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmioTransportSnapshot {
+    pub desc: DeviceDesc,
     pub regs: MmioRegs,
     pub interrupt_status: u32,
 }
@@ -200,7 +202,8 @@ impl MmioTransport {
         }
     }
 
-    /// Construct a transport in a previously captured state, for a restore.
+    /// Construct a transport in a previously captured state, for a restore. The
+    /// backend must offer the guest exactly what it offered when captured.
     pub fn restore(
         desc: DeviceDesc,
         memory: SharedGuestMemory,
@@ -208,11 +211,18 @@ impl MmioTransport {
         interrupt: Arc<IrqTrigger>,
         queue_notifiers: Vec<EventFd>,
         snapshot: MmioTransportSnapshot,
-    ) -> Self {
+    ) -> Result<Self> {
+        if desc != snapshot.desc {
+            bail!(
+                "the device no longer offers what it offered when captured: {:?}, not {:?}",
+                desc,
+                snapshot.desc
+            );
+        }
         interrupt
             .status()
             .store(snapshot.interrupt_status, Ordering::SeqCst);
-        Self {
+        Ok(Self {
             state: Mutex::new(TransportState {
                 regs: snapshot.regs,
                 session: None,
@@ -222,7 +232,7 @@ impl MmioTransport {
             activator,
             interrupt,
             queue_notifiers,
-        }
+        })
     }
 
     fn activate(&self, state: &mut TransportState) -> Result<()> {
@@ -281,6 +291,7 @@ impl MmioTransport {
     pub fn snapshot(&self) -> MmioTransportSnapshot {
         let state = self.state.lock().unwrap();
         MmioTransportSnapshot {
+            desc: self.desc.clone(),
             regs: state.regs.clone(),
             interrupt_status: self.interrupt.status().load(Ordering::SeqCst),
         }

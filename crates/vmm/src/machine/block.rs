@@ -49,8 +49,9 @@ pub(super) struct AttachedBlock {
     plan: BlockPlan,
     transport: Arc<MmioTransport>,
     quiesce: BlockQuiesceHandle,
-    /// What the backend was doing at the last pause, or when attached.
-    state: BlockQuiesced,
+    /// What the backend was doing when the machine last paused; `None` while
+    /// the backend runs, since its queue then moves on.
+    state: Option<BlockQuiesced>,
 }
 
 /// Lays out the disks: at most one root disk, placed first so the guest names
@@ -131,7 +132,6 @@ pub(super) fn attach(
     );
 
     // The backend's record, not the transport status, decides reactivation.
-    let queue = restore.as_ref().and_then(|captured| captured.queue);
     let (transport, reactivate) = match restore {
         None => (
             MmioTransport::new(
@@ -145,6 +145,7 @@ pub(super) fn attach(
         ),
         Some(captured) => {
             let driver_features = captured.transport.regs.driver_features;
+            let pending = captured.transport.interrupt_status != 0;
             let transport = MmioTransport::restore(
                 desc,
                 Arc::clone(memory),
@@ -152,17 +153,27 @@ pub(super) fn attach(
                 Arc::clone(&interrupt),
                 vec![queue_notifier],
                 captured.transport,
-            );
+            )
+            .with_context(|| format!("restore disk {}", plan.id))?;
+            // Validated here, so a bad capture fails the restore instead of the backend.
+            let queue = captured
+                .queue
+                .map(|queue| {
+                    let queue = Queue::try_from(queue).context("restore block queue from state")?;
+                    if !queue.is_valid(memory.as_ref()) {
+                        bail!("restored block queue failed validation");
+                    }
+                    Ok(queue)
+                })
+                .transpose()
+                .with_context(|| format!("restore disk {}", plan.id))?;
             let reactivate = queue.map(|queue| {
                 // Injected before the backend runs, so a guest reset reaches the restored session.
                 let (control, session) = session_channel();
                 transport.inject_session(control);
                 let mem = Arc::clone(memory);
-                move || -> Result<()> {
-                    let queue = Queue::try_from(queue).context("restore block queue from state")?;
-                    if !queue.is_valid(mem.as_ref()) {
-                        bail!("restored block queue failed validation");
-                    }
+                let interrupt = Arc::clone(&interrupt);
+                move || {
                     activator.activate(Activation {
                         mem,
                         queues: vec![queue],
@@ -172,6 +183,14 @@ pub(super) fn attach(
                     })
                 }
             });
+            // KVM injects an irqfd write asynchronously, so an interrupt raised
+            // just before the capture may be missing from the captured irqchip.
+            if pending {
+                interrupt
+                    .irq_fd()
+                    .write(1)
+                    .context("re-raise the restored interrupt")?;
+            }
             (transport, reactivate)
         }
     };
@@ -196,7 +215,7 @@ pub(super) fn attach(
         plan,
         transport,
         quiesce,
-        state: queue.map_or(BlockQuiesced::Inactive, BlockQuiesced::Active),
+        state: None,
     })
 }
 
@@ -204,26 +223,32 @@ impl AttachedBlock {
     /// Parks the backend and records what it was doing. An exited backend is
     /// recorded, not an error, so pausing survives a failed disk.
     pub(super) async fn quiesce(&mut self) {
-        self.state = self.quiesce.quiesce().await;
-        if self.state == BlockQuiesced::Exited {
+        let state = self.quiesce.quiesce().await;
+        if state == BlockQuiesced::Exited {
             warn_unlimited!(
                 "block device {} has exited; pausing without it",
                 self.plan.id
             );
         }
+        self.state = Some(state);
     }
 
-    pub(super) async fn resume(&self) {
+    pub(super) async fn resume(&mut self) {
+        self.state = None;
         self.quiesce.resume().await;
     }
 
-    /// Captures the disk as of the last pause. An exited backend has no state
-    /// to capture, and restoring the disk would hide the failure.
+    /// Captures the disk as of the last pause. A running backend's queue moves
+    /// on, and an exited backend has no state: restoring it would hide the failure.
     pub(super) fn capture(&self) -> Result<BlockSnapshot> {
         let queue = match self.state {
-            BlockQuiesced::Inactive => None,
-            BlockQuiesced::Active(queue) => Some(queue),
-            BlockQuiesced::Exited => bail!(
+            None => bail!(
+                "block device {} is running; pause the machine to capture it",
+                self.plan.id
+            ),
+            Some(BlockQuiesced::Inactive) => None,
+            Some(BlockQuiesced::Active(queue)) => Some(queue),
+            Some(BlockQuiesced::Exited) => bail!(
                 "block device {} has exited; refusing to snapshot",
                 self.plan.id
             ),

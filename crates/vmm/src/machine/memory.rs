@@ -80,14 +80,27 @@ pub fn describe(memory: &GuestMemoryMmap<()>) -> Option<MemoryPlan> {
 /// it is handed to never sees it shrink or grow.
 fn memfd(region: GpaRange) -> Result<File> {
     let name = CString::new(format!("guest-ram-{:#x}", region.start()))?;
-    // SAFETY: `name` is a NUL-terminated string that outlives the call.
-    let fd =
-        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error()).context("create guest RAM memfd");
+    let create = |flags| {
+        // SAFETY: `name` is a NUL-terminated string that outlives the call.
+        let fd = unsafe {
+            libc::memfd_create(
+                name.as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | flags,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh descriptor owned by nothing else.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    };
+    // Kernels from 6.3 warn about, and under vm.memfd_noexec=2 refuse, a memfd
+    // that does not say whether it is executable; older kernels reject the flag.
+    let file = match create(libc::MFD_NOEXEC_SEAL) {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => create(0),
+        created => created,
     }
-    // SAFETY: `fd` is a fresh descriptor owned by nothing else.
-    let file = unsafe { File::from_raw_fd(fd) };
+    .context("create guest RAM memfd")?;
     file.set_len(region.len()).context("size guest RAM memfd")?;
     let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
     // SAFETY: `file` owns a live descriptor for the duration of the call.

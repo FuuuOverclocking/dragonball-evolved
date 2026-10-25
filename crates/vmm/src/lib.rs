@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 pub use crate::exit_status::VmmExitStatus;
 pub use crate::kvm_context::{HostCapabilities, KvmContext};
-use crate::lifecycle::{BusyCtx, BusyEvent, Controller, Event, Step, handle_busy, handle_idle};
+use crate::lifecycle::{BusyCtx, BusyEvent, Controller, Event, Step, Vm, handle_busy, handle_idle};
 pub use crate::process_ctx::ProcessCtx;
 use crate::spec::MachineSpec;
 pub use crate::vmm_server::VmmClient;
@@ -45,6 +45,11 @@ async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
     let mut status = loop {
         match controller {
             Controller::Idle(mut vm) => {
+                // A Start that failed after every client left: nobody can start it again.
+                if server.is_detached() && matches!(vm, Vm::NotStarted(_)) {
+                    controller = Controller::Idle(vm);
+                    break VmmExitStatus::Ok;
+                }
                 // IDLE: select machine/device events (biased) and requests.
                 let event = select! {
                     biased;

@@ -26,6 +26,11 @@ impl VmmServer {
         Self { rx: Some(rx) }
     }
 
+    /// Whether every client has gone away.
+    pub(crate) fn is_detached(&self) -> bool {
+        self.rx.is_none()
+    }
+
     /// Wait for the next request, or `Detached` once every client has gone away.
     ///
     /// `Detached` is reported exactly once; later calls never resolve, because a

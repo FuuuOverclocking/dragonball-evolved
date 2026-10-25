@@ -67,7 +67,7 @@ impl AttachedDevice {
         }
     }
 
-    async fn resume(&self) {
+    async fn resume(&mut self) {
         match self {
             Self::Block(block) => block.resume().await,
         }
@@ -111,7 +111,7 @@ impl Machine {
 
     pub async fn resume(&mut self) -> Result<()> {
         self.tasks.resume().await;
-        for device in &self.devices {
+        for device in &mut self.devices {
             device.resume().await;
         }
         self.vcpus.as_ref().unwrap().resume().await

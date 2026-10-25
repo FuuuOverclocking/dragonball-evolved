@@ -368,3 +368,115 @@ async fn pause_survives_an_exited_disk_but_capture_refuses_it_on_kvm() {
     machine.resume().await.unwrap();
     machine.teardown().await.unwrap();
 }
+
+/// A disk is captured only while the machine is paused: before the first pause
+/// and after a resume its backend runs, and its queue moves on.
+#[tokio::test(flavor = "local")]
+async fn capture_refuses_a_running_disk_on_kvm() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+    let kernel = elf::TempFile::new(&elf::image(&inc_eax_payload(), true));
+    let disk_file = TempDisk::new("snap-running", &[0; SECTOR_SIZE]);
+    let mut machine = build_machine(
+        spec(kernel.path(), vec![disk("disk", disk_file.path(), false)]),
+        &context,
+    );
+
+    let Err(error) = snapshot::capture(&machine) else {
+        panic!("captured a disk that was never paused");
+    };
+    assert!(error.to_string().contains("is running"), "{error:#}");
+    machine.pause().await.unwrap();
+    snapshot::capture(&machine).unwrap();
+    machine.resume().await.unwrap();
+    let Err(error) = snapshot::capture(&machine) else {
+        panic!("captured a disk after the machine resumed");
+    };
+    assert!(error.to_string().contains("is running"), "{error:#}");
+    machine.teardown().await.unwrap();
+}
+
+/// The guest driver read the disk's size when it probed the device. A restore
+/// that would offer a different one is refused, rather than changing the disk
+/// under the driver.
+#[tokio::test(flavor = "local")]
+async fn rebuild_refuses_a_disk_whose_size_changed_on_kvm() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+    let kernel = elf::TempFile::new(&elf::image(&inc_eax_payload(), true));
+    let disk_file = TempDisk::new("snap-resized", &[0; SECTOR_SIZE]);
+    let mut machine = build_machine(
+        spec(kernel.path(), vec![disk("disk", disk_file.path(), false)]),
+        &context,
+    );
+    machine.pause().await.unwrap();
+    let snap = snapshot::capture(&machine).unwrap();
+    machine.teardown().await.unwrap();
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(disk_file.path())
+        .unwrap()
+        .set_len(2 * SECTOR_SIZE as u64)
+        .unwrap();
+    let Err(error) = rebuild(snap, &context) else {
+        panic!("restored a disk whose size changed");
+    };
+    assert!(
+        format!("{error:#}").contains("no longer offers"),
+        "{error:#}"
+    );
+}
+
+/// KVM injects an irqfd write asynchronously, so the interrupt a device raised
+/// just before the capture may be missing from the captured IOAPIC. A restore
+/// re-raises every interrupt the guest has not acknowledged.
+#[tokio::test(flavor = "local")]
+async fn rebuild_re_raises_an_unacknowledged_interrupt_on_kvm() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+    let kernel = elf::TempFile::new(&elf::image(&inc_eax_payload(), true));
+    let disk_file = TempDisk::new("snap-irq", &[0xd0; SECTOR_SIZE]);
+    let mut machine = build_machine(
+        spec(kernel.path(), vec![disk("disk", disk_file.path(), false)]),
+        &context,
+    );
+    let base = window(&machine, "disk");
+    let DevicePlan::Block(block) = &machine.plan().devices[0];
+    let line = 1u32 << block.grant.gsi.0;
+    negotiate_driver_ok(machine.mmio_bus(), base);
+
+    // Reach the guest RAM through a snapshot, then complete a read whose
+    // interrupt the guest never acknowledges.
+    machine.pause().await.unwrap();
+    let mut guest = GuestDriver::with_memory(snapshot::capture(&machine).unwrap().memory);
+    machine.resume().await.unwrap();
+    assert_eq!(
+        read_sector(&mut guest, machine.mmio_bus(), base, 0).await,
+        [0xd0; SECTOR_SIZE]
+    );
+    machine.pause().await.unwrap();
+    let mut snap = snapshot::capture(&machine).unwrap();
+    machine.teardown().await.unwrap();
+    assert_ne!(snap.block("disk").unwrap().transport.interrupt_status, 0);
+
+    // As if KVM had not yet injected the device's last irqfd write.
+    // SAFETY: chip 2 is the IOAPIC, whose state is the union's `ioapic` member.
+    unsafe { snap.vm.ioapic.chip.ioapic.irr &= !line };
+    let mut restored = rebuild(snap, &context).unwrap();
+    restored.pause().await.unwrap();
+    wait_until("the restored interrupt to reach the IOAPIC", || {
+        let snap = snapshot::capture(&restored).unwrap();
+        // SAFETY: as above.
+        let irr = unsafe { snap.vm.ioapic.chip.ioapic.irr };
+        irr & line != 0
+    })
+    .await;
+    restored.teardown().await.unwrap();
+}

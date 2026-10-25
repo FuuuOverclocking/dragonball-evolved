@@ -69,8 +69,10 @@ impl KvmVm {
                 flags: 0,
             };
             // SAFETY: the returned VM owns `memory` and releases it only after its
-            // own fd and, through KvmVcpu, every vCPU fd is closed. Each region
-            // gets a distinct slot, and the regions of `memory` do not overlap.
+            // own fd and, through KvmVcpu, every vCPU fd is closed. On an early
+            // return no vCPU exists yet, and the local `fd` is dropped before the
+            // `memory` parameter. Each region gets a distinct slot, and the
+            // regions of `memory` do not overlap.
             unsafe { fd.set_user_memory_region(binding) }
                 .with_context(|| format!("bind guest RAM to KVM memslot {}", slot.0))?;
         }

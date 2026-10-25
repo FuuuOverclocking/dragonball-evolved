@@ -123,8 +123,9 @@ pub fn capture_vcpus(vcpus: &Vcpus) -> Result<Vec<VcpuSnapshot>> {
     vcpus.handles().iter().map(|h| h.capture_state()).collect()
 }
 
-/// Capture a paused machine. A machine with an exited device is refused: there
-/// is no state to capture for it, and restoring it would hide the failure.
+/// Capture a paused machine. A device that still runs is refused, since its
+/// state moves on, and so is one that has exited: there is no state to capture
+/// for it, and restoring it would hide the failure.
 pub fn capture(machine: &Machine) -> Result<MachineSnapshot> {
     // Devices first: an interrupt a device raised while finishing its last
     // request must be part of the interrupt controller state captured below.
@@ -239,7 +240,7 @@ mod tests {
     use super::*;
     use crate::KvmContext;
     use crate::arch::x86_64::layout::ram_regions;
-    use crate::devices::virtio::mmio::{MmioRegs, MmioTransportSnapshot};
+    use crate::devices::virtio::mmio::{DeviceDesc, MmioRegs, MmioTransportSnapshot};
     use crate::machine::block::BlockPlan;
     use crate::machine::memory::MemoryPlan;
     use crate::machine::plan::VirtioMmioGrant;
@@ -283,6 +284,12 @@ mod tests {
         DeviceSnapshot::Block(BlockSnapshot {
             id: id.into(),
             transport: MmioTransportSnapshot {
+                desc: DeviceDesc {
+                    device_type: 2,
+                    features: 0,
+                    queue_max: vec![256],
+                    config: Vec::new(),
+                },
                 regs: MmioRegs::default(),
                 interrupt_status: 0,
             },
