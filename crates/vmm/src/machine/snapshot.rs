@@ -20,7 +20,6 @@ use super::memory::GuestRam;
 use super::plan::{self, DevicePlan, MachinePlan};
 use super::platform::PlatformSnapshot;
 use super::vcpu::{self, Vcpus};
-use super::vm::KvmVm;
 use crate::KvmContext;
 
 pub struct MachineSnapshot {
@@ -197,7 +196,7 @@ pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -
         bail!("the guest RAM was not mapped from the snapshot's plan");
     }
 
-    let vm = KvmVm::new(context, ram)?;
+    let (vm, ram_bindings, memslots) = build::create_vm(context, ram)?;
     let fd = vm.fd();
     fd.set_irqchip(&vm_state.pic_master)
         .context("restore PIC master")?;
@@ -214,7 +213,7 @@ pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -
     // After the vCPUs are restored, before anything runs.
     fd.set_clock(&vm_state.clock).context("restore VM clock")?;
 
-    build::assemble(plan, vm, vcpus, Some(restore))
+    build::assemble(plan, vm, vcpus, ram_bindings, memslots, Some(restore))
 }
 
 /// Puts the captured device states in plan order, so a restore attaches each
@@ -268,7 +267,8 @@ mod tests {
             context.capabilities(),
         )
         .unwrap();
-        let vm = KvmVm::new(&context, GuestRam::map(&plan).unwrap()).unwrap();
+        let (vm, _bindings, _) =
+            build::create_vm(&context, GuestRam::map(&plan, &[]).unwrap()).unwrap();
 
         let state = capture_vm_kvm(vm.fd()).unwrap();
         assert_eq!(state.pic_master.chip_id, 0);

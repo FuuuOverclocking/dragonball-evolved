@@ -452,7 +452,7 @@ async fn rebuild_refuses_ram_mapped_from_another_plan_on_kvm() {
     let mut shared = snap.plan.memory.clone();
     assert_eq!(shared.backing, MemoryBacking::Anonymous);
     shared.backing = MemoryBacking::Shared;
-    let Err(error) = rebuild(snap, GuestRam::map(&shared).unwrap(), &context) else {
+    let Err(error) = rebuild(snap, GuestRam::map(&shared, &[]).unwrap(), &context) else {
         panic!("restored onto RAM mapped from another plan");
     };
     assert!(

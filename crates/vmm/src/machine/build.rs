@@ -19,7 +19,7 @@ use super::plan::{DevicePlan, MachinePlan};
 use super::platform::{Platform, PlatformSnapshot};
 use super::snapshot::DeviceSnapshot;
 use super::vcpu::{VcpuHandle, Vcpus};
-use super::vm::{KvmVcpu, KvmVm};
+use super::vm::{Binding, KvmVcpu, KvmVm, MemSlots, SlotPermit};
 use crate::KvmContext;
 use crate::arch::x86_64::{cpuid, lapic, layout, mptable, msr, pvh, regs};
 use crate::devices::DeviceManager;
@@ -35,6 +35,8 @@ pub struct Machine {
     /// In plan order.
     pub(super) devices: Vec<AttachedDevice>,
     mmio: Arc<Bus>,
+    ram_bindings: Vec<Binding>,
+    memslots: MemSlots,
     pub(super) vm: Arc<KvmVm>,
 }
 
@@ -104,6 +106,10 @@ impl Machine {
         self.vm.memory()
     }
 
+    pub fn allocate_memslots(&mut self, count: usize) -> Result<Vec<SlotPermit>> {
+        self.memslots.allocate(count)
+    }
+
     pub async fn pause(&mut self) -> Result<()> {
         self.vcpus.as_ref().unwrap().pause().await?;
         // Cooperatively quiesced devices record what they were doing as they park.
@@ -132,12 +138,30 @@ impl Machine {
         };
         self.tasks.stop().await;
         stopped?;
-        KvmVm::into_ram(self.vm).map_err(|_| anyhow!("a vCPU still holds the VM"))
+        drop(self.devices);
+        drop(self.ram_bindings);
+        drop(self.memslots);
+        KvmVm::into_ram(self.vm).map_err(|_| anyhow!("memory permits or vCPUs still hold the VM"))
     }
 }
 
+pub(super) fn create_vm(
+    context: &KvmContext,
+    ram: GuestRam,
+) -> Result<(Arc<KvmVm>, Vec<Binding>, MemSlots)> {
+    let boot_ram = ram.plan().ram.clone();
+    let (vm, mut pool) = KvmVm::new(context, ram)?;
+    let permits = pool.allocate(boot_ram.len())?;
+    let bindings = permits
+        .into_iter()
+        .zip(boot_ram)
+        .map(|(permit, range)| permit.bind(range).map_err(|(_, error)| error))
+        .collect::<Result<_>>()?;
+    Ok((vm, bindings, pool))
+}
+
 pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
-    let vm = KvmVm::new(context, GuestRam::map(&plan.memory)?)?;
+    let (vm, ram_bindings, memslots) = create_vm(context, GuestRam::map(&plan.memory, &[])?)?;
     let memory = Arc::clone(vm.memory());
 
     let kernel = plan.spec.kernel.as_ref().unwrap();
@@ -232,7 +256,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         vcpu.set_lapic(&lapic::configure_lint(vcpu.get_lapic()?))?;
         vcpus.push(vcpu);
     }
-    assemble(plan, vm, vcpus, None)
+    assemble(plan, vm, vcpus, ram_bindings, memslots, None)
 }
 
 /// Attaches the platform and the planned devices, then starts the vCPU threads,
@@ -245,6 +269,8 @@ pub(super) fn assemble(
     plan: MachinePlan,
     vm: Arc<KvmVm>,
     vcpus: Vec<KvmVcpu>,
+    ram_bindings: Vec<Binding>,
+    memslots: MemSlots,
     restore: Option<Restore>,
 ) -> Result<Machine> {
     let (events_tx, events) = mpsc::unbounded_channel();
@@ -296,6 +322,8 @@ pub(super) fn assemble(
         platform,
         devices,
         mmio,
+        ram_bindings,
+        memslots,
         vm,
     })
 }

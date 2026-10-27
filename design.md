@@ -363,7 +363,7 @@ status
 1. **接收 `Shutdown` 时回复**：立即发送 `Ok(())`，只确认请求已进入停止流程；然后关闭请求入口。
 2. **停 vCPU**：向全部 vCPU 发 `Stop` 并踢出 → `.await` 每个线程的"已退出"通知 → 在 blocking pool 中 `join`。
 3. **停设备**：`tasks.stop()`——设置 stop watch，向全部 guest gate 发 `Stop`，`.await` 全部 `DeviceExit`（含 io 线程上的）→ 结束 io 线程。
-4. **关闭 VM 并交还 RAM**：`KvmVm::into_ram` 只有在没有其他 `Arc<KvmVm>` 持有者时才成功；先关闭 VM fd，再交还 `GuestRam`。`Machine` 的其余资源（Bus、transport、ioeventfd/irqfd 注册）随拆除结束释放。
+4. **关闭 VM 并交还 RAM**：drop 设备、启动 RAM 的 `Binding` 与 `MemSlots` 分配权，然后 `KvmVm::into_ram` 经 `Arc::try_unwrap` 确认没有其他持有者，先关闭 VM fd 再交还 `GuestRam`。尚存的 Binding、SlotPermit、分配权或 vCPU 都会阻止交接；其余资源随拆除结束释放。
 5. **释放或接管 RAM**：`Machine::teardown() -> Result<GuestRam>`；生命周期退出时 drop RAM，恢复时把它按值交给 `rebuild`。每个 `KvmVcpu`（含踢出用的复制 fd）持有 VM，所以仍有 vCPU fd 时既不能交还 RAM，也不会解除映射（§6.7）。快照不持有 RAM。
 
 拆除结果写入最终 `VmmExitStatus`，不再修改已经发送的 Shutdown 回复。
@@ -565,7 +565,7 @@ pub struct VirtioMmioGrant { pub mmio: GpaRange, pub gsi: Gsi }          // mach
 - **值类型**：每次分配返回结果与新的池，旧值不变；失败时调用方手中的旧账本仍然有效，不需要回滚。
 - **plan 记录 grant**：`MachinePlan::new` 经账本为每个设备分配 `VirtioMmioGrant`，记在 `DevicePlan` 中；账本本身不保存。
 - **恢复时重放，不重算**：`plan::replay(&plan, host)` 先校验 RAM、设备窗口及宿主能力，再在 `resource_book(plan.memory.device_window)` 的账本上逐个 `reserve` 记录的 grant。窗口取自记录，不重新调用布局算法；重叠或越窗的 grant 在挂设备前被拒绝。当前只有块设备；内存设备的 grant 随消费者接入。
-- **memslot** 由 `KvmVm::new` 从 `IdPool<MemSlot>` 分配（上限 `KVM_CAP_NR_MEMSLOTS`），只属于运行期，不进 plan 与快照。
+- **memslot**：`KvmVm::new` 只交出一份不可克隆的 `MemSlots`，内含值类型 `IdPool<MemSlot>`（上限 `KVM_CAP_NR_MEMSLOTS`），由 `Machine` 独占。分配只有全部成功后才提交新池，产生不可克隆且 VM-scoped 的 `SlotPermit`；绑定消耗它，解绑成功才交回，失败保留原句柄。数值 ID 与宿主绑定都只在运行期，不进 plan / 快照；不共享 allocator，不加锁。
 - 窗口与池的范围是 arch 数据：`layout::VIRTIO_MMIO_WINDOW`（编译期断言它止于 IOAPIC 之下）、`layout::LEGACY_GSIS`；`layout::device_window` 给出设备内存窗口，由 `MemoryPlan` 记录。
 
 ### 6.7 guest RAM：plan、后端与所有权
@@ -581,31 +581,42 @@ impl MemoryPlan {
     pub fn validate(&self, host: &HostCapabilities) -> Result<()>;
 }
 pub type SharedGuestMemory = Arc<GuestMemoryMmap>; // devices::virtio 中唯一的视图别名
-pub struct GuestRam { plan: MemoryPlan, memory: SharedGuestMemory } // 不实现 Clone
+pub type RamMapping = Arc<GuestRegionMmap<()>>;
+pub struct GuestRam { plan: MemoryPlan, memory: SharedGuestMemory, mappings: Vec<RamMapping> } // 不实现 Clone
 impl GuestRam {
-    pub fn map(plan: &MemoryPlan) -> Result<Self>;
+    pub fn map(plan: &MemoryPlan, runtime_ram: &[GpaRange]) -> Result<Self>;
     pub fn plan(&self) -> &MemoryPlan;
     pub fn memory(&self) -> &SharedGuestMemory;
 }
 pub struct KvmVm { fd: VmFd, ram: GuestRam }      // fd 先声明，先关闭
+pub struct MemSlots { vm: Arc<KvmVm>, pool: IdPool<MemSlot> } // 不实现 Clone
+pub struct SlotPermit { vm: Arc<KvmVm>, slot: MemSlot }      // 不实现 Clone / Copy
+pub struct Binding { permit: Option<SlotPermit>, range: GpaRange, mapping: RamMapping }
 impl KvmVm {
-    pub fn new(context: &KvmContext, ram: GuestRam) -> Result<Arc<Self>>; // TSS、irqchip、PIT2、memslot
+    pub fn new(context: &KvmContext, ram: GuestRam) -> Result<(Arc<Self>, MemSlots)>;
+    pub fn bind(self: &Arc<Self>, permit: SlotPermit, range: GpaRange)
+        -> Result<Binding, (SlotPermit, anyhow::Error)>;
     pub fn create_vcpu(self: &Arc<Self>, index: u8) -> Result<KvmVcpu>;
     pub fn into_ram(self: Arc<Self>) -> Result<GuestRam, Arc<Self>>;
 }
-pub struct KvmVcpu { fd: VcpuFd, vm: Arc<KvmVm> }   // Deref<Target = VcpuFd>；try_clone 给踢出用
+impl MemSlots { pub fn allocate(&mut self, count: usize) -> Result<Vec<SlotPermit>>; }
+impl SlotPermit { pub fn bind(self, range: GpaRange) -> Result<Binding, (Self, anyhow::Error)>; }
+impl Binding { pub fn unbind(self) -> Result<(SlotPermit, RamMapping), (Self, anyhow::Error)>; }
+pub struct KvmVcpu { fd: VcpuFd, vm: Arc<KvmVm> }
 impl Machine {
     pub fn memory(&self) -> &SharedGuestMemory;
+    pub fn allocate_memslots(&mut self, count: usize) -> Result<Vec<SlotPermit>>;
     pub async fn teardown(self) -> Result<GuestRam>;
 }
 ```
 
-- **区域与窗口**：`ram` 只表示启动 RAM，`GuestRam::map` 与 PVH 启动内存表只取它；窗口本身不映射。设备窗口紧跟 RAM 与 4 GiB 洞的末端，1 GiB 对齐，大小为 `min(1 TiB, physical_limit − start)`；若没有可用地址，窗口为空，设备分配返回耗尽。物理地址上限来自 KVM 支持的 CPUID 0x80000008；构建与 replay 都检查窗口、RAM 与 RAM memslot 数，内存设备的额外 slot 预算随消费者实现。
+- **区域与窗口**：`ram` 只表示启动 RAM，PVH 内存表只取它；窗口本身不映射。`GuestRam::map(plan, runtime_ram)` 在 VM 创建前映射启动与额外 RAM，统一进入固定字节视图；普通 build 目前传空的额外 RAM。窗口紧跟 RAM 与 4 GiB 洞的末端，1 GiB 对齐，大小为 `min(1 TiB, physical_limit − start)`；没有可用地址则窗口为空。物理上限来自 KVM 支持的 CPUID 0x80000008；构建/replay 校验窗口、RAM 与启动 slot 数，额外设备预算随消费者实现。
 - **后端**：
   - `Anonymous`：`MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`。
   - `Shared`：每段一个 memfd（`MFD_CLOEXEC | MFD_ALLOW_SEALING`，内核支持时加 `MFD_NOEXEC_SEAL`，6.3 之前的内核拒绝该标志则去掉重试），封印 `SHRINK | GROW | SEAL`，以 `MAP_SHARED | MAP_NORESERVE` 映射；fd 经 region 的 `FileOffset` 取得。
 - **所有权与视图**：`GuestRam` 是不可克隆的所有权句柄，记录映射时的 plan；`SharedGuestMemory` 是可克隆的字节视图，不能用于创建 VM。每个 `KvmVcpu`（含复制的 fd）持有 `Arc<KvmVm>`；VM 内 fd 先于 RAM 声明。`into_ram` 经 `Arc::try_unwrap` 确认没有其他持有者后先关 fd，所以 RAM 不能同时绑定到两台 VM，映射也不会早于全部 fd 解除。
-- **快照与恢复**：快照不持有 RAM；`pause → capture → teardown → rebuild(snapshot, ram, context)`。恢复按值接收 RAM，核对 `ram.plan() == &snapshot.plan.memory`，不再从 `FileOffset` 反推后端。运行期改变 DMA 视图的方案见 design.mem.md §4.2；当前区域固定，未引入 `GuestMemoryAtomic`。
+- **绑定**：`KvmVm::new` 建立 VM fd、irqchip/PIT 并交出唯一分配权，不绑定 RAM。`build::create_vm` 为启动 RAM 建立 `Binding`，由 `Machine` 持有，build/rebuild 共用。运行期绑定须消耗本 VM 的凭据，范围须非空、页对齐、落在本 VM 单个映射内；额外映射不自动绑定。删除成功才交回凭据与映射 Arc；Drop 尽力删 slot，失败则记录日志并泄漏映射。KVM 允许相同 slot 重复注册，唯一凭据避免两个 RAII 句柄互相删除。
+- **快照与恢复**：快照不持有 RAM；`pause → capture → teardown → rebuild(snapshot, ram, context)`。恢复按值接收 RAM，核对 `ram.plan() == &snapshot.plan.memory`，不再从 `FileOffset` 反推后端。当前重建启动 RAM 绑定；内存设备的动态绑定状态随消费者接入。运行期 DMA 视图变化见 design.mem.md §4.2，未引入 `GuestMemoryAtomic`。
 
 ## 7. CPUID、MSR、寄存器
 
@@ -872,7 +883,7 @@ gate 是纯 supervisor 层控制，不修改也不替换原始 future；quiesce 
 
 - `Machine::pause()`：`vcpus.pause()`（不再产生新的 I/O 退出）→ 每个已挂设备协作 quiesce 并记录自己的状态（块设备：`BlockQuiesced`）→ `tasks.quiesce()`（gate 类任务）。
 - `Machine::resume()`：`tasks.resume()` → 设备 resume（清除记录的状态）→ `vcpus.resume()`（guest 可以立即发起 I/O）。
-- `Machine::teardown()`：`vcpus.stop()` → `tasks.stop()` → `KvmVm::into_ram`，返回 `GuestRam`；生命周期退出时释放，恢复时交接（§6.7）。
+- `Machine::teardown()`：`vcpus.stop()` → `tasks.stop()` → drop 设备、启动绑定与 slot 分配权 → `KvmVm::into_ram` 返回 `GuestRam`；生命周期退出时释放，恢复时交接（§6.7）。
 
 **按 kind 纵切**：每类设备一个 `machine/<kind>.rs`（目前是 `block.rs`；i8042 与 COM1 合在 `platform.rs`），负责该类设备的 plan、attach（新建或恢复）、quiesce、capture。`DeviceSpec`、`DevicePlan`、`AttachedDevice`、`DeviceSnapshot` 都是按 kind 的 enum：新增一类设备即各加一个变体，由穷举 match 让编译器指出所有要补的地方。
 
@@ -901,7 +912,7 @@ pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -
 **Rebuild 顺序**（按值接收 `MachineSnapshot` 与 `GuestRam`）：
 
 1. **纯校验，先于任何 KVM 对象**：`plan::replay` 校验 grant；`match_devices` 按 id 把设备状态对齐到 plan（缺失、重复、多余都报错）；vCPU 必须恰为 `0..cpus`；`ram.plan()` 必须等于 `&plan.memory`。
-2. `KvmVm::new`（TSS、irqchip、PIT2、memslot）→ `set_irqchip`×3 → `set_pit2`。
+2. `build::create_vm`（`KvmVm::new` 建 TSS、irqchip、PIT2、唯一分配权，再绑定启动 RAM）→ `set_irqchip`×3 → `set_pit2`。
 3. 每个 vCPU：`create_vcpu` + `restore_state`：`set_cpuid2` → `set_mp_state` → regs → sregs → xsave → xcrs → debug_regs → lapic → msrs → `vcpu_events`，最后 `kvmclock_ctrl`（失败只告警）。
 4. `set_clock`。
 5. `build::assemble`（与 build 共用）：恢复平台（i8042、COM1，重新接入控制台输入），在记录的 grant 上挂设备，最后启动 Paused 的 vCPU 线程。设备在 vCPU（LAPIC）恢复之后才挂上：恢复出来的设备可能立刻发中断，之后的 LAPIC 恢复会把它覆盖。挂块设备时：
@@ -1043,7 +1054,7 @@ crates/vmm/src/
 ├── machine/               副作用侧（plan 为纯）
 │   ├── plan.rs            MachinePlan、DevicePlan、VirtioMmioGrant；replay
 │   ├── memory.rs          MemoryPlan、GuestRam（map / plan / memory）；memfd
-│   ├── vm.rs              KvmVm（VM fd + GuestRam + memslot、into_ram）、KvmVcpu
+│   ├── vm.rs              KvmVm、MemSlots、SlotPermit、Binding（unbind / Drop）、KvmVcpu
 │   ├── build.rs           build、assemble；Machine：pause / resume / teardown
 │   ├── block.rs           块设备纵切：plan / attach / quiesce / capture
 │   ├── platform.rs        i8042 + COM1：attach / capture
@@ -1067,7 +1078,7 @@ crates/vmm/src/
 | -------------- | ------------------------------------------------------------------------------------------ | ------------- |
 | 纯函数         | `ram_regions`、`device_window`（对齐、物理上限、空窗、溢出）、memmap、MP table（结构与校验和）、CPUID、GDT 编码、寄存器、MMIO 与 i8042 状态机、cmdline、spec 校验；资源池（分配、对齐、reserve 冲突、release）、plan（根盘排序、grant、记录窗口的 replay、宿主物理地址与 slot 校验）、快照设备按 id 对齐 | 任意          |
 | 设备（已有形式） | 沿用 `tests/block.rs`、`tests/serial.rs`：测试扮演 guest 驱动；改为经 transport 激活，覆盖 reset 后重新激活、io 线程放置、quiesce / resume | 任意          |
-| 内存           | 两种后端的分段映射与读写；memfd 能看到 guest 写入、拒绝改变大小；映射比 VM 与 vCPU 活得久；复制 vCPU fd 未关闭时交不出 RAM，关闭后可携带内容重绑；compile-fail 文档测试验证 RAM 不可克隆、不可用于两次恢复 | 任意 / `/dev/kvm` |
+| 内存           | 两种后端的启动/额外 RAM 映射与读写、memfd 封印；VM/vCPU/绑定的映射寿命；动态读 0→标记→0（含复用与 Drop）；非法范围、跨 VM、失败重试、删除失败泄漏；slot 批量分配事务性；compile-fail 验证 RAM、分配权、凭据不可克隆/重复消耗 | 任意 / `/dev/kvm` |
 | KVM 集成       | mini PVH ELF：32 位代码先检查 `[ebx]` 是否等于 start_info magic，再向 COM1 输出 `OK`，最后 `out 0x64, 0xFE`；断言输出与 `GuestReset`。另测 pause/resume、Shutdown 立即确认及后续拆除、配置文件选择 shared 内存后启动 | `/dev/kvm`    |
 | 快照（`crates/vmm/tests/snapshot.rs`） | 寄存器递增 guest 的 round-trip（两种后端，teardown 交还 RAM 再 rebuild）；plan 顺序与逐盘激活在 rebuild 后保持；修改快照中的 grant 会移动设备；已退出的盘不阻碍 pause 但被 capture 拒绝；运行中的盘被拒绝；磁盘大小变化、RAM 的 plan 不匹配时拒绝恢复；capture 漏掉的中断在恢复时补发 | `/dev/kvm`    |
 | 真实 Linux     | `#[ignore]`；`DBE_KERNEL`、`DBE_INITRD`、`DBE_ROOTFS`。断言串口出现约定标记，guest `reboot` 后 VMM 以 `Ok` 退出 | PVH 内核      |
@@ -1113,7 +1124,8 @@ crates/vmm/src/
 - block quiesce 的 parked loop 中缺少 `session.requested()` 分支（延迟清理，非正确性问题）。
 - rate limiter 的 `Instant` 在暂停期间继续流逝，resume 后第一个窗口可能不限流。
 - 部分 KVM 测试仍用固定 sleep 让 guest 运行（round-trip 中的 50 ms）。
-- 内存阶段当前到 M1：设备内存窗口与账本已实现，仍没有使用窗口的内存设备；运行期 memslot 绑定在 M2、virtio-mem 在 M3。
+- 内存阶段当前到 M2：设备窗口、预映射与运行期绑定设施已实现；尚无内存设备，未开始 virtio-mem（M3）。运行期 Binding 状态目前不进入快照，随内存设备消费者补上。
+- 丢弃 slot 凭据不会自动回收编号，解绑成功交回的凭据可复用；Drop 删除失败会故意保留映射（可能泄漏），不让错误释放 KVM 仍能访问的内存。
 
 ## 14. 实现与验证进度
 
@@ -1140,7 +1152,8 @@ crates/vmm/src/
 - [x] memfd 共享后端（f9e333f）：`SetMemoryBacking`（`.machine.memory_backing`、`PUT /v1/machine/memory-backing`）；sealed memfd；rebuild 核对内存与 plan 一致。
 - [x] 第二轮深度 review 修复（f050e2b）：恢复时补发未确认的中断；快照记录 `DeviceDesc`，恢复时拒绝变化的后端；队列在 attach 时校验；capture 拒绝运行中的设备；断开后 `Start` 失败时 vmm-main 退出；memfd 加 `MFD_NOEXEC_SEAL`。
 - [x] 内存阶段 M0（8b33f5a，design.mem.md）：不可克隆的 `GuestRam` 与唯一的字节视图别名；`KvmVm::into_ram` 在全部 vCPU fd 关闭后交还 RAM；`Machine::teardown` 返回 RAM；快照不持有 RAM，恢复按值接管并核对 plan。两种后端的 KVM round-trip、内存寿命与复制 vCPU fd 屏障、两项 compile-fail 文档测试通过；移除 plan 核对与添加 Clone 的变异均被捕获。`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
-- [x] 内存阶段 M1（design.mem.md）：`MemoryPlan { backing, ram, device_window }`；设备窗口按 1 GiB 对齐、≤1 TiB、受物理地址上限约束；`ResourceBook.device_memory`；replay 复用记录窗口并重新校验宿主能力；只映射启动 RAM、只将其写入 PVH 内存表。窗口边界/空窗/溢出、池耗尽/越窗/重叠/重放、RAM slot 预算及物理宽度测试通过；禁用 replay 校验会使两项边界测试失败。两种后端的 KVM round-trip 与全部 make 检查通过；尚无内存设备，额外设备 grant 与 slot 预算随消费者接入。
+- [x] 内存阶段 M1（6333f42，design.mem.md）：`MemoryPlan { backing, ram, device_window }`；设备窗口按 1 GiB 对齐、≤1 TiB、受物理地址上限约束；`ResourceBook.device_memory`；replay 复用记录窗口并重新校验宿主能力；只映射启动 RAM、只将其写入 PVH 内存表。窗口边界/空窗/溢出、池耗尽/越窗/重叠/重放、RAM slot 预算及物理宽度测试通过；禁用 replay 校验会使两项边界测试失败。两种后端的 KVM round-trip 与全部 make 检查通过；尚无内存设备，额外设备 grant 与 slot 预算随消费者接入。
+- [x] 内存阶段 M2（design.mem.md）：不可克隆的 `MemSlots` / `SlotPermit`，机器拥有值类型 slot 池；绑定消耗凭据，失败归还，解绑成功归还凭据与映射，Drop 失败保留映射；额外 RAM 在启动前预映射而不绑定；启动绑定由 Machine 持有，build/rebuild 共用。真实 vCPU 在两种后端上观测 `0 → 0x44332211 → 0 → 0x44332211 → 0`；非法范围、跨 VM、失败重试、映射寿命、批量分配与文档测试通过。跳过删除、取消失败映射保留、增加 Clone 的变异均被捕获；完整 make 检查通过。按要求停在 virtio-mem 之前。
 
 运行真实 Linux 冒烟测试：
 

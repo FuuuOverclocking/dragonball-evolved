@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use api::machine::MemoryBacking;
 use vm_memory::mmap::MmapRegionBuilder;
-use vm_memory::{FileOffset, GuestAddress, GuestRegionMmap};
+use vm_memory::{Address, FileOffset, GuestAddress, GuestMemoryRegion, GuestRegionMmap};
 
 use crate::arch::x86_64::layout::{self, DEVICE_MEMORY_ALIGN, DEVICE_MEMORY_MAX_SIZE, PAGE_SIZE};
 use crate::devices::virtio::{GuestMemoryMmap, SharedGuestMemory};
@@ -73,6 +73,8 @@ impl MemoryPlan {
     }
 }
 
+pub type RamMapping = Arc<GuestRegionMmap<()>>;
+
 /// A machine's guest RAM: the host mappings, and the plan they were mapped from.
 ///
 /// It has a single owner, the only one that can bind it to a VM. Views of the
@@ -88,14 +90,19 @@ impl MemoryPlan {
 pub struct GuestRam {
     plan: MemoryPlan,
     memory: SharedGuestMemory,
+    mappings: Vec<RamMapping>,
 }
 
 impl GuestRam {
-    /// Maps the planned regions, zero-filled. A shared region is backed by a
-    /// memfd of its own, reachable through the region's file offset.
-    pub fn map(plan: &MemoryPlan) -> Result<Self> {
-        let mut mappings = Vec::with_capacity(plan.ram.len());
-        for &region in &plan.ram {
+    pub fn map(plan: &MemoryPlan, runtime_ram: &[GpaRange]) -> Result<Self> {
+        let mut mappings = Vec::with_capacity(plan.ram.len() + runtime_ram.len());
+        for &region in plan.ram.iter().chain(runtime_ram) {
+            if region.is_empty()
+                || !region.start().is_multiple_of(PAGE_SIZE)
+                || !region.len().is_multiple_of(PAGE_SIZE)
+            {
+                bail!("guest RAM region must be non-empty and page-aligned");
+            }
             let len = usize::try_from(region.len()).context("guest memory region is too large")?;
             let builder = MmapRegionBuilder::<()>::new(len)
                 .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
@@ -111,14 +118,27 @@ impl GuestRam {
                 .with_context(|| format!("map guest memory region {region}"))?;
             let mapping = GuestRegionMmap::new(mmap, GuestAddress(region.start()))
                 .context("guest memory region address overflows")?;
-            mappings.push(mapping);
+            mappings.push(Arc::new(mapping));
         }
-        let memory =
-            GuestMemoryMmap::from_regions(mappings).context("assemble guest memory regions")?;
+        mappings.sort_unstable_by_key(|region| region.start_addr());
+        let memory = GuestMemoryMmap::from_arc_regions(mappings.clone())
+            .context("assemble guest memory regions")?;
         Ok(Self {
             plan: plan.clone(),
             memory: Arc::new(memory),
+            mappings,
         })
+    }
+
+    pub(super) fn mapping(&self, range: GpaRange) -> Result<RamMapping> {
+        self.mappings
+            .iter()
+            .find(|mapping| {
+                let start = mapping.start_addr().raw_value();
+                range.start() >= start && range.end() <= start + mapping.len()
+            })
+            .map(Arc::clone)
+            .context("binding range is outside a single guest RAM mapping")
     }
 
     /// The plan this RAM was mapped from.
@@ -189,7 +209,7 @@ mod tests {
     fn maps_split_guest_memory_with_read_write_access() {
         for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
             let plan = split(backing);
-            let ram = GuestRam::map(&plan).unwrap();
+            let ram = GuestRam::map(&plan, &[]).unwrap();
             assert_eq!(ram.plan(), &plan);
             let memory = ram.memory();
             let mapped = memory
@@ -225,7 +245,7 @@ mod tests {
 
     #[test]
     fn shared_regions_are_reachable_through_a_sealed_memfd() {
-        let ram = GuestRam::map(&split(MemoryBacking::Shared)).unwrap();
+        let ram = GuestRam::map(&split(MemoryBacking::Shared), &[]).unwrap();
         let memory = ram.memory();
         memory
             .write_slice(b"guest", GuestAddress(0x1_0000_0010))
@@ -239,5 +259,39 @@ mod tests {
         assert_eq!(file.metadata().unwrap().len(), 0x1000);
         assert!(file.set_len(0x2000).is_err(), "the memfd can still grow");
         assert!(file.set_len(0).is_err(), "the memfd can still shrink");
+    }
+
+    #[test]
+    fn runtime_ram_is_mapped_without_changing_boot_ram() {
+        let range = GpaRange::new(0x8000, 0xa000);
+        for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
+            let plan = split(backing);
+            let ram = GuestRam::map(&plan, &[range]).unwrap();
+            assert_eq!(ram.plan(), &plan);
+            assert_eq!(ram.memory().num_regions(), 3);
+            let mapping = ram.mapping(GpaRange::new(0x9000, 0xa000)).unwrap();
+            assert_eq!(mapping.start_addr(), GuestAddress(range.start()));
+            ram.memory()
+                .write_obj(0x4433_2211u32, GuestAddress(0x9000))
+                .unwrap();
+            assert_eq!(
+                ram.memory().read_obj::<u32>(GuestAddress(0x9000)).unwrap(),
+                0x4433_2211
+            );
+            assert!(ram.mapping(GpaRange::new(0x7000, 0xa000)).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_runtime_mappings_are_rejected() {
+        let plan = split(MemoryBacking::Anonymous);
+        for range in [
+            GpaRange::new(0x8000, 0x8000),
+            GpaRange::new(0x8001, 0x9000),
+            GpaRange::new(0x8000, 0x9001),
+            GpaRange::new(0x1000, 0x3000),
+        ] {
+            assert!(GuestRam::map(&plan, &[range]).is_err());
+        }
     }
 }

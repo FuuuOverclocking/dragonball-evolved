@@ -472,21 +472,24 @@ mod tests {
     use crate::arch::x86_64::regs::{boot_fpu, boot_regs, boot_sregs};
     use crate::devices::legacy::i8042::I8042Device;
     use crate::devices::legacy::serial::SerialDevice;
+    use crate::machine::build::create_vm;
     use crate::machine::bus::BusDevice;
     use crate::machine::memory::{GuestRam, MemoryPlan};
-    use crate::machine::vm::KvmVm;
+    use crate::machine::vm::{Binding, KvmVm};
+    use crate::resources::GpaRange;
 
     const KVM_TEST_TIMEOUT: Duration = Duration::from_secs(2);
     const MMIO_READ_VALUE: u32 = 0x4433_2211;
 
-    fn test_vm(context: &KvmContext) -> Arc<KvmVm> {
+    fn test_vm(context: &KvmContext) -> (Arc<KvmVm>, Vec<Binding>) {
         let plan = MemoryPlan::new(
             16 << 20,
             api::machine::MemoryBacking::Anonymous,
             context.capabilities(),
         )
         .unwrap();
-        KvmVm::new(context, GuestRam::map(&plan).unwrap()).unwrap()
+        let (vm, bindings, _) = create_vm(context, GuestRam::map(&plan, &[]).unwrap()).unwrap();
+        (vm, bindings)
     }
 
     #[derive(Clone)]
@@ -538,7 +541,7 @@ mod tests {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let vm = test_vm(&context);
+        let (vm, _bindings) = test_vm(&context);
         let memory = Arc::clone(vm.memory());
 
         const ENTRY: u64 = 0x10_0000;
@@ -626,7 +629,7 @@ mod tests {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let vm = test_vm(&context);
+        let (vm, _bindings) = test_vm(&context);
         let memory = Arc::clone(vm.memory());
 
         const ENTRY: u64 = 0x10_0000;
@@ -700,12 +703,117 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn running_guest_observes_runtime_bind_unbind_and_drop_on_kvm() {
+        if !Path::new("/dev/kvm").exists() {
+            return;
+        }
+        const ENTRY: u64 = 0x10_0000;
+        const RUNTIME_RAM: GpaRange = GpaRange::new(0x1000_0000, 0x1000_2000);
+        const CHUNK: GpaRange = GpaRange::new(0x1000_1000, 0x1000_2000);
+        const VALUE: u64 = 0x8000;
+        const SEQUENCE: u64 = 0x8004;
+        const MARKER: u32 = 0x4433_2211;
+        let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+        for backing in [
+            api::machine::MemoryBacking::Anonymous,
+            api::machine::MemoryBacking::Shared,
+        ] {
+            let plan = MemoryPlan::new(16 << 20, backing, context.capabilities()).unwrap();
+            let (vm, _boot, mut pool) =
+                create_vm(&context, GuestRam::map(&plan, &[RUNTIME_RAM]).unwrap()).unwrap();
+            let permit = pool.allocate(1).unwrap().pop().unwrap();
+            vm.memory()
+                .write_obj(MARKER, GuestAddress(CHUNK.start()))
+                .unwrap();
+            let mut code = vec![0xa1];
+            code.extend_from_slice(&(CHUNK.start() as u32).to_le_bytes());
+            code.push(0xa3);
+            code.extend_from_slice(&(VALUE as u32).to_le_bytes());
+            code.extend_from_slice(&[0xff, 0x05]);
+            code.extend_from_slice(&(SEQUENCE as u32).to_le_bytes());
+            code.extend_from_slice(&[0xeb, 0xee]);
+            vm.memory().write_slice(&code, GuestAddress(ENTRY)).unwrap();
+
+            let vcpu = vm.create_vcpu(0).unwrap();
+            vcpu.set_cpuid2(
+                &normalize(
+                    &context.capabilities().supported_cpuid,
+                    &context.capabilities().host_cpuid,
+                    1,
+                    0,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let entries = boot_msrs();
+            assert_eq!(
+                vcpu.set_msrs(&Msrs::from_entries(&entries).unwrap())
+                    .unwrap(),
+                entries.len()
+            );
+            vcpu.set_regs(&boot_regs(ENTRY)).unwrap();
+            vcpu.set_fpu(&boot_fpu()).unwrap();
+            let (sregs, tables) = boot_sregs(vcpu.get_sregs().unwrap());
+            for table in tables {
+                vm.memory()
+                    .write_slice(&table.bytes, GuestAddress(table.address))
+                    .unwrap();
+            }
+            vcpu.set_sregs(&sregs).unwrap();
+            vcpu.set_lapic(&configure_lint(vcpu.get_lapic().unwrap()))
+                .unwrap();
+            let (events, mut exits) = tokio_mpsc::unbounded_channel();
+            let vcpus = Vcpus::new(vec![
+                VcpuHandle::spawn(
+                    0,
+                    vcpu,
+                    Arc::new(Bus::empty()),
+                    Arc::new(Bus::empty()),
+                    events,
+                )
+                .unwrap(),
+            ]);
+            let memory = vm.memory();
+            let observe = |expected| async move {
+                let before = memory.read_obj::<u32>(GuestAddress(SEQUENCE)).unwrap();
+                time::timeout(KVM_TEST_TIMEOUT, async {
+                    loop {
+                        let sequence = memory.read_obj::<u32>(GuestAddress(SEQUENCE)).unwrap();
+                        let value = memory.read_obj::<u32>(GuestAddress(VALUE)).unwrap();
+                        if sequence.wrapping_sub(before) != 0 && value == expected {
+                            break value;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("guest stopped advancing or read the wrong value")
+            };
+            vcpus.resume().await.unwrap();
+            let before = observe(0).await;
+            let binding = permit.bind(CHUNK).unwrap();
+            let bound = observe(MARKER).await;
+            let (permit, _mapping) = binding.unbind().unwrap();
+            let unbound = observe(0).await;
+            let binding = permit.bind(CHUNK).unwrap();
+            let rebound = observe(MARKER).await;
+            drop(binding);
+            let dropped = observe(0).await;
+            vcpus.stop().await.unwrap();
+            assert!(exits.try_recv().is_err(), "guest or vCPU failed");
+            println!(
+                "{backing:?}: before={before:#x}, bound={bound:#x}, unbound={unbound:#x}, rebound={rebound:#x}, dropped={dropped:#x}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn capture_state_returns_set_registers_on_kvm() {
         if !Path::new("/dev/kvm").exists() {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let vm = test_vm(&context);
+        let (vm, _bindings) = test_vm(&context);
         let memory = Arc::clone(vm.memory());
 
         const ENTRY: u64 = 0x10_0000;

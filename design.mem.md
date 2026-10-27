@@ -78,21 +78,24 @@
 ### 4.1 KVM 绑定：RAII 句柄（本阶段实现）
 
 ```rust
+pub type RamMapping = Arc<GuestRegionMmap<()>>;
+pub struct MemSlots { vm: Arc<KvmVm>, pool: IdPool<MemSlot> } // 不实现 Clone
+pub struct SlotPermit { vm: Arc<KvmVm>, slot: MemSlot }      // 不实现 Clone / Copy
 pub struct Binding {
-    vm: Arc<KvmVm>,     // 删除 slot 需要 VM fd
-    slot: MemSlot,
+    permit: Option<SlotPermit>,
     range: GpaRange,
-    mapping: …,         // 映射的 Arc：KVM 可能访问期间，映射一直活着
+    mapping: RamMapping,
 }
 
 impl KvmVm {
-    /// range 必须落在本 VM 自己的 GuestRam 中尚未绑定的区域内。
-    pub fn bind(self: &Arc<Self>, slot: MemSlot, range: GpaRange) -> Result<Binding>;
+    pub fn new(context: &KvmContext, ram: GuestRam) -> Result<(Arc<Self>, MemSlots)>;
+    pub fn bind(self: &Arc<Self>, permit: SlotPermit, range: GpaRange)
+        -> Result<Binding, (SlotPermit, anyhow::Error)>;
 }
-
+impl MemSlots { pub fn allocate(&mut self, count: usize) -> Result<Vec<SlotPermit>>; }
+impl SlotPermit { pub fn bind(self, range: GpaRange) -> Result<Binding, (Self, anyhow::Error)>; }
 impl Binding {
-    /// 删除 slot 成功才交还映射；失败则原样还回句柄，它仍处于绑定状态。
-    pub fn unbind(self) -> Result<…, (Self, anyhow::Error)>;
+    pub fn unbind(self) -> Result<(SlotPermit, RamMapping), (Self, anyhow::Error)>;
 }
 // Drop：尽力删除 slot；删除失败就泄漏映射，绝不 unmap KVM 仍能访问的内存。
 ```
@@ -103,7 +106,11 @@ impl Binding {
 2. **再确认**：VMM 内的访问者都经视图值访问；新视图下发后，各自回 ack 即放弃旧视图（§4.2）。外部访问者（以后）：vhost-user 对 `REM_MEM_REG` 的应答、VFIO unmap 的返回。
 3. **最后 unmap**：munmap 发生在最后一个 `Arc` 被 drop 时（vm-memory 的 `MmapRegion`）。
 
-slot 号由 `Machine` 持有的值类型 `IdPool<MemSlot>` 分配，attach 时按 plan 给每个设备预留一段（单一所有者，不需要锁）；slot 号仍不进 plan 与快照。绑定由拥有区域的设备持有，不经 vmm-main：这样不会出现"设备等 vmm-main 回复、vmm-main 在 Busy(pause) 中等这个设备 quiesce"的死锁。
+M2 实施时补上了唯一绑定权：KVM 对同一 slot 的相同注册会成功，而不是报冲突（`kvm_main.c:2073-2116`）；只用可复制的 `MemSlot` 会产生两个 RAII 句柄，drop 一个就删掉另一个的绑定。因此 `KvmVm::new` 只交出一份不可克隆的 `MemSlots`，内部仍是值类型 `IdPool<MemSlot>`；`Machine` 持有它，`allocate_memslots` 只在全部分配成功后提交新池，产生不可克隆且属于这台 VM 的 `SlotPermit`。绑定消耗凭据；失败交回，成功解绑也交回，后者可再次绑定。丢弃凭据或 Binding 会消耗其预留，不会偷偷重新发出这个 slot；目前不提供释放/reissue API。
+
+`GuestRam::map(plan, runtime_ram)` 在 VM 创建前映射启动与额外 RAM，视图固定；`KvmVm::new` 不做绑定。`build::create_vm` 在唯一 slot 池上为启动 RAM 创建 `Binding`，由 `Machine` 持有，build/rebuild 共用；额外 RAM 只预映射，运行期凭据只能绑定本 VM 内一个映射中的非空、页对齐范围。KVM 拒绝与其他 slot 重叠的范围。拆除在 vCPU、设备停下后 drop 设备、启动绑定与分配权，再关闭 VM、交还 RAM。
+
+attach 时按 plan 为内存设备预留 slot 随 M3 / M4 接入。slot 号与句柄仍不进 plan 或快照；绑定由拥有区域的设备持有，不经 vmm-main：这样不会出现"设备等 vmm-main 回复、vmm-main 在 Busy(pause) 中等这个设备 quiesce"的死锁。
 
 ### 4.2 设备 DMA 视图：按值下发 + oneshot 确认（以后实现）
 
@@ -231,8 +238,10 @@ pub struct ResourceBook { pub virtio_mmio: AddressPool, pub legacy_gsi: IdPool<G
 // machine（副作用）
 pub struct GuestRam { /* 映射及其布局；不实现 Clone */ }
 pub type SharedGuestMemory = Arc<GuestMemoryMmap>;      // 视图
-pub struct KvmVm { fd: VmFd, ram: GuestRam }            // new() 只绑定启动 RAM
-pub struct Binding { vm: Arc<KvmVm>, slot: MemSlot, range: GpaRange, mapping: … }
+pub struct KvmVm { fd: VmFd, ram: GuestRam }            // new() 交出 VM 与唯一 slot 分配权
+pub struct MemSlots { vm: Arc<KvmVm>, pool: IdPool<MemSlot> }
+pub struct SlotPermit { vm: Arc<KvmVm>, slot: MemSlot }
+pub struct Binding { permit: Option<SlotPermit>, range: GpaRange, mapping: RamMapping }
 pub enum AttachedDevice { Block(AttachedBlock), Mem(AttachedMem) }
 
 // 快照
@@ -251,7 +260,7 @@ pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -
 | --- | --- | --- | --- |
 | M0 所有权与视图拆分 | `GuestRam` 与唯一的视图别名；`KvmVm { fd, ram }`、`into_ram`；`teardown` 交还 RAM；快照去掉 memory，`rebuild` 按值接收 RAM；删除 `describe()` | 两种后端的 round-trip 改为 teardown → rebuild；内存比 VM 与 vCPU 活得久；vCPU 未退出时交不出 RAM；文档测试证明 RAM 不能用两次 | 功能不变 |
 | M1 区域模型与设备内存窗口 | `MemoryPlan { backing, ram, device_window }`；`layout::device_window`；`ResourceBook.device_memory`；`replay` 覆盖内存 grant；phys-bits 与 slot 预算；e820 只取启动 RAM | 单测：窗口位置与对齐（RAM ≤ 3 GiB / > 3 GiB）、池耗尽、replay 拒绝越窗与重叠、slot 预算 | 还没有设备使用窗口 |
-| M2 运行期 memslot 绑定 | `Binding`、`KvmVm::bind`；`Machine` 持有 `IdPool<MemSlot>` | KVM：mini guest 循环读一个运行期区间（放在 4 GiB 以下）：绑定前读到 0 且 VMM 不退出，绑定后读到标记，解绑后再读到 0；映射在解绑后才释放；删除失败走泄漏路径 | 只新增 API |
+| M2 运行期 memslot 绑定 | `Binding`、`KvmVm::bind`；唯一 `MemSlots` 内的值类型 `IdPool` 由 `Machine` 持有；绑定消耗 `SlotPermit`；额外 RAM 先映射但不绑定 | KVM：mini guest 在运行期区间观测 0 → 标记 → 0 → 标记 → 0（含凭据复用与 Drop）；非法范围、跨 VM、失败重试、映射寿命、删除失败泄漏；分配事务性与三项凭据文档测试 | 只新增库 API，无内存设备 |
 | M3 virtio-mem | 纯核、设备任务、`machine/mem.rs` 纵切、transport 可变配置、API、按 chunk 绑定与 discard、`DeviceSnapshot::Mem` | 纯核单测（对齐、超出 requested、副作用顺序、设备复位不改块状态）；设备测试扮演 guest 驱动；KVM 测试观察 chunk 绑定；同进程 round-trip 保留已插块；真实 Linux：调大后 MemTotal 增加，调小后减少、宿主 RSS 回落 | 不配置时与之前一致 |
 | M4 virtio-pmem（可选） | 设备拥有的文件映射（`MAP_SHARED`，只读加 `KVM_MEM_READONLY`）、io 线程上 flush、不进 DMA 视图、快照只记配置 | guest 中 `mount -o dax` 读到宿主写入的标记；写只读 pmem 被丢弃且 VMM 不退出 | 新增设备 |
 | M5 快照持久化 | 带版本与 CRC 的序列化、稀疏镜像 + manifest、Copy 恢复、`HandoverState` 交接 memfd | 跨进程恢复 mini guest 与 virtio-mem 插拔状态；损坏或版本不符被拒；交接后新进程继续运行 | 新增能力 |
@@ -264,7 +273,7 @@ M1 尚无内存设备，slot 预算就是启动 RAM 段数；设备内存池已�
 
 - [x] M0 所有权与视图拆分：两种后端的 KVM round-trip、复制 vCPU fd 关闭前后交接、RAM 不可克隆与不可二次恢复的文档测试通过；移除 plan 核对与添加 Clone 的变异均被测试捕获。`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
 - [x] M1 区域模型与设备内存窗口：只映射/上报启动 RAM；窗口位置、对齐、物理上限、空窗与溢出、设备内存池的耗尽/越窗/重叠与重放、记录窗口的 replay、RAM slot 预算测试通过；禁用 replay 校验会使两项边界测试失败。两种后端的 KVM round-trip、`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
-- [ ] M2 运行期 memslot 绑定
+- [x] M2 运行期 memslot 绑定：两种后端上真实 vCPU 在 4 GiB 以下观测 `0 → 0x44332211 → 0 → 0x44332211 → 0`；非法范围、跨 VM、绑定/解绑失败归还句柄、分配事务性、映射寿命与失败泄漏、不可克隆/重复消耗凭据均有测试。跳过删除、取消失败映射保留、增加 Clone 的变异均被捕获并已恢复；`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。按要求停在此处，未开始 virtio-mem。
 - [ ] M3 virtio-mem
 - [ ] M4 virtio-pmem（可选）
 - [ ] M5 快照持久化
@@ -274,7 +283,7 @@ M1 尚无内存设备，slot 预算就是启动 RAM 段数；设备内存池已�
 1. 已修正（M0）：移除预设运行期增长使用 `GuestMemoryAtomic` 的注释；视图传播方案见 §4.2。
 2. 已修正（M0）：`SharedGuestMemory` 只在 `devices/virtio/mod.rs` 定义，design.md §6.7 已同步。
 3. 已修正（M0）：删除 `describe()`，由 `GuestRam` 保存映射时的 plan；design.md §6.7 与 §8.8 已同步。`MemoryPlan.backing` 与 `plan.spec.memory_backing` 仍各自记录，plan 的内部一致性校验仍是已知限制。
-4. §6.6 与 B1 说 memslot "从 `IdPool<MemSlot>` 分配"，实际上池只是 `KvmVm::new` 的局部变量（M2 修正）。
+4. 已修正（M2）：唯一 `MemSlots` 内的值类型 `IdPool<MemSlot>` 由 `Machine` 持有；分配、绑定使用不可克隆的权利凭据，design.md §6.6 / §6.7 已同步。
 5. §8.4 没有说明 transport 不实现 SHM 寄存器与 ConfigGeneration（M3 补充）。
 6. 附录 A 仍以 `/fuu.code/kernel-5.10/.config` 为准；冒烟测试用的已是 kangaroo-6.6，且未列出内存设备所需的内核选项（M3 补充）。
 
@@ -296,6 +305,8 @@ M1 尚无内存设备，slot 预算就是启动 RAM 段数；设备内存池已�
 
 ## 13. 本阶段的已知限制（预期）
 
+- 当前到 M2；运行期绑定状态尚不进入快照，内存设备消费者在 M3 / M4 接入。未开始 virtio-mem。
+- 丢弃 slot 凭据不会自动释放编号；成功解绑交回的凭据可复用。Drop 删除失败故意保留映射，即使最后 VM 已关闭也可能泄漏。
 - 设备 DMA 视图包含整个 virtio-mem 区：guest 违反协议对未插块做 DMA 时，会重新分配宿主页（上限为区域大小），而不是得到 I/O 错误。
 - 设备窗口（pmem、DAX）不在 DMA 视图中：guest 对这些页做 O_DIRECT 会得到 I/O 错误。
 - 启动后不能提高热插上限，也不能新增 virtio-mem 设备（E9）。
