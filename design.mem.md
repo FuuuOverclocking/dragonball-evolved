@@ -260,7 +260,7 @@ pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -
 
 ## 10. 进度
 
-- [ ] M0 所有权与视图拆分
+- [x] M0 所有权与视图拆分：两种后端的 KVM round-trip、复制 vCPU fd 关闭前后交接、RAM 不可克隆与不可二次恢复的文档测试通过；移除 plan 核对与添加 Clone 的变异均被测试捕获。`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
 - [ ] M1 区域模型与设备内存窗口
 - [ ] M2 运行期 memslot 绑定
 - [ ] M3 virtio-mem
@@ -269,9 +269,9 @@ pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -
 
 ## 11. 需要同步回 design.md 的偏差
 
-1. `devices/virtio/mod.rs:19-23` 的注释预设"运行期增长要用 `GuestMemoryAtomic`"，与本设计相反（M0 修正）。
-2. `SharedGuestMemory` 在 `machine/memory.rs:20` 与 `devices/virtio/mod.rs:23` 各定义一次；§6.7 只列出一个（M0 修正）。
-3. §6.7 把 `describe()` 描述为"实际映射出的 plan"，它只在恰好两种后端、每段都是 RAM 时成立；`MemoryPlan.backing` 与 `plan.spec.memory_backing` 重复（M0 删除 `describe()`）。
+1. 已修正（M0）：移除预设运行期增长使用 `GuestMemoryAtomic` 的注释；视图传播方案见 §4.2。
+2. 已修正（M0）：`SharedGuestMemory` 只在 `devices/virtio/mod.rs` 定义，design.md §6.7 已同步。
+3. 已修正（M0）：删除 `describe()`，由 `GuestRam` 保存映射时的 plan；design.md §6.7 与 §8.8 已同步。`MemoryPlan.backing` 与 `plan.spec.memory_backing` 仍各自记录，plan 的内部一致性校验仍是已知限制。
 4. §6.6 与 B1 说 memslot "从 `IdPool<MemSlot>` 分配"，实际上池只是 `KvmVm::new` 的局部变量（M2 修正）。
 5. §8.4 没有说明 transport 不实现 SHM 寄存器与 ConfigGeneration（M3 补充）。
 6. 附录 A 仍以 `/fuu.code/kernel-5.10/.config` 为准；冒烟测试用的已是 kangaroo-6.6，且未列出内存设备所需的内核选项（M3 补充）。

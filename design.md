@@ -190,8 +190,8 @@
 配置类 VmmCommand ──apply──▶ MachineSpec                 纯：可比较
 MachineSpec + HostCaps ──MachinePlan::new──▶ MachinePlan  纯：validate，再定 RAM 区段、设备 grant、cmdline
 MachinePlan + 内核/initrd ──build──▶ Machine             副作用：ioctl、mmap、fd、线程、任务
-暂停的 Machine ──capture──▶ MachineSnapshot              读取：设备、平台、vCPU、VM 状态 + 内存引用
-MachineSnapshot ──rebuild──▶ Machine                     副作用：重放快照里 plan 的 grant，再恢复状态
+暂停的 Machine ──capture──▶ MachineSnapshot              读取：设备、平台、vCPU、VM 状态；不持有 RAM
+MachineSnapshot + GuestRam ──rebuild──▶ Machine          副作用：接管拆除后交还的 RAM，重放 grant，再恢复状态
 ```
 
 - **`HostCaps`**：打开 `/dev/kvm` 时一次性取得的纯数据投影。包括：
@@ -363,8 +363,8 @@ status
 1. **接收 `Shutdown` 时回复**：立即发送 `Ok(())`，只确认请求已进入停止流程；然后关闭请求入口。
 2. **停 vCPU**：向全部 vCPU 发 `Stop` 并踢出 → `.await` 每个线程的"已退出"通知 → 在 blocking pool 中 `join`。
 3. **停设备**：`tasks.stop()`——设置 stop watch，向全部 guest gate 发 `Stop`，`.await` 全部 `DeviceExit`（含 io 线程上的）→ 结束 io 线程。
-4. **drop `Machine`**：Bus 与 transport、ioeventfd/irqfd 注册、vCPU fd、`KvmVm`。
-5. **释放 guest memory**：由所有权结构保证，拆除代码不再手工排序（§6.7）。`KvmVm` 拥有 VM fd 与 memory 且先关 fd；每个 `KvmVcpu`（含踢出用的复制 fd）持有 `Arc<KvmVm>`。所以映射只会在 VM fd 与全部 vCPU fd 关闭之后解除。快照另持有 memory 的 `Arc`，RAM 因此可以跨过源机器的拆除。
+4. **关闭 VM 并交还 RAM**：`KvmVm::into_ram` 只有在没有其他 `Arc<KvmVm>` 持有者时才成功；先关闭 VM fd，再交还 `GuestRam`。`Machine` 的其余资源（Bus、transport、ioeventfd/irqfd 注册）随拆除结束释放。
+5. **释放或接管 RAM**：`Machine::teardown() -> Result<GuestRam>`；生命周期退出时 drop RAM，恢复时把它按值交给 `rebuild`。每个 `KvmVcpu`（含踢出用的复制 fd）持有 VM，所以仍有 vCPU fd 时既不能交还 RAM，也不会解除映射（§6.7）。快照不持有 RAM。
 
 拆除结果写入最终 `VmmExitStatus`，不再修改已经发送的 Shutdown 回复。
 
@@ -571,25 +571,31 @@ pub struct MemoryPlan {
     pub backing: MemoryBacking,      // Anonymous（缺省）| Shared
     pub regions: Vec<GpaRange>,      // 有序、不相交；属于 guest ABI，快照记录、恢复照搬
 }
-pub fn create(plan: &MemoryPlan) -> Result<SharedGuestMemory>;
-pub fn describe(memory: &GuestMemoryMmap) -> Option<MemoryPlan>;   // 实际映射出的 plan
-
-pub struct KvmVm {
-    fd: VmFd,                        // 先声明，先关闭
-    memory: SharedGuestMemory,
+pub type SharedGuestMemory = Arc<GuestMemoryMmap>; // devices::virtio 中唯一的视图别名
+pub struct GuestRam { plan: MemoryPlan, memory: SharedGuestMemory } // 不实现 Clone
+impl GuestRam {
+    pub fn map(plan: &MemoryPlan) -> Result<Self>;
+    pub fn plan(&self) -> &MemoryPlan;
+    pub fn memory(&self) -> &SharedGuestMemory;
 }
+pub struct KvmVm { fd: VmFd, ram: GuestRam }      // fd 先声明，先关闭
 impl KvmVm {
-    pub fn new(context: &KvmContext, memory: SharedGuestMemory) -> Result<Arc<Self>>; // TSS、irqchip、PIT2、memslot
+    pub fn new(context: &KvmContext, ram: GuestRam) -> Result<Arc<Self>>; // TSS、irqchip、PIT2、memslot
     pub fn create_vcpu(self: &Arc<Self>, index: u8) -> Result<KvmVcpu>;
+    pub fn into_ram(self: Arc<Self>) -> Result<GuestRam, Arc<Self>>;
 }
 pub struct KvmVcpu { fd: VcpuFd, vm: Arc<KvmVm> }   // Deref<Target = VcpuFd>；try_clone 给踢出用
+impl Machine {
+    pub fn memory(&self) -> &SharedGuestMemory;
+    pub async fn teardown(self) -> Result<GuestRam>;
+}
 ```
 
 - **后端**：
   - `Anonymous`：`MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`。
   - `Shared`：每段一个 memfd（`MFD_CLOEXEC | MFD_ALLOW_SEALING`，内核支持时加 `MFD_NOEXEC_SEAL`，6.3 之前的内核拒绝该标志则去掉重试），封印 `SHRINK | GROW | SEAL`，以 `MAP_SHARED | MAP_NORESERVE` 映射；fd 经 region 的 `FileOffset` 取得。
-- **所有权**："映射只在 VM fd 与全部 vCPU fd 关闭之后解除"由类型保证，而不是靠拆除代码的顺序。KVM 在任一 vCPU fd 打开时保持 VM 存活，所以每个 `KvmVcpu`（含复制的 fd）持有 `Arc<KvmVm>`；`KvmVm` 内 fd 先于 memory 声明。两处 unsafe（`set_user_memory_region`、`create_vcpu_from_rawfd`）只出现在 `machine/vm.rs`。
-- **快照与恢复**：快照持有 memory 的另一个 `Arc`。`rebuild` 先用 `describe` 核对快照中的内存与 `plan.memory` 一致，再交给新的 `KvmVm`。
+- **所有权与视图**：`GuestRam` 是不可克隆的所有权句柄，记录映射时的 plan；`SharedGuestMemory` 是可克隆的字节视图，不能用于创建 VM。每个 `KvmVcpu`（含复制的 fd）持有 `Arc<KvmVm>`；VM 内 fd 先于 RAM 声明。`into_ram` 经 `Arc::try_unwrap` 确认没有其他持有者后先关 fd，所以 RAM 不能同时绑定到两台 VM，映射也不会早于全部 fd 解除。
+- **快照与恢复**：快照不持有 RAM；`pause → capture → teardown → rebuild(snapshot, ram, context)`。恢复按值接收 RAM，核对 `ram.plan() == &snapshot.plan.memory`，不再从 `FileOffset` 反推后端。运行期改变 DMA 视图的方案见 design.mem.md §4.2；当前区域固定，未引入 `GuestMemoryAtomic`。
 
 ## 7. CPUID、MSR、寄存器
 
@@ -856,13 +862,13 @@ gate 是纯 supervisor 层控制，不修改也不替换原始 future；quiesce 
 
 - `Machine::pause()`：`vcpus.pause()`（不再产生新的 I/O 退出）→ 每个已挂设备协作 quiesce 并记录自己的状态（块设备：`BlockQuiesced`）→ `tasks.quiesce()`（gate 类任务）。
 - `Machine::resume()`：`tasks.resume()` → 设备 resume（清除记录的状态）→ `vcpus.resume()`（guest 可以立即发起 I/O）。
-- `Machine::teardown()`：`vcpus.stop()` → `tasks.stop()` → drop；内存何时释放由所有权决定（§6.7）。
+- `Machine::teardown()`：`vcpus.stop()` → `tasks.stop()` → `KvmVm::into_ram`，返回 `GuestRam`；生命周期退出时释放，恢复时交接（§6.7）。
 
 **按 kind 纵切**：每类设备一个 `machine/<kind>.rs`（目前是 `block.rs`；i8042 与 COM1 合在 `platform.rs`），负责该类设备的 plan、attach（新建或恢复）、quiesce、capture。`DeviceSpec`、`DevicePlan`、`AttachedDevice`、`DeviceSnapshot` 都是按 kind 的 enum：新增一类设备即各加一个变体，由穷举 match 让编译器指出所有要补的地方。
 
 ### 8.8 状态可提取性：capture / rebuild
 
-**MachineSnapshot**：一次 capture 的全部内容。字段都是普通数据，不加 serde derive（同进程 round-trip 不需要序列化，见 G6），不持有任何内核对象。
+**MachineSnapshot**：一次 capture 的状态数据，不持有 RAM 或内核对象。不加 serde derive（同进程 round-trip 不需要序列化，见 G6）；恢复还需要拆除后交还的 `GuestRam`。
 
 ```rust
 pub struct MachineSnapshot {
@@ -871,8 +877,8 @@ pub struct MachineSnapshot {
     pub vcpus: Vec<VcpuSnapshot>,       // mp_state、regs、sregs、XSAVE、xcrs、debug_regs、lapic、CPUID、MSR、vcpu_events
     pub platform: PlatformSnapshot,     // i8042；COM1（console 为 None 时没有）
     pub devices: Vec<DeviceSnapshot>,   // plan 顺序；Block(BlockSnapshot { id, transport, queue: Option<QueueState> })
-    pub memory: SharedGuestMemory,      // Arc 引用，同进程共享映射
 }
+pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -> Result<Machine>;
 ```
 
 **Capture 顺序**（机器必须已暂停）：
@@ -882,9 +888,9 @@ pub struct MachineSnapshot {
 3. **vCPU**：`get_mp_state` 最先（`kvm_apic_accept_events` 有副作用），`get_vcpu_events` 最后。
 4. **VM**：irqchip → PIT → clock。
 
-**Rebuild 顺序**（只接收 `MachineSnapshot`）：
+**Rebuild 顺序**（按值接收 `MachineSnapshot` 与 `GuestRam`）：
 
-1. **纯校验，先于任何 KVM 对象**：`plan::replay` 校验 grant；`match_devices` 按 id 把设备状态对齐到 plan（缺失、重复、多余都报错）；vCPU 必须恰为 `0..cpus`；`memory::describe(&memory)` 必须等于 `plan.memory`。
+1. **纯校验，先于任何 KVM 对象**：`plan::replay` 校验 grant；`match_devices` 按 id 把设备状态对齐到 plan（缺失、重复、多余都报错）；vCPU 必须恰为 `0..cpus`；`ram.plan()` 必须等于 `&plan.memory`。
 2. `KvmVm::new`（TSS、irqchip、PIT2、memslot）→ `set_irqchip`×3 → `set_pit2`。
 3. 每个 vCPU：`create_vcpu` + `restore_state`：`set_cpuid2` → `set_mp_state` → regs → sregs → xsave → xcrs → debug_regs → lapic → msrs → `vcpu_events`，最后 `kvmclock_ctrl`（失败只告警）。
 4. `set_clock`。
@@ -1026,8 +1032,8 @@ crates/vmm/src/
 │   └── lapic.rs           LINT0 / LINT1
 ├── machine/               副作用侧（plan 为纯）
 │   ├── plan.rs            MachinePlan、DevicePlan、VirtioMmioGrant；replay
-│   ├── memory.rs          MemoryPlan；create / describe；memfd
-│   ├── vm.rs              KvmVm（VM fd + memory + memslot）、KvmVcpu
+│   ├── memory.rs          MemoryPlan、GuestRam（map / plan / memory）；memfd
+│   ├── vm.rs              KvmVm（VM fd + GuestRam + memslot、into_ram）、KvmVcpu
 │   ├── build.rs           build、assemble；Machine：pause / resume / teardown
 │   ├── block.rs           块设备纵切：plan / attach / quiesce / capture
 │   ├── platform.rs        i8042 + COM1：attach / capture
@@ -1051,9 +1057,9 @@ crates/vmm/src/
 | -------------- | ------------------------------------------------------------------------------------------ | ------------- |
 | 纯函数         | `ram_regions`、memmap、MP table（结构与校验和）、CPUID（每张表逐项断言）、GDT 编码、寄存器、MMIO 状态机（合法与非法转移、特性协商、reset）、i8042 状态机、cmdline 拼接、`MachineSpec` 校验；资源池（分配、对齐、reserve 冲突、release）、plan（根盘排序、grant、`replay`）、快照设备按 id 对齐 | 任意          |
 | 设备（已有形式） | 沿用 `tests/block.rs`、`tests/serial.rs`：测试扮演 guest 驱动；改为经 transport 激活，覆盖 reset 后重新激活、io 线程放置、quiesce / resume | 任意          |
-| 内存           | 两种后端的分段映射与读写；memfd 能看到 guest 写入、拒绝改变大小；guest memory 比 VM 与 vCPU 活得久 | 任意 / `/dev/kvm` |
+| 内存           | 两种后端的分段映射与读写；memfd 能看到 guest 写入、拒绝改变大小；映射比 VM 与 vCPU 活得久；复制 vCPU fd 未关闭时交不出 RAM，关闭后可携带内容重绑；compile-fail 文档测试验证 RAM 不可克隆、不可用于两次恢复 | 任意 / `/dev/kvm` |
 | KVM 集成       | mini PVH ELF：32 位代码先检查 `[ebx]` 是否等于 start_info magic，再向 COM1 输出 `OK`，最后 `out 0x64, 0xFE`；断言输出与 `GuestReset`。另测 pause/resume、Shutdown 立即确认及后续拆除、配置文件选择 shared 内存后启动 | `/dev/kvm`    |
-| 快照（`crates/vmm/tests/snapshot.rs`） | 寄存器递增 guest 的 round-trip（两种后端）；plan 顺序与逐盘激活在 rebuild 后保持；修改快照中的 grant 会移动设备；已退出的盘不阻碍 pause 但被 capture 拒绝；运行中的盘被拒绝；磁盘大小变化时拒绝恢复；capture 漏掉的中断在恢复时补发 | `/dev/kvm`    |
+| 快照（`crates/vmm/tests/snapshot.rs`） | 寄存器递增 guest 的 round-trip（两种后端，teardown 交还 RAM 再 rebuild）；plan 顺序与逐盘激活在 rebuild 后保持；修改快照中的 grant 会移动设备；已退出的盘不阻碍 pause 但被 capture 拒绝；运行中的盘被拒绝；磁盘大小变化、RAM 的 plan 不匹配时拒绝恢复；capture 漏掉的中断在恢复时补发 | `/dev/kvm`    |
 | 真实 Linux     | `#[ignore]`；`DBE_KERNEL`、`DBE_INITRD`、`DBE_ROOTFS`。断言串口出现约定标记，guest `reboot` 后 VMM 以 `Ok` 退出 | PVH 内核      |
 
 ## 12. 实施顺序
@@ -1086,8 +1092,7 @@ crates/vmm/src/
 - `Start` 在 vmm-main 上同步读取内核与 initrd 文件（D5 的例外）。
 - 控制台 raw mode 下，Ctrl-C 不会终止 VMM。
 - Busy 期间不处理机器事件（`MachineEvent`、`DeviceExit`）：操作 future 独占 Machine，events 和 device exits 的 receiver 在 future 内部不被 poll。操作完成后回到 Idle 时才会在下一轮 select 中处理积压的事件。
-- 快照只在同进程内有效：没有序列化与格式版本，RAM 以 `Arc` 共享而不复制；跨进程恢复需要 dump（或交接 memfd）以及 dirty page tracking（G6）。
-- 同一个快照可以在源机器仍存活时 rebuild，结果是两台 VM 共用一块 RAM。应在类型上排除：capture 消费 `Machine`，或 rebuild 要求源机器已拆除。
+- 快照恢复只在同进程内有效：没有序列化与格式版本，`GuestRam` 从源机器拆除后按值交接，不复制内容；跨进程恢复需要 dump 或交接 memfd（G6）。RAM 的 plan 核对不能证明内容对应某次 capture，调用者须在 capture 后保持暂停直到 teardown。
 - "已暂停"没有类型表示：capture 依赖各设备记录的状态做运行时检查。
 - rebuild 不核对 plan 的内部一致性（例如 cmdline 中的 virtio-mmio 片段与 grant 是否一致）。
 - `Restore.devices` 与 plan 按位置对应（`match_devices` 已按 id 排好序），类型上没有绑定。
@@ -1123,6 +1128,7 @@ crates/vmm/src/
 - [x] guest RAM 所有权（ff79a8f）：`KvmVm` 拥有 VM fd 与 memory，`KvmVcpu` 持有 `Arc<KvmVm>`；memslot 从 `IdPool<MemSlot>` 分配；`MemoryPlan` 取代 `MachinePlan.ram`。
 - [x] memfd 共享后端（f9e333f）：`SetMemoryBacking`（`.machine.memory_backing`、`PUT /v1/machine/memory-backing`）；sealed memfd；rebuild 核对内存与 plan 一致。
 - [x] 第二轮深度 review 修复（f050e2b）：恢复时补发未确认的中断；快照记录 `DeviceDesc`，恢复时拒绝变化的后端；队列在 attach 时校验；capture 拒绝运行中的设备；断开后 `Start` 失败时 vmm-main 退出；memfd 加 `MFD_NOEXEC_SEAL`。
+- [x] 内存阶段 M0（design.mem.md）：不可克隆的 `GuestRam` 与唯一的字节视图别名；`KvmVm::into_ram` 在全部 vCPU fd 关闭后交还 RAM；`Machine::teardown` 返回 RAM；快照不持有 RAM，恢复按值接管并核对 plan。两种后端的 KVM round-trip、内存寿命与复制 vCPU fd 屏障、两项 compile-fail 文档测试通过；移除 plan 核对与添加 Clone 的变异均被捕获。`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
 
 运行真实 Linux 冒烟测试：
 

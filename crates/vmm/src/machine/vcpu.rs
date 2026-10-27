@@ -473,7 +473,7 @@ mod tests {
     use crate::devices::legacy::i8042::I8042Device;
     use crate::devices::legacy::serial::SerialDevice;
     use crate::machine::bus::BusDevice;
-    use crate::machine::memory::{self, MemoryPlan};
+    use crate::machine::memory::{GuestRam, MemoryPlan};
     use crate::machine::vm::KvmVm;
 
     const KVM_TEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -484,7 +484,7 @@ mod tests {
             backing: api::machine::MemoryBacking::Anonymous,
             regions: ram_regions(16 << 20).unwrap(),
         };
-        KvmVm::new(context, memory::create(&plan).unwrap()).unwrap()
+        KvmVm::new(context, GuestRam::map(&plan).unwrap()).unwrap()
     }
 
     #[derive(Clone)]

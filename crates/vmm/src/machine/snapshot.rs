@@ -1,11 +1,11 @@
 //! Capturing a paused machine as data and restoring a machine from it.
 //!
-//! A snapshot holds the machine's plan, the KVM, vCPU and device state, and a
-//! reference to its guest memory. It holds no live kernel objects: a restore
-//! creates new ones and attaches every device at the grant the plan recorded.
+//! A snapshot holds the machine's plan and the KVM, vCPU and device state. It
+//! holds no live kernel objects and no guest RAM: a restore takes over the RAM
+//! of the torn-down machine, creates new kernel objects and attaches every
+//! device at the grant the plan recorded.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use kvm_bindings::{
@@ -16,7 +16,7 @@ use kvm_ioctls::VmFd;
 
 use super::block::BlockSnapshot;
 use super::build::{self, AttachedDevice, Machine, Restore};
-use super::memory::{self, SharedGuestMemory};
+use super::memory::GuestRam;
 use super::plan::{self, DevicePlan, MachinePlan};
 use super::platform::PlatformSnapshot;
 use super::vcpu::{self, Vcpus};
@@ -30,7 +30,6 @@ pub struct MachineSnapshot {
     pub platform: PlatformSnapshot,
     /// In plan order.
     pub devices: Vec<DeviceSnapshot>,
-    pub memory: SharedGuestMemory,
 }
 
 impl MachineSnapshot {
@@ -143,7 +142,6 @@ pub fn capture(machine: &Machine) -> Result<MachineSnapshot> {
         vcpus,
         platform,
         devices,
-        memory: Arc::clone(machine.vm.memory()),
     })
 }
 
@@ -151,19 +149,32 @@ pub fn capture(machine: &Machine) -> Result<MachineSnapshot> {
 // Rebuild
 // ---------------------------------------------------------------------------
 
-/// Reconstruct a [`Machine`] from a [`MachineSnapshot`], attaching every device
-/// at the grant its plan recorded.
+/// Reconstruct a [`Machine`] from a [`MachineSnapshot`] on the guest RAM it was
+/// captured with, attaching every device at the grant its plan recorded.
 ///
 /// The returned machine is paused: its vCPUs wait for a resume, and a disk whose
 /// backend had a session when captured is reactivated with its captured queue.
-pub fn rebuild(snapshot: MachineSnapshot, context: &KvmContext) -> Result<Machine> {
+///
+/// The RAM is taken by value, so a restore needs the RAM of a torn-down machine,
+/// and the same RAM cannot back two restores:
+///
+/// ```compile_fail,E0382
+/// use vmm::KvmContext;
+/// use vmm::machine::memory::GuestRam;
+/// use vmm::machine::snapshot::{MachineSnapshot, rebuild};
+///
+/// fn restore_twice(a: MachineSnapshot, b: MachineSnapshot, ram: GuestRam, context: &KvmContext) {
+///     let _first = rebuild(a, ram, context);
+///     let _second = rebuild(b, ram, context);
+/// }
+/// ```
+pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -> Result<Machine> {
     let MachineSnapshot {
         plan,
         vm: vm_state,
         vcpus: vcpu_states,
         platform,
         devices,
-        memory,
     } = snapshot;
     // Rejects grants that overlap or leave their pools before anything is attached.
     plan::replay(&plan.devices)?;
@@ -182,11 +193,11 @@ pub fn rebuild(snapshot: MachineSnapshot, context: &KvmContext) -> Result<Machin
             plan.spec.cpus
         );
     }
-    if memory::describe(&memory).as_ref() != Some(&plan.memory) {
-        bail!("the snapshot's guest memory does not match its plan");
+    if ram.plan() != &plan.memory {
+        bail!("the guest RAM was not mapped from the snapshot's plan");
     }
 
-    let vm = KvmVm::new(context, memory)?;
+    let vm = KvmVm::new(context, ram)?;
     let fd = vm.fd();
     fd.set_irqchip(&vm_state.pic_master)
         .context("restore PIC master")?;
@@ -256,7 +267,7 @@ mod tests {
             backing: api::machine::MemoryBacking::Anonymous,
             regions: ram_regions(16 << 20).unwrap(),
         };
-        let vm = KvmVm::new(&context, memory::create(&plan).unwrap()).unwrap();
+        let vm = KvmVm::new(&context, GuestRam::map(&plan).unwrap()).unwrap();
 
         let state = capture_vm_kvm(vm.fd()).unwrap();
         assert_eq!(state.pic_master.chip_id, 0);

@@ -13,13 +13,12 @@ use virtio_queue::{Queue, QueueState, QueueT};
 use vm_memory::GuestAddress;
 
 use super::bus::BusDevice;
-use super::memory::SharedGuestMemory;
 use super::plan::VirtioMmioGrant;
 use crate::devices::virtio::block::{
     BlockHandle, BlockQuiesceHandle, BlockQuiesced, BlockResources,
 };
 use crate::devices::virtio::mmio::{MmioTransport, MmioTransportSnapshot, NOTIFY_OFFSET};
-use crate::devices::virtio::{Activation, session_channel};
+use crate::devices::virtio::{Activation, SharedGuestMemory, session_channel};
 use crate::devices::{DeviceManager, DeviceRole, Placement};
 use crate::resources::ResourceBook;
 use crate::spec::BlockSpec;

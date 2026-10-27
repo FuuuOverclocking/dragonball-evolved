@@ -3,7 +3,7 @@ use std::io::Read;
 use std::range::Range;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use kvm_bindings::{KVM_MP_STATE_UNINITIALIZED, Msrs, kvm_mp_state};
 use kvm_ioctls::VmFd;
 use linux_loader::loader::elf::Elf;
@@ -14,7 +14,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
 use super::MachineEvent;
 use super::block::{self, AttachedBlock};
 use super::bus::{Bus, BusDevice};
-use super::memory::{self, SharedGuestMemory};
+use super::memory::GuestRam;
 use super::plan::{DevicePlan, MachinePlan};
 use super::platform::{Platform, PlatformSnapshot};
 use super::snapshot::DeviceSnapshot;
@@ -23,6 +23,7 @@ use super::vm::{KvmVcpu, KvmVm};
 use crate::KvmContext;
 use crate::arch::x86_64::{cpuid, lapic, layout, mptable, msr, pvh, regs};
 use crate::devices::DeviceManager;
+use crate::devices::virtio::SharedGuestMemory;
 
 pub struct Machine {
     pub vcpus: Option<Vcpus>,
@@ -98,6 +99,11 @@ impl Machine {
         &self.mmio
     }
 
+    /// A view of the guest RAM.
+    pub fn memory(&self) -> &SharedGuestMemory {
+        self.vm.memory()
+    }
+
     pub async fn pause(&mut self) -> Result<()> {
         self.vcpus.as_ref().unwrap().pause().await?;
         // Cooperatively quiesced devices record what they were doing as they park.
@@ -117,19 +123,21 @@ impl Machine {
         self.vcpus.as_ref().unwrap().resume().await
     }
 
-    pub async fn teardown(mut self) -> Result<()> {
-        let result = if let Some(vcpus) = self.vcpus.take() {
-            vcpus.stop().await
-        } else {
-            Ok(())
+    /// Stops the vCPUs and the devices, then closes the VM and hands its guest
+    /// RAM back.
+    pub async fn teardown(mut self) -> Result<GuestRam> {
+        let stopped = match self.vcpus.take() {
+            Some(vcpus) => vcpus.stop().await,
+            None => Ok(()),
         };
         self.tasks.stop().await;
-        result
+        stopped?;
+        KvmVm::into_ram(self.vm).map_err(|_| anyhow!("a vCPU still holds the VM"))
     }
 }
 
 pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
-    let vm = KvmVm::new(context, memory::create(&plan.memory)?)?;
+    let vm = KvmVm::new(context, GuestRam::map(&plan.memory)?)?;
     let memory = Arc::clone(vm.memory());
 
     let kernel = plan.spec.kernel.as_ref().unwrap();

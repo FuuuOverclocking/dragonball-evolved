@@ -21,6 +21,7 @@ use tokio::time;
 use vmm::KvmContext;
 use vmm::machine::build::{self, Machine};
 use vmm::machine::bus::Bus;
+use vmm::machine::memory::GuestRam;
 use vmm::machine::plan::{DevicePlan, MachinePlan, VirtioMmioGrant};
 use vmm::machine::snapshot::{self, rebuild};
 use vmm::resources::{GpaRange, Gsi};
@@ -160,9 +161,8 @@ async fn register_increment_round_trip_on_kvm() {
         let rax_before = snap.vcpus[0].regs.rax;
         assert!(rax_before > 0, "guest did not execute (rax = {rax_before})");
 
-        // The snapshot's memory Arc keeps the guest RAM mapped across the teardown.
-        machine.teardown().await.unwrap();
-        let mut restored = rebuild(snap, &context).unwrap();
+        let ram = machine.teardown().await.unwrap();
+        let mut restored = rebuild(snap, ram, &context).unwrap();
 
         restored.vcpus.as_ref().unwrap().resume().await.unwrap();
         time::sleep(Duration::from_millis(50)).await;
@@ -225,15 +225,15 @@ async fn rebuild_keeps_plan_layout_and_per_disk_activation_on_kvm() {
 
     machine.pause().await.unwrap();
     let snap = snapshot::capture(&machine).unwrap();
-    machine.teardown().await.unwrap();
+    // Play A's guest driver in the RAM the restored VM takes over.
+    let mut guest = GuestDriver::with_memory(Arc::clone(machine.memory()));
+    let ram = machine.teardown().await.unwrap();
     assert_eq!(snap.block("disk-a").unwrap().transport.regs.status, 15);
     assert!(snap.block("disk-a").unwrap().queue.is_some());
     assert_eq!(snap.block("disk-b").unwrap().queue, None);
 
-    // Play A's guest driver in the restored VM's RAM.
-    let mut guest = GuestDriver::with_memory(Arc::clone(&snap.memory));
     let captured_plan = snap.plan.clone();
-    let mut restored = rebuild(snap, &context).unwrap();
+    let mut restored = rebuild(snap, ram, &context).unwrap();
     assert_eq!(restored.plan(), &captured_plan);
     // Let the reactivated device finish its first drain, so that the kick
     // below is what delivers the request.
@@ -289,7 +289,8 @@ async fn rebuild_attaches_devices_at_the_recorded_grants_on_kvm() {
     negotiate_driver_ok(machine.mmio_bus(), planned);
     machine.pause().await.unwrap();
     let mut snap = snapshot::capture(&machine).unwrap();
-    machine.teardown().await.unwrap();
+    let mut guest = GuestDriver::with_memory(Arc::clone(machine.memory()));
+    let ram = machine.teardown().await.unwrap();
 
     let moved = VirtioMmioGrant {
         mmio: GpaRange::new(0xc000_8000, 0xc000_9000),
@@ -299,8 +300,7 @@ async fn rebuild_attaches_devices_at_the_recorded_grants_on_kvm() {
     assert_ne!(block.grant, moved);
     block.grant = moved;
 
-    let mut guest = GuestDriver::with_memory(Arc::clone(&snap.memory));
-    let mut restored = rebuild(snap, &context).unwrap();
+    let mut restored = rebuild(snap, ram, &context).unwrap();
     settle().await;
     let mut device_status = [0; 4];
     assert!(
@@ -339,13 +339,9 @@ async fn pause_survives_an_exited_disk_but_capture_refuses_it_on_kvm() {
     let base = window(&machine, "failing-disk");
     negotiate_driver_ok(machine.mmio_bus(), base);
 
-    // Reach the guest RAM through a snapshot taken while the device is healthy.
-    machine.pause().await.unwrap();
-    let memory = snapshot::capture(&machine).unwrap().memory;
-    machine.resume().await.unwrap();
-
     // An available index past the queue size makes the device task fail.
-    memory
+    machine
+        .memory()
         .write_obj(17u16, GuestAddress(AVAIL_RING + 2))
         .unwrap();
     assert!(
@@ -415,7 +411,7 @@ async fn rebuild_refuses_a_disk_whose_size_changed_on_kvm() {
     );
     machine.pause().await.unwrap();
     let snap = snapshot::capture(&machine).unwrap();
-    machine.teardown().await.unwrap();
+    let ram = machine.teardown().await.unwrap();
 
     std::fs::OpenOptions::new()
         .write(true)
@@ -423,11 +419,37 @@ async fn rebuild_refuses_a_disk_whose_size_changed_on_kvm() {
         .unwrap()
         .set_len(2 * SECTOR_SIZE as u64)
         .unwrap();
-    let Err(error) = rebuild(snap, &context) else {
+    let Err(error) = rebuild(snap, ram, &context) else {
         panic!("restored a disk whose size changed");
     };
     assert!(
         format!("{error:#}").contains("no longer offers"),
+        "{error:#}"
+    );
+}
+
+/// A restore runs only on RAM mapped from the snapshot's plan: the same ranges
+/// with another backing are refused.
+#[tokio::test(flavor = "local")]
+async fn rebuild_refuses_ram_mapped_from_another_plan_on_kvm() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+    let kernel = elf::TempFile::new(&elf::image(&inc_eax_payload(), true));
+    let mut machine = build_machine(spec(kernel.path(), Vec::new()), &context);
+    machine.pause().await.unwrap();
+    let snap = snapshot::capture(&machine).unwrap();
+    machine.teardown().await.unwrap();
+
+    let mut shared = snap.plan.memory.clone();
+    assert_eq!(shared.backing, MemoryBacking::Anonymous);
+    shared.backing = MemoryBacking::Shared;
+    let Err(error) = rebuild(snap, GuestRam::map(&shared).unwrap(), &context) else {
+        panic!("restored onto RAM mapped from another plan");
+    };
+    assert!(
+        error.to_string().contains("was not mapped from"),
         "{error:#}"
     );
 }
@@ -452,24 +474,21 @@ async fn rebuild_re_raises_an_unacknowledged_interrupt_on_kvm() {
     let line = 1u32 << block.grant.gsi.0;
     negotiate_driver_ok(machine.mmio_bus(), base);
 
-    // Reach the guest RAM through a snapshot, then complete a read whose
-    // interrupt the guest never acknowledges.
-    machine.pause().await.unwrap();
-    let mut guest = GuestDriver::with_memory(snapshot::capture(&machine).unwrap().memory);
-    machine.resume().await.unwrap();
+    // Complete a read whose interrupt the guest never acknowledges.
+    let mut guest = GuestDriver::with_memory(Arc::clone(machine.memory()));
     assert_eq!(
         read_sector(&mut guest, machine.mmio_bus(), base, 0).await,
         [0xd0; SECTOR_SIZE]
     );
     machine.pause().await.unwrap();
     let mut snap = snapshot::capture(&machine).unwrap();
-    machine.teardown().await.unwrap();
+    let ram = machine.teardown().await.unwrap();
     assert_ne!(snap.block("disk").unwrap().transport.interrupt_status, 0);
 
     // As if KVM had not yet injected the device's last irqfd write.
     // SAFETY: chip 2 is the IOAPIC, whose state is the union's `ioapic` member.
     unsafe { snap.vm.ioapic.chip.ioapic.irr &= !line };
-    let mut restored = rebuild(snap, &context).unwrap();
+    let mut restored = rebuild(snap, ram, &context).unwrap();
     restored.pause().await.unwrap();
     wait_until("the restored interrupt to reach the IOAPIC", || {
         let snap = snapshot::capture(&restored).unwrap();

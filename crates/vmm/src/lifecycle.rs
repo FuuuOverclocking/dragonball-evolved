@@ -53,7 +53,7 @@ impl Vm {
     pub(crate) async fn teardown(self) -> anyhow::Result<()> {
         match self {
             Self::NotStarted(_) => Ok(()),
-            Self::Running(machine) | Self::Paused(machine) => machine.teardown().await,
+            Self::Running(machine) | Self::Paused(machine) => machine.teardown().await.map(drop),
         }
     }
 

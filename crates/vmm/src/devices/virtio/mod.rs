@@ -16,10 +16,9 @@ pub use crate::devices::virtio::interrupt::{InterruptKind, IrqTrigger};
 /// Guest physical memory as devices see it.
 pub type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
 
-/// A cheaply clonable handle to guest memory.
-///
-/// `Arc` is enough while the memory map is fixed at boot; growing the guest at
-/// runtime would want `vm_memory::GuestMemoryAtomic` instead.
+/// A cheaply clonable view of guest memory. It reads and writes the bytes, but
+/// only the machine's `GuestRam` can bind them to a VM. The regions are fixed
+/// for the life of a machine.
 pub type SharedGuestMemory = Arc<GuestMemoryMmap>;
 
 /// Everything the guest driver negotiates before a device may touch its queues.

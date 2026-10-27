@@ -1,9 +1,10 @@
-//! The KVM VM and the guest memory bound to it.
+//! The KVM VM and the guest RAM bound to it.
 //!
 //! KVM keeps a VM alive while its fd or any of its vCPU fds is open, and the
 //! VM's memslots point into the host mappings of guest RAM, so those mappings
 //! must outlive every such fd. That is structural here: a [`KvmVm`] owns the
-//! memory it binds, and every [`KvmVcpu`] holds its VM.
+//! RAM it binds and gives it back only once nothing else holds the VM, and
+//! every [`KvmVcpu`] holds its VM.
 
 use std::io;
 use std::ops::{Deref, DerefMut};
@@ -16,9 +17,10 @@ use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config, kvm_userspace_memory_r
 use kvm_ioctls::{VcpuFd, VmFd};
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
 
-use super::memory::SharedGuestMemory;
+use super::memory::GuestRam;
 use crate::KvmContext;
 use crate::arch::x86_64::layout;
+use crate::devices::virtio::SharedGuestMemory;
 use crate::resources::IdPool;
 
 /// A KVM memory slot. Runtime only: a restore binds guest RAM to whichever
@@ -38,16 +40,17 @@ impl From<MemSlot> for u32 {
     }
 }
 
+#[derive(Debug)]
 pub struct KvmVm {
-    // Declared first, so the VM is closed before the memory it maps is released.
+    // Declared first, so the VM is closed before the RAM it maps is released.
     fd: VmFd,
-    memory: SharedGuestMemory,
+    ram: GuestRam,
 }
 
 impl KvmVm {
     /// Creates a VM with the in-kernel interrupt controllers and PIT, and binds
-    /// each region of `memory` to a memslot of its own.
-    pub fn new(context: &KvmContext, memory: SharedGuestMemory) -> Result<Arc<Self>> {
+    /// each region of `ram` to a memslot of its own.
+    pub fn new(context: &KvmContext, ram: GuestRam) -> Result<Arc<Self>> {
         let fd = context.kvm().create_vm().context("create KVM VM")?;
         fd.set_tss_address(layout::TSS_START as usize)
             .context("set TSS address")?;
@@ -58,7 +61,7 @@ impl KvmVm {
         })
         .context("create PIT2")?;
         let mut slots = memslots(context.capabilities().max_memslots)?;
-        for region in memory.iter() {
+        for region in ram.memory().iter() {
             let (slot, next) = slots.allocate().context("bind guest RAM")?;
             slots = next;
             let binding = kvm_userspace_memory_region {
@@ -68,24 +71,32 @@ impl KvmVm {
                 userspace_addr: region.as_ptr() as u64,
                 flags: 0,
             };
-            // SAFETY: the returned VM owns `memory` and releases it only after its
-            // own fd and, through KvmVcpu, every vCPU fd is closed. On an early
-            // return no vCPU exists yet, and the local `fd` is dropped before the
-            // `memory` parameter. Each region gets a distinct slot, and the
-            // regions of `memory` do not overlap.
+            // SAFETY: the returned VM owns `ram` and gives it up, by drop or by
+            // `into_ram`, only after its own fd and, through KvmVcpu, every vCPU
+            // fd is closed. On an early return no vCPU exists yet, and the local
+            // `fd` is dropped before the `ram` parameter. Each region gets a
+            // distinct slot, and the regions of `ram` do not overlap.
             unsafe { fd.set_user_memory_region(binding) }
                 .with_context(|| format!("bind guest RAM to KVM memslot {}", slot.0))?;
         }
-        Ok(Arc::new(Self { fd, memory }))
+        Ok(Arc::new(Self { fd, ram }))
     }
 
     pub fn fd(&self) -> &VmFd {
         &self.fd
     }
 
-    /// The guest RAM bound to this VM.
+    /// A view of the guest RAM bound to this VM.
     pub fn memory(&self) -> &SharedGuestMemory {
-        &self.memory
+        self.ram.memory()
+    }
+
+    /// Closes the VM and hands its RAM back, or returns the VM if anything else,
+    /// such as a vCPU, still holds it.
+    pub fn into_ram(self: Arc<Self>) -> Result<GuestRam, Arc<Self>> {
+        let Self { fd, ram } = Arc::try_unwrap(self)?;
+        drop(fd);
+        Ok(ram)
     }
 
     pub fn create_vcpu(self: &Arc<Self>, index: u8) -> Result<KvmVcpu> {
@@ -113,7 +124,7 @@ fn memslots(max_memslots: usize) -> Result<IdPool<MemSlot>> {
     ))
 }
 
-/// A vCPU fd that keeps its VM, and with it the guest memory, alive.
+/// A vCPU fd that keeps its VM, and with it the guest RAM, alive.
 pub struct KvmVcpu {
     // Declared first, so the vCPU fd is closed before the VM can be released.
     fd: VcpuFd,
@@ -162,8 +173,15 @@ mod tests {
 
     use super::*;
     use crate::arch::x86_64::layout::ram_regions;
-    use crate::machine::memory::{self, MemoryPlan};
+    use crate::machine::memory::MemoryPlan;
     use crate::resources::ResourceError;
+
+    fn plan(backing: MemoryBacking) -> MemoryPlan {
+        MemoryPlan {
+            backing,
+            regions: ram_regions(16 << 20).unwrap(),
+        }
+    }
 
     #[test]
     fn memslots_are_bounded_by_what_kvm_provides() {
@@ -187,11 +205,8 @@ mod tests {
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
         for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
-            let plan = MemoryPlan {
-                backing,
-                regions: ram_regions(16 << 20).unwrap(),
-            };
-            let vm = KvmVm::new(&context, memory::create(&plan).unwrap()).unwrap();
+            let ram = GuestRam::map(&plan(backing)).unwrap();
+            let vm = KvmVm::new(&context, ram).unwrap();
             let memory = Arc::downgrade(vm.memory());
             let vcpu = vm.create_vcpu(0).unwrap();
             let kick = vcpu.try_clone().unwrap();
@@ -203,6 +218,34 @@ mod tests {
             assert!(memory.upgrade().is_some());
             drop(kick);
             assert!(memory.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn ram_comes_back_only_once_every_vcpu_fd_is_closed_on_kvm() {
+        if !Path::new("/dev/kvm").exists() {
+            return;
+        }
+        let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
+        for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
+            let plan = plan(backing);
+            let vm = KvmVm::new(&context, GuestRam::map(&plan).unwrap()).unwrap();
+            vm.memory().write_obj(0x5au8, GuestAddress(0x1000)).unwrap();
+            let vcpu = vm.create_vcpu(0).unwrap();
+            let kick = vcpu.try_clone().unwrap();
+
+            drop(vcpu);
+            let vm = KvmVm::into_ram(vm).expect_err("a kick fd still holds the VM");
+            drop(kick);
+            let ram = KvmVm::into_ram(vm).unwrap();
+            assert_eq!(ram.plan(), &plan);
+
+            // The contents come along, and the RAM can back the next VM.
+            let vm = KvmVm::new(&context, ram).unwrap();
+            assert_eq!(
+                vm.memory().read_obj::<u8>(GuestAddress(0x1000)).unwrap(),
+                0x5a
+            );
         }
     }
 }

@@ -10,14 +10,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use api::machine::MemoryBacking;
 use vm_memory::mmap::MmapRegionBuilder;
-use vm_memory::{
-    Address, FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
-    GuestRegionMmap,
-};
+use vm_memory::{FileOffset, GuestAddress, GuestRegionMmap};
 
+use crate::devices::virtio::{GuestMemoryMmap, SharedGuestMemory};
 use crate::resources::GpaRange;
-
-pub type SharedGuestMemory = Arc<GuestMemoryMmap<()>>;
 
 /// Where guest RAM sits and what backs it. The ranges are guest ABI: a snapshot
 /// records them and a restore maps the same ranges.
@@ -28,52 +24,63 @@ pub struct MemoryPlan {
     pub regions: Vec<GpaRange>,
 }
 
-/// Maps the planned regions, zero-filled. A shared region is backed by a memfd
-/// of its own, reachable through the region's file offset.
-pub fn create(plan: &MemoryPlan) -> Result<SharedGuestMemory> {
-    let mut mappings = Vec::with_capacity(plan.regions.len());
-    for &region in &plan.regions {
-        let len = usize::try_from(region.len()).context("guest memory region is too large")?;
-        let builder =
-            MmapRegionBuilder::<()>::new(len).with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
-        let builder = match plan.backing {
-            MemoryBacking::Anonymous => builder
-                .with_mmap_flags(libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE),
-            MemoryBacking::Shared => builder
-                .with_mmap_flags(libc::MAP_SHARED | libc::MAP_NORESERVE)
-                .with_file_offset(FileOffset::new(memfd(region)?, 0)),
-        };
-        let mmap = builder
-            .build()
-            .with_context(|| format!("map guest memory region {region}"))?;
-        let mapping = GuestRegionMmap::new(mmap, GuestAddress(region.start()))
-            .context("guest memory region address overflows")?;
-        mappings.push(mapping);
-    }
-    let memory =
-        GuestMemoryMmap::from_regions(mappings).context("assemble guest memory regions")?;
-    Ok(Arc::new(memory))
+/// A machine's guest RAM: the host mappings, and the plan they were mapped from.
+///
+/// It has a single owner, the only one that can bind it to a VM. Views of the
+/// bytes are cheap to clone, but cannot be bound, and the RAM itself cannot be
+/// cloned, so it never backs two VMs:
+///
+/// ```compile_fail,E0277
+/// fn twice(ram: vmm::machine::memory::GuestRam) {
+///     let _copy = vmm::machine::memory::GuestRam::clone(&ram);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct GuestRam {
+    plan: MemoryPlan,
+    memory: SharedGuestMemory,
 }
 
-/// The plan `memory` was mapped from, or `None` if its regions are backed
-/// differently.
-pub fn describe(memory: &GuestMemoryMmap<()>) -> Option<MemoryPlan> {
-    let mut backings = memory.iter().map(|region| match region.file_offset() {
-        Some(_) => MemoryBacking::Shared,
-        None => MemoryBacking::Anonymous,
-    });
-    let backing = backings.next().unwrap_or_default();
-    if !backings.all(|other| other == backing) {
-        return None;
-    }
-    let regions = memory
-        .iter()
-        .map(|region| {
-            let start = region.start_addr().raw_value();
-            GpaRange::new(start, start + region.len())
+impl GuestRam {
+    /// Maps the planned regions, zero-filled. A shared region is backed by a
+    /// memfd of its own, reachable through the region's file offset.
+    pub fn map(plan: &MemoryPlan) -> Result<Self> {
+        let mut mappings = Vec::with_capacity(plan.regions.len());
+        for &region in &plan.regions {
+            let len = usize::try_from(region.len()).context("guest memory region is too large")?;
+            let builder = MmapRegionBuilder::<()>::new(len)
+                .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
+            let builder = match plan.backing {
+                MemoryBacking::Anonymous => builder
+                    .with_mmap_flags(libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE),
+                MemoryBacking::Shared => builder
+                    .with_mmap_flags(libc::MAP_SHARED | libc::MAP_NORESERVE)
+                    .with_file_offset(FileOffset::new(memfd(region)?, 0)),
+            };
+            let mmap = builder
+                .build()
+                .with_context(|| format!("map guest memory region {region}"))?;
+            let mapping = GuestRegionMmap::new(mmap, GuestAddress(region.start()))
+                .context("guest memory region address overflows")?;
+            mappings.push(mapping);
+        }
+        let memory =
+            GuestMemoryMmap::from_regions(mappings).context("assemble guest memory regions")?;
+        Ok(Self {
+            plan: plan.clone(),
+            memory: Arc::new(memory),
         })
-        .collect();
-    Some(MemoryPlan { backing, regions })
+    }
+
+    /// The plan this RAM was mapped from.
+    pub fn plan(&self) -> &MemoryPlan {
+        &self.plan
+    }
+
+    /// A view of the bytes.
+    pub fn memory(&self) -> &SharedGuestMemory {
+        &self.memory
+    }
 }
 
 /// A memfd holding exactly one shared region, sealed at that size so a process
@@ -114,7 +121,7 @@ fn memfd(region: GpaRange) -> Result<File> {
 mod tests {
     use std::os::unix::fs::FileExt;
 
-    use vm_memory::{Bytes, GuestAddress};
+    use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
 
     use super::*;
 
@@ -129,11 +136,28 @@ mod tests {
     }
 
     #[test]
-    fn creates_split_guest_memory_with_read_write_access() {
+    fn maps_split_guest_memory_with_read_write_access() {
         for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
             let plan = split(backing);
-            let memory = create(&plan).unwrap();
-            assert_eq!(describe(&memory), Some(plan));
+            let ram = GuestRam::map(&plan).unwrap();
+            assert_eq!(ram.plan(), &plan);
+            let memory = ram.memory();
+            let mapped = memory
+                .iter()
+                .map(|region| {
+                    let start = region.start_addr().raw_value();
+                    let range = GpaRange::new(start, start + region.len());
+                    (range, region.file_offset().is_some())
+                })
+                .collect::<Vec<_>>();
+            let shared = backing == MemoryBacking::Shared;
+            assert_eq!(
+                mapped,
+                plan.regions
+                    .iter()
+                    .map(|&range| (range, shared))
+                    .collect::<Vec<_>>()
+            );
             memory.write_obj(0x1234_u32, GuestAddress(0x1000)).unwrap();
             memory
                 .write_obj(0x5678_u32, GuestAddress(0x1_0000_0000))
@@ -151,7 +175,8 @@ mod tests {
 
     #[test]
     fn shared_regions_are_reachable_through_a_sealed_memfd() {
-        let memory = create(&split(MemoryBacking::Shared)).unwrap();
+        let ram = GuestRam::map(&split(MemoryBacking::Shared)).unwrap();
+        let memory = ram.memory();
         memory
             .write_slice(b"guest", GuestAddress(0x1_0000_0010))
             .unwrap();
