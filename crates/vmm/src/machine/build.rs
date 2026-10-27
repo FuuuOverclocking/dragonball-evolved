@@ -167,7 +167,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         if size == 0 {
             bail!("initrd is empty");
         }
-        let low_end = plan.memory.regions[0].end();
+        let low_end = plan.memory.ram[0].end();
         let address = layout::align_down(
             low_end
                 .checked_sub(size)
@@ -195,7 +195,7 @@ pub fn build(plan: MachinePlan, context: &KvmContext) -> Result<Machine> {
         GuestAddress(layout::CMDLINE_START),
         &plan.cmdline,
     )?;
-    for blob in pvh::boot_data(&plan.memory.regions, layout::CMDLINE_START, initrd)?
+    for blob in pvh::boot_data(&plan.memory.ram, layout::CMDLINE_START, initrd)?
         .into_iter()
         .chain([mptable::build(plan.spec.cpus)?])
     {

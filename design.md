@@ -205,7 +205,7 @@ MachineSnapshot + GuestRam ──rebuild──▶ Machine          副作用：�
   ```rust
   pub struct MachinePlan {
       pub spec: MachineSpec,
-      pub memory: MemoryPlan,          // backing + 有序不相交的 RAM 区段（§6.7）
+      pub memory: MemoryPlan,          // backing + 启动 RAM + 设备内存窗口（§6.7）
       pub devices: Vec<DevicePlan>,    // guest 探测顺序；每项带自己的 grant（§6.6）
       pub cmdline: Cmdline,
   }
@@ -554,22 +554,31 @@ impl AddressPool {
 }
 pub struct IdPool<T> { /* name, ids: RangeInclusive<T>, allocated */ }   // allocate / reserve / release，同上
 
-pub struct ResourceBook { pub virtio_mmio: AddressPool, pub legacy_gsi: IdPool<Gsi> }
+pub struct ResourceBook {
+    pub virtio_mmio: AddressPool,
+    pub legacy_gsi: IdPool<Gsi>,
+    pub device_memory: AddressPool,
+}
 pub struct VirtioMmioGrant { pub mmio: GpaRange, pub gsi: Gsi }          // machine/plan.rs
 ```
 
 - **值类型**：每次分配返回结果与新的池，旧值不变；失败时调用方手中的旧账本仍然有效，不需要回滚。
 - **plan 记录 grant**：`MachinePlan::new` 经账本为每个设备分配 `VirtioMmioGrant`，记在 `DevicePlan` 中；账本本身不保存。
-- **恢复时重放，不重算**：`plan::replay` 在 `resource_book()` 给出的新账本上逐个 `reserve` 记录的 grant。重叠或越出窗口的 grant 在挂任何设备之前就被拒绝，设备随后挂在记录的位置，而不是按 spec 重新排出的位置。
+- **恢复时重放，不重算**：`plan::replay(&plan, host)` 先校验 RAM、设备窗口及宿主能力，再在 `resource_book(plan.memory.device_window)` 的账本上逐个 `reserve` 记录的 grant。窗口取自记录，不重新调用布局算法；重叠或越窗的 grant 在挂设备前被拒绝。当前只有块设备；内存设备的 grant 随消费者接入。
 - **memslot** 由 `KvmVm::new` 从 `IdPool<MemSlot>` 分配（上限 `KVM_CAP_NR_MEMSLOTS`），只属于运行期，不进 plan 与快照。
-- 窗口与池的范围是 arch 数据：`layout::VIRTIO_MMIO_WINDOW`（编译期断言它止于 IOAPIC 之下）、`layout::LEGACY_GSIS`。
+- 窗口与池的范围是 arch 数据：`layout::VIRTIO_MMIO_WINDOW`（编译期断言它止于 IOAPIC 之下）、`layout::LEGACY_GSIS`；`layout::device_window` 给出设备内存窗口，由 `MemoryPlan` 记录。
 
 ### 6.7 guest RAM：plan、后端与所有权
 
 ```rust
 pub struct MemoryPlan {
     pub backing: MemoryBacking,      // Anonymous（缺省）| Shared
-    pub regions: Vec<GpaRange>,      // 有序、不相交；属于 guest ABI，快照记录、恢复照搬
+    pub ram: Vec<GpaRange>,          // 启动 RAM：有序、不相交、页对齐；恢复照搬
+    pub device_window: GpaRange,     // 地址窗口，不是映射，不进启动内存表
+}
+impl MemoryPlan {
+    pub fn new(size: u64, backing: MemoryBacking, host: &HostCapabilities) -> Result<Self>;
+    pub fn validate(&self, host: &HostCapabilities) -> Result<()>;
 }
 pub type SharedGuestMemory = Arc<GuestMemoryMmap>; // devices::virtio 中唯一的视图别名
 pub struct GuestRam { plan: MemoryPlan, memory: SharedGuestMemory } // 不实现 Clone
@@ -591,6 +600,7 @@ impl Machine {
 }
 ```
 
+- **区域与窗口**：`ram` 只表示启动 RAM，`GuestRam::map` 与 PVH 启动内存表只取它；窗口本身不映射。设备窗口紧跟 RAM 与 4 GiB 洞的末端，1 GiB 对齐，大小为 `min(1 TiB, physical_limit − start)`；若没有可用地址，窗口为空，设备分配返回耗尽。物理地址上限来自 KVM 支持的 CPUID 0x80000008；构建与 replay 都检查窗口、RAM 与 RAM memslot 数，内存设备的额外 slot 预算随消费者实现。
 - **后端**：
   - `Anonymous`：`MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`。
   - `Shared`：每段一个 memfd（`MFD_CLOEXEC | MFD_ALLOW_SEALING`，内核支持时加 `MFD_NOEXEC_SEAL`，6.3 之前的内核拒绝该标志则去掉重试），封印 `SHRINK | GROW | SEAL`，以 `MAP_SHARED | MAP_NORESERVE` 映射；fd 经 region 的 `FileOffset` 取得。
@@ -1023,7 +1033,7 @@ crates/vmm/src/
 ├── spec.rs                MachineSpec、DeviceSpec：apply / validate（纯）
 ├── resources.rs           GpaRange、Gsi、AddressPool、IdPool、ResourceBook（纯，值类型）
 ├── arch/x86_64/           纯：无 fd、无 tokio
-│   ├── layout.rs          地址常量、资源窗口与 GSI 范围、ram_regions()、resource_book()
+│   ├── layout.rs          地址常量、ram_regions、device_window、resource_book（取记录的窗口）
 │   ├── pvh.rs             start_info / memmap / modlist
 │   ├── mptable.rs         MP table 字节与校验和
 │   ├── cpuid.rs           CPUID 归一化（通用 / Intel / AMD）
@@ -1055,7 +1065,7 @@ crates/vmm/src/
 
 | 层次           | 内容                                                                                       | 运行条件      |
 | -------------- | ------------------------------------------------------------------------------------------ | ------------- |
-| 纯函数         | `ram_regions`、memmap、MP table（结构与校验和）、CPUID（每张表逐项断言）、GDT 编码、寄存器、MMIO 状态机（合法与非法转移、特性协商、reset）、i8042 状态机、cmdline 拼接、`MachineSpec` 校验；资源池（分配、对齐、reserve 冲突、release）、plan（根盘排序、grant、`replay`）、快照设备按 id 对齐 | 任意          |
+| 纯函数         | `ram_regions`、`device_window`（对齐、物理上限、空窗、溢出）、memmap、MP table（结构与校验和）、CPUID、GDT 编码、寄存器、MMIO 与 i8042 状态机、cmdline、spec 校验；资源池（分配、对齐、reserve 冲突、release）、plan（根盘排序、grant、记录窗口的 replay、宿主物理地址与 slot 校验）、快照设备按 id 对齐 | 任意          |
 | 设备（已有形式） | 沿用 `tests/block.rs`、`tests/serial.rs`：测试扮演 guest 驱动；改为经 transport 激活，覆盖 reset 后重新激活、io 线程放置、quiesce / resume | 任意          |
 | 内存           | 两种后端的分段映射与读写；memfd 能看到 guest 写入、拒绝改变大小；映射比 VM 与 vCPU 活得久；复制 vCPU fd 未关闭时交不出 RAM，关闭后可携带内容重绑；compile-fail 文档测试验证 RAM 不可克隆、不可用于两次恢复 | 任意 / `/dev/kvm` |
 | KVM 集成       | mini PVH ELF：32 位代码先检查 `[ebx]` 是否等于 start_info magic，再向 COM1 输出 `OK`，最后 `out 0x64, 0xFE`；断言输出与 `GuestReset`。另测 pause/resume、Shutdown 立即确认及后续拆除、配置文件选择 shared 内存后启动 | `/dev/kvm`    |
@@ -1103,6 +1113,7 @@ crates/vmm/src/
 - block quiesce 的 parked loop 中缺少 `session.requested()` 分支（延迟清理，非正确性问题）。
 - rate limiter 的 `Instant` 在暂停期间继续流逝，resume 后第一个窗口可能不限流。
 - 部分 KVM 测试仍用固定 sleep 让 guest 运行（round-trip 中的 50 ms）。
+- 内存阶段当前到 M1：设备内存窗口与账本已实现，仍没有使用窗口的内存设备；运行期 memslot 绑定在 M2、virtio-mem 在 M3。
 
 ## 14. 实现与验证进度
 
@@ -1128,7 +1139,8 @@ crates/vmm/src/
 - [x] guest RAM 所有权（ff79a8f）：`KvmVm` 拥有 VM fd 与 memory，`KvmVcpu` 持有 `Arc<KvmVm>`；memslot 从 `IdPool<MemSlot>` 分配；`MemoryPlan` 取代 `MachinePlan.ram`。
 - [x] memfd 共享后端（f9e333f）：`SetMemoryBacking`（`.machine.memory_backing`、`PUT /v1/machine/memory-backing`）；sealed memfd；rebuild 核对内存与 plan 一致。
 - [x] 第二轮深度 review 修复（f050e2b）：恢复时补发未确认的中断；快照记录 `DeviceDesc`，恢复时拒绝变化的后端；队列在 attach 时校验；capture 拒绝运行中的设备；断开后 `Start` 失败时 vmm-main 退出；memfd 加 `MFD_NOEXEC_SEAL`。
-- [x] 内存阶段 M0（design.mem.md）：不可克隆的 `GuestRam` 与唯一的字节视图别名；`KvmVm::into_ram` 在全部 vCPU fd 关闭后交还 RAM；`Machine::teardown` 返回 RAM；快照不持有 RAM，恢复按值接管并核对 plan。两种后端的 KVM round-trip、内存寿命与复制 vCPU fd 屏障、两项 compile-fail 文档测试通过；移除 plan 核对与添加 Clone 的变异均被捕获。`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
+- [x] 内存阶段 M0（8b33f5a，design.mem.md）：不可克隆的 `GuestRam` 与唯一的字节视图别名；`KvmVm::into_ram` 在全部 vCPU fd 关闭后交还 RAM；`Machine::teardown` 返回 RAM；快照不持有 RAM，恢复按值接管并核对 plan。两种后端的 KVM round-trip、内存寿命与复制 vCPU fd 屏障、两项 compile-fail 文档测试通过；移除 plan 核对与添加 Clone 的变异均被捕获。`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
+- [x] 内存阶段 M1（design.mem.md）：`MemoryPlan { backing, ram, device_window }`；设备窗口按 1 GiB 对齐、≤1 TiB、受物理地址上限约束；`ResourceBook.device_memory`；replay 复用记录窗口并重新校验宿主能力；只映射启动 RAM、只将其写入 PVH 内存表。窗口边界/空窗/溢出、池耗尽/越窗/重叠/重放、RAM slot 预算及物理宽度测试通过；禁用 replay 校验会使两项边界测试失败。两种后端的 KVM round-trip 与全部 make 检查通过；尚无内存设备，额外设备 grant 与 slot 预算随消费者接入。
 
 运行真实 Linux 冒烟测试：
 

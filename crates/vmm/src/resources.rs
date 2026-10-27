@@ -279,6 +279,7 @@ where
 pub struct ResourceBook {
     pub virtio_mmio: AddressPool,
     pub legacy_gsi: IdPool<Gsi>,
+    pub device_memory: AddressPool,
 }
 
 #[cfg(test)]
@@ -286,6 +287,7 @@ mod tests {
     use super::*;
 
     const WINDOW: GpaRange = GpaRange::new(0x1000, 0x4000);
+    const MEMORY_WINDOW: GpaRange = GpaRange::new(4 << 30, 6 << 30);
     const GSIS: RangeInclusive<Gsi> = RangeInclusive {
         start: Gsi(5),
         last: Gsi(7),
@@ -295,6 +297,7 @@ mod tests {
         ResourceBook {
             virtio_mmio: AddressPool::new("test MMIO", WINDOW),
             legacy_gsi: IdPool::new("test GSI", GSIS),
+            device_memory: AddressPool::new("device memory", MEMORY_WINDOW),
         }
     }
 
@@ -453,9 +456,11 @@ mod tests {
         let book = fresh_book();
         let (_, virtio_mmio) = book.virtio_mmio.allocate(0x1000, 0x1000).unwrap();
         let (_, legacy_gsi) = book.legacy_gsi.allocate().unwrap();
+        let (_, device_memory) = book.device_memory.allocate(1 << 30, 1 << 30).unwrap();
         let next = ResourceBook {
             virtio_mmio,
             legacy_gsi,
+            device_memory,
         };
         assert_ne!(next, book);
         assert_eq!(book, fresh_book());
@@ -468,20 +473,59 @@ mod tests {
         for len in [0x1000, 0x800, 0x1000] {
             let (mmio, virtio_mmio) = book.virtio_mmio.allocate(len, 0x1000).unwrap();
             let (gsi, legacy_gsi) = book.legacy_gsi.allocate().unwrap();
+            let (memory, device_memory) = book.device_memory.allocate(1 << 29, 1 << 29).unwrap();
             book = ResourceBook {
                 virtio_mmio,
                 legacy_gsi,
+                device_memory,
             };
-            grants.push((mmio, gsi));
+            grants.push((mmio, gsi, memory));
         }
         // Replaying out of order still yields an equal book.
         let mut replayed = fresh_book();
-        for &(mmio, gsi) in grants.iter().rev() {
+        for &(mmio, gsi, memory) in grants.iter().rev() {
             replayed = ResourceBook {
                 virtio_mmio: replayed.virtio_mmio.reserve(mmio).unwrap(),
                 legacy_gsi: replayed.legacy_gsi.reserve(gsi).unwrap(),
+                device_memory: replayed.device_memory.reserve(memory).unwrap(),
             };
         }
         assert_eq!(replayed, book);
+    }
+
+    #[test]
+    fn device_memory_grants_are_bounded_and_disjoint() {
+        let original = fresh_book().device_memory;
+        let (first, pool) = original.allocate(1 << 30, 1 << 30).unwrap();
+        assert_eq!(first, GpaRange::new(4 << 30, 5 << 30));
+        let (second, full) = pool.allocate(1 << 30, 1 << 30).unwrap();
+        assert_eq!(second, GpaRange::new(5 << 30, 6 << 30));
+        assert_eq!(
+            full.allocate(1 << 30, 1 << 30).unwrap_err(),
+            ResourceError::Exhausted {
+                pool: "device memory"
+            }
+        );
+        let range = GpaRange::new(5 << 30, 7 << 30);
+        assert_eq!(
+            original.reserve(range).unwrap_err(),
+            ResourceError::OutsideWindow {
+                pool: "device memory",
+                range,
+                window: MEMORY_WINDOW,
+            }
+        );
+        assert_eq!(
+            pool.reserve(first).unwrap_err(),
+            ResourceError::Overlap {
+                pool: "device memory",
+                range: first,
+                allocated: first,
+            }
+        );
+        assert_eq!(
+            full.release(first).unwrap().release(second).unwrap(),
+            original
+        );
     }
 }

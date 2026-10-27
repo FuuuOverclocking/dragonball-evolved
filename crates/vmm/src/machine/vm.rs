@@ -172,15 +172,11 @@ mod tests {
     use vm_memory::{Bytes, GuestAddress};
 
     use super::*;
-    use crate::arch::x86_64::layout::ram_regions;
     use crate::machine::memory::MemoryPlan;
     use crate::resources::ResourceError;
 
-    fn plan(backing: MemoryBacking) -> MemoryPlan {
-        MemoryPlan {
-            backing,
-            regions: ram_regions(16 << 20).unwrap(),
-        }
+    fn plan(backing: MemoryBacking, context: &KvmContext) -> MemoryPlan {
+        MemoryPlan::new(16 << 20, backing, context.capabilities()).unwrap()
     }
 
     #[test]
@@ -205,7 +201,7 @@ mod tests {
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
         for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
-            let ram = GuestRam::map(&plan(backing)).unwrap();
+            let ram = GuestRam::map(&plan(backing, &context)).unwrap();
             let vm = KvmVm::new(&context, ram).unwrap();
             let memory = Arc::downgrade(vm.memory());
             let vcpu = vm.create_vcpu(0).unwrap();
@@ -228,7 +224,7 @@ mod tests {
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
         for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
-            let plan = plan(backing);
+            let plan = plan(backing, &context);
             let vm = KvmVm::new(&context, GuestRam::map(&plan).unwrap()).unwrap();
             vm.memory().write_obj(0x5au8, GuestAddress(0x1000)).unwrap();
             let vcpu = vm.create_vcpu(0).unwrap();

@@ -467,7 +467,7 @@ mod tests {
     use crate::KvmContext;
     use crate::arch::x86_64::cpuid::normalize;
     use crate::arch::x86_64::lapic::configure_lint;
-    use crate::arch::x86_64::layout::{COM1_GSI, COM1_PORTS, I8042_PORTS, ram_regions};
+    use crate::arch::x86_64::layout::{COM1_GSI, COM1_PORTS, I8042_PORTS};
     use crate::arch::x86_64::msr::boot_msrs;
     use crate::arch::x86_64::regs::{boot_fpu, boot_regs, boot_sregs};
     use crate::devices::legacy::i8042::I8042Device;
@@ -480,10 +480,12 @@ mod tests {
     const MMIO_READ_VALUE: u32 = 0x4433_2211;
 
     fn test_vm(context: &KvmContext) -> Arc<KvmVm> {
-        let plan = MemoryPlan {
-            backing: api::machine::MemoryBacking::Anonymous,
-            regions: ram_regions(16 << 20).unwrap(),
-        };
+        let plan = MemoryPlan::new(
+            16 << 20,
+            api::machine::MemoryBacking::Anonymous,
+            context.capabilities(),
+        )
+        .unwrap();
         KvmVm::new(context, GuestRam::map(&plan).unwrap()).unwrap()
     }
 

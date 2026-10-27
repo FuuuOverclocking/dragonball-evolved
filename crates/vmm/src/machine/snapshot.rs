@@ -177,7 +177,7 @@ pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -
         devices,
     } = snapshot;
     // Rejects grants that overlap or leave their pools before anything is attached.
-    plan::replay(&plan.devices)?;
+    plan::replay(&plan, context.capabilities())?;
     let restore = Restore {
         platform,
         devices: match_devices(&plan.devices, devices)?,
@@ -250,7 +250,6 @@ mod tests {
 
     use super::*;
     use crate::KvmContext;
-    use crate::arch::x86_64::layout::ram_regions;
     use crate::devices::virtio::mmio::{DeviceDesc, MmioRegs, MmioTransportSnapshot};
     use crate::machine::block::BlockPlan;
     use crate::machine::memory::MemoryPlan;
@@ -263,10 +262,12 @@ mod tests {
             return;
         }
         let context = KvmContext::from_dev_path("/dev/kvm").unwrap();
-        let plan = MemoryPlan {
-            backing: api::machine::MemoryBacking::Anonymous,
-            regions: ram_regions(16 << 20).unwrap(),
-        };
+        let plan = MemoryPlan::new(
+            16 << 20,
+            api::machine::MemoryBacking::Anonymous,
+            context.capabilities(),
+        )
+        .unwrap();
         let vm = KvmVm::new(&context, GuestRam::map(&plan).unwrap()).unwrap();
 
         let state = capture_vm_kvm(vm.fd()).unwrap();

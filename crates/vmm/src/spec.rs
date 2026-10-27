@@ -131,16 +131,8 @@ impl MachineSpec {
         if regions.len() > host.max_memslots {
             bail!("guest memory exceeds KVM memslot limit");
         }
-        if let Some(leaf) = host
-            .supported_cpuid
-            .as_slice()
-            .iter()
-            .find(|entry| entry.function == 0x8000_0008)
-        {
-            let bits = leaf.eax & 0xff;
-            if bits < 64 && regions.last().unwrap().end() > (1u64 << bits) {
-                bail!("guest memory exceeds supported physical address width");
-            }
+        if regions.last().unwrap().end() > host.physical_address_limit() {
+            bail!("guest memory exceeds supported physical address width");
         }
         let mut ids = HashSet::new();
         if !self.devices.iter().all(|device| ids.insert(device.id())) {

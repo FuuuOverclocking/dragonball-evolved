@@ -18,7 +18,7 @@
 
 本阶段要能承载、但不必全部实现的需求：运行期增减内存（virtio-mem、balloon；ACPI DIMM 依赖 A5）；设备内存窗口（virtio-pmem、virtio-fs DAX）；hugepage、预分配、宿主 NUMA 绑定；vhost-user 内存表与 VFIO DMA 映射（G5）所需的区域变化通知；快照持久化、热升级（G6、E10）与 dirty page tracking。
 
-## 1. 现状与断裂点
+## 1. 计划确认时的现状与断裂点
 
 **可以沿用**：
 
@@ -197,8 +197,8 @@ pub struct MemoryPolicy { pub prealloc: bool, pub numa: Option<HostNodes> }
 - `MachineSnapshot` 不再有 `memory` 字段；`rebuild(snapshot, ram, context)` 按值接收 `GuestRam`，并核对 `ram` 的 plan 与快照的 plan 一致。没有 RAM 就无法 rebuild，同一块 RAM 也不可能被用两次。
 
 ```text
-现在：pause → capture（snap 持有 RAM 的 Arc）→ teardown（可省略）→ rebuild(snap)
-计划：pause → capture（纯数据）→ teardown（交还 GuestRam）→ rebuild(snap, ram)
+原路径：pause → capture（snap 持有 RAM 的 Arc）→ teardown（可省略）→ rebuild(snap)
+M0 后：pause → capture（纯数据）→ teardown（交还 GuestRam）→ rebuild(snap, ram)
 ```
 
 ### 7.2 持久化（M5）
@@ -256,12 +256,14 @@ pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -
 | M4 virtio-pmem（可选） | 设备拥有的文件映射（`MAP_SHARED`，只读加 `KVM_MEM_READONLY`）、io 线程上 flush、不进 DMA 视图、快照只记配置 | guest 中 `mount -o dax` 读到宿主写入的标记；写只读 pmem 被丢弃且 VMM 不退出 | 新增设备 |
 | M5 快照持久化 | 带版本与 CRC 的序列化、稀疏镜像 + manifest、Copy 恢复、`HandoverState` 交接 memfd | 跨进程恢复 mini guest 与 virtio-mem 插拔状态；损坏或版本不符被拒；交接后新进程继续运行 | 新增能力 |
 
+M1 尚无内存设备，slot 预算就是启动 RAM 段数；设备内存池已支持分配、reserve 重放与冲突校验，M3 / M4 接入消费者时把对应 grant 写入设备 plan，并追加 slot 预算。
+
 之后：hugetlb / 预分配 / NUMA（同时拆分后端类型）、dirty tracking、视图传播与 listener（A5、G5）、balloon（复用同一个 discard）。
 
 ## 10. 进度
 
 - [x] M0 所有权与视图拆分：两种后端的 KVM round-trip、复制 vCPU fd 关闭前后交接、RAM 不可克隆与不可二次恢复的文档测试通过；移除 plan 核对与添加 Clone 的变异均被测试捕获。`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
-- [ ] M1 区域模型与设备内存窗口
+- [x] M1 区域模型与设备内存窗口：只映射/上报启动 RAM；窗口位置、对齐、物理上限、空窗与溢出、设备内存池的耗尽/越窗/重叠与重放、记录窗口的 replay、RAM slot 预算测试通过；禁用 replay 校验会使两项边界测试失败。两种后端的 KVM round-trip、`make lint`、`make test`、`make api-features`、`make schema-verify` 通过。
 - [ ] M2 运行期 memslot 绑定
 - [ ] M3 virtio-mem
 - [ ] M4 virtio-pmem（可选）

@@ -264,6 +264,9 @@ impl AttachedBlock {
 mod tests {
     use super::*;
     use crate::arch::x86_64::layout::{CMDLINE_MAX_SIZE, resource_book};
+    use crate::resources::GpaRange;
+
+    const DEVICE_WINDOW: GpaRange = GpaRange::new(4 << 30, (4 << 30) + (1 << 40));
 
     fn disk(id: &str, root: bool) -> BlockSpec {
         BlockSpec {
@@ -278,14 +281,14 @@ mod tests {
     fn only_one_root_disk_is_planned_and_it_comes_first() {
         let mut cmdline = Cmdline::new(CMDLINE_MAX_SIZE).unwrap();
         let roots = [disk("a", true), disk("b", true)];
-        let Err(error) = plan(&roots, resource_book(), &mut cmdline) else {
+        let Err(error) = plan(&roots, resource_book(DEVICE_WINDOW), &mut cmdline) else {
             panic!("planned two root disks");
         };
         assert_eq!(error.to_string(), "multiple root disks");
 
         let (plans, _) = plan(
             &[disk("data", false), disk("root", true)],
-            resource_book(),
+            resource_book(DEVICE_WINDOW),
             &mut cmdline,
         )
         .unwrap();

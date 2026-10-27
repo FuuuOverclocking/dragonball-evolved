@@ -3,7 +3,7 @@ use linux_loader::cmdline::Cmdline;
 
 use super::block::{self, BlockPlan};
 use super::memory::MemoryPlan;
-use crate::arch::x86_64::layout::{CMDLINE_MAX_SIZE, VIRTIO_MMIO_LEN, ram_regions, resource_book};
+use crate::arch::x86_64::layout::{CMDLINE_MAX_SIZE, VIRTIO_MMIO_LEN, resource_book};
 use crate::kvm_context::HostCapabilities;
 use crate::resources::{GpaRange, Gsi, ResourceBook, ResourceError};
 use crate::spec::MachineSpec;
@@ -27,6 +27,7 @@ impl VirtioMmioGrant {
         let book = ResourceBook {
             virtio_mmio,
             legacy_gsi,
+            device_memory: book.device_memory.clone(),
         };
         Ok((Self { mmio, gsi }, book))
     }
@@ -35,6 +36,7 @@ impl VirtioMmioGrant {
         Ok(ResourceBook {
             virtio_mmio: book.virtio_mmio.reserve(self.mmio)?,
             legacy_gsi: book.legacy_gsi.reserve(self.gsi)?,
+            device_memory: book.device_memory.clone(),
         })
     }
 }
@@ -67,10 +69,7 @@ impl DevicePlan {
 impl MachinePlan {
     pub fn new(spec: MachineSpec, host: &HostCapabilities) -> Result<Self> {
         spec.validate(host)?;
-        let memory = MemoryPlan {
-            backing: spec.memory_backing,
-            regions: ram_regions(u64::from(spec.memory_mib) << 20)?,
-        };
+        let memory = MemoryPlan::new(u64::from(spec.memory_mib) << 20, spec.memory_backing, host)?;
         let mut cmdline = Cmdline::new(CMDLINE_MAX_SIZE)?;
         cmdline
             .insert_str(
@@ -82,7 +81,11 @@ impl MachinePlan {
                     .unwrap_or(DEFAULT_CMDLINE),
             )
             .context("build kernel command line")?;
-        let (blocks, _) = block::plan(spec.blocks(), resource_book(), &mut cmdline)?;
+        let (blocks, _) = block::plan(
+            spec.blocks(),
+            resource_book(memory.device_window),
+            &mut cmdline,
+        )?;
         let devices = blocks.into_iter().map(DevicePlan::Block).collect();
         Ok(Self {
             spec,
@@ -95,19 +98,22 @@ impl MachinePlan {
 
 /// Reserves every recorded grant again on a fresh book, so a plan whose grants
 /// overlap or leave their pools is rejected instead of attached.
-pub fn replay(devices: &[DevicePlan]) -> Result<ResourceBook> {
-    devices.iter().try_fold(resource_book(), |book, device| {
-        match device {
-            DevicePlan::Block(block) => block.grant.reserve(&book),
-        }
-        .with_context(|| format!("replay the grant of device {}", device.id()))
-    })
+pub fn replay(plan: &MachinePlan, host: &HostCapabilities) -> Result<ResourceBook> {
+    plan.memory.validate(host)?;
+    plan.devices
+        .iter()
+        .try_fold(resource_book(plan.memory.device_window), |book, device| {
+            match device {
+                DevicePlan::Block(block) => block.grant.reserve(&book),
+            }
+            .with_context(|| format!("replay the grant of device {}", device.id()))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use api::boot::KernelConfig;
-    use kvm_bindings::CpuId;
+    use kvm_bindings::{CpuId, kvm_cpuid_entry2};
 
     use super::*;
     use crate::arch::x86_64::cpuid::{CpuVendor, HostCpuid};
@@ -125,6 +131,18 @@ mod tests {
             },
             max_vcpus: 254,
             max_memslots: 2,
+        }
+    }
+
+    fn host_with_bits(bits: u32) -> HostCapabilities {
+        HostCapabilities {
+            supported_cpuid: CpuId::from_entries(&[kvm_cpuid_entry2 {
+                function: 0x8000_0008,
+                eax: bits,
+                ..Default::default()
+            }])
+            .unwrap(),
+            ..host()
         }
     }
 
@@ -186,12 +204,22 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(plan.memory.regions.len(), 2);
+        assert_eq!(plan.memory.ram.len(), 2);
         let cmdline = plan.cmdline.as_cstring().unwrap();
         let cmdline = cmdline.to_str().unwrap();
         assert!(cmdline.contains("virtio_mmio.device=4K@0xc0000000:5"));
         assert!(cmdline.contains("virtio_mmio.device=4K@0xc0001000:6"));
         assert!(cmdline.contains("root=/dev/vda ro"));
+        assert_eq!(
+            plan.memory.device_window,
+            GpaRange::new(5 << 30, (5 << 30) + (1 << 40))
+        );
+        let map = crate::arch::x86_64::pvh::memory_map(&plan.memory.ram).unwrap();
+        assert_eq!(map[3].addr, 4 << 30);
+        assert_eq!(map[3].size, 1 << 30);
+        assert!(map.iter().all(|entry| {
+            !GpaRange::new(entry.addr, entry.addr + entry.size).overlaps(&plan.memory.device_window)
+        }));
     }
 
     #[test]
@@ -240,7 +268,7 @@ mod tests {
         spec.devices = data_disks(3);
         let plan = MachinePlan::new(spec, &host()).unwrap();
         // The replayed book holds exactly the planned grants.
-        let book = replay(&plan.devices).unwrap();
+        let book = replay(&plan, &host()).unwrap();
         assert_eq!(
             VirtioMmioGrant::allocate(&book).unwrap().0,
             VirtioMmioGrant {
@@ -251,13 +279,13 @@ mod tests {
 
         let DevicePlan::Block(first) = &plan.devices[0];
         let holding = |id: &str, grant| {
-            let mut devices = plan.devices.clone();
-            devices.push(DevicePlan::Block(BlockPlan {
+            let mut modified = plan.clone();
+            modified.devices.push(DevicePlan::Block(BlockPlan {
                 id: id.into(),
                 grant,
                 ..first.clone()
             }));
-            replay(&devices).unwrap_err()
+            replay(&modified, &host()).unwrap_err()
         };
         let error = holding("copy", first.grant);
         assert_eq!(
@@ -283,6 +311,115 @@ mod tests {
                 pool: "legacy GSI",
                 id: 5,
             })
+        );
+    }
+
+    #[test]
+    fn replay_uses_the_recorded_device_window() {
+        let mut plan = MachinePlan::new(fixture(), &host()).unwrap();
+        plan.memory.device_window = GpaRange::new(32 << 30, 34 << 30);
+        let book = replay(&plan, &host()).unwrap();
+        let (range, device_memory) = book.device_memory.allocate(1 << 30, 1 << 30).unwrap();
+        assert_eq!(range, GpaRange::new(32 << 30, 33 << 30));
+        let holding = ResourceBook {
+            device_memory,
+            ..book
+        };
+        let (_, next) = VirtioMmioGrant::allocate(&holding).unwrap();
+        assert_eq!(next.device_memory, holding.device_memory);
+        assert_eq!(
+            VirtioMmioGrant {
+                mmio: GpaRange::new(0xc000_1000, 0xc000_2000),
+                gsi: Gsi(6)
+            }
+            .reserve(&next)
+            .unwrap()
+            .device_memory,
+            holding.device_memory
+        );
+    }
+
+    #[test]
+    fn plan_and_replay_check_the_host_memory_limits() {
+        let narrow = host_with_bits(36);
+        let mut spec = fixture();
+        spec.memory_mib = 62 * 1024;
+        let plan = MachinePlan::new(spec.clone(), &narrow).unwrap();
+        assert_eq!(plan.memory.device_window, GpaRange::new(63 << 30, 64 << 30));
+        spec.memory_mib = 64 * 1024;
+        assert!(MachinePlan::new(spec, &narrow).is_err());
+
+        let mut spec = fixture();
+        spec.memory_mib = 4096;
+        let plan = MachinePlan::new(spec.clone(), &host()).unwrap();
+        let one_slot = HostCapabilities {
+            max_memslots: 1,
+            ..host()
+        };
+        assert!(
+            MachinePlan::new(spec, &one_slot)
+                .unwrap_err()
+                .to_string()
+                .contains("memslot")
+        );
+        assert!(
+            replay(&plan, &one_slot)
+                .unwrap_err()
+                .to_string()
+                .contains("memslot")
+        );
+        assert!(
+            replay(&plan, &narrow)
+                .unwrap_err()
+                .to_string()
+                .contains("physical address")
+        );
+        let empty = MachinePlan::new(fixture(), &host_with_bits(32)).unwrap();
+        assert!(empty.memory.device_window.is_empty());
+    }
+
+    #[test]
+    fn replay_rejects_a_window_overlapping_ram_or_exceeding_host_limits() {
+        let plan = MachinePlan::new(fixture(), &host()).unwrap();
+        let mut overlap = plan.clone();
+        overlap.memory.ram.push(GpaRange::new(4 << 30, 5 << 30));
+        assert!(
+            replay(&overlap, &host())
+                .unwrap_err()
+                .to_string()
+                .contains("window")
+        );
+        let mut unaligned = plan.clone();
+        unaligned.memory.device_window = GpaRange::new((4 << 30) + 4096, 5 << 30);
+        assert!(
+            replay(&unaligned, &host())
+                .unwrap_err()
+                .to_string()
+                .contains("window")
+        );
+        let mut too_large = plan.clone();
+        too_large.memory.device_window = GpaRange::new(4 << 30, (4 << 30) + (2 << 40));
+        assert!(
+            replay(&too_large, &host())
+                .unwrap_err()
+                .to_string()
+                .contains("window")
+        );
+        let mut empty_ram = plan.clone();
+        empty_ram.memory.ram.clear();
+        assert!(
+            replay(&empty_ram, &host())
+                .unwrap_err()
+                .to_string()
+                .contains("RAM ranges")
+        );
+        let mut overlapping_ram = plan;
+        overlapping_ram.memory.ram.push(GpaRange::new(0, 4096));
+        assert!(
+            replay(&overlapping_ram, &host())
+                .unwrap_err()
+                .to_string()
+                .contains("RAM ranges")
         );
     }
 }

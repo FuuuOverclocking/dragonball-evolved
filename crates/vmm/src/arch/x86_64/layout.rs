@@ -37,6 +37,8 @@ pub const COM1_PORTS: Range<u64> = Range {
 };
 pub const COM1_GSI: Gsi = Gsi(4);
 pub const PAGE_SIZE: u64 = 4096;
+pub const DEVICE_MEMORY_ALIGN: u64 = 1 << 30;
+pub const DEVICE_MEMORY_MAX_SIZE: u64 = 1 << 40;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LayoutError {
@@ -63,10 +65,23 @@ pub fn ram_regions(size: u64) -> Result<Vec<GpaRange>, LayoutError> {
     ])
 }
 
-pub fn resource_book() -> ResourceBook {
+pub fn device_window(ram_end: u64, physical_limit: u64) -> Result<GpaRange, LayoutError> {
+    let start = ram_end
+        .max(MMIO32_END)
+        .checked_next_multiple_of(DEVICE_MEMORY_ALIGN)
+        .ok_or(LayoutError::Overflow)?;
+    let size = physical_limit
+        .checked_sub(start)
+        .ok_or(LayoutError::Overflow)?
+        .min(DEVICE_MEMORY_MAX_SIZE);
+    Ok(GpaRange::new(start, start + size))
+}
+
+pub fn resource_book(device_window: GpaRange) -> ResourceBook {
     ResourceBook {
         virtio_mmio: AddressPool::new("virtio-mmio", VIRTIO_MMIO_WINDOW),
         legacy_gsi: IdPool::new("legacy GSI", LEGACY_GSIS),
+        device_memory: AddressPool::new("device memory", device_window),
     }
 }
 
@@ -99,5 +114,41 @@ mod tests {
     fn invalid_sizes_are_rejected() {
         assert_eq!(ram_regions(0), Err(LayoutError::Empty));
         assert_eq!(ram_regions(u64::MAX), Err(LayoutError::Overflow));
+    }
+
+    #[test]
+    fn device_memory_starts_after_ram_and_the_mmio_hole() {
+        for (size, start) in [
+            (128 << 20, 4 << 30),
+            (3 << 30, 4 << 30),
+            ((3 << 30) + (1 << 20), 5 << 30),
+            (4 << 30, 5 << 30),
+        ] {
+            let ram = ram_regions(size).unwrap();
+            let window = device_window(ram.last().unwrap().end(), 1 << 46).unwrap();
+            assert_eq!(window, GpaRange::new(start, start + (1 << 40)));
+            assert!(ram.iter().all(|range| !range.overlaps(&window)));
+        }
+    }
+
+    #[test]
+    fn device_memory_is_clipped_to_the_physical_address_limit() {
+        assert_eq!(
+            device_window(63 << 30, 1 << 36).unwrap(),
+            GpaRange::new(63 << 30, 64 << 30)
+        );
+        let empty = device_window(128 << 20, 1 << 32).unwrap();
+        assert_eq!(empty, GpaRange::new(4 << 30, 4 << 30));
+        assert!(
+            resource_book(empty)
+                .device_memory
+                .allocate(1 << 30, 1 << 30)
+                .is_err()
+        );
+        assert_eq!(device_window(65 << 30, 1 << 36), Err(LayoutError::Overflow));
+        assert_eq!(
+            device_window(u64::MAX, u64::MAX),
+            Err(LayoutError::Overflow)
+        );
     }
 }

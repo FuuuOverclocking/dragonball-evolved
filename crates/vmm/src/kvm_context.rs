@@ -32,6 +32,18 @@ pub struct HostCapabilities {
     pub max_memslots: usize,
 }
 
+impl HostCapabilities {
+    pub fn physical_address_limit(&self) -> u64 {
+        let bits = self
+            .supported_cpuid
+            .as_slice()
+            .iter()
+            .find(|entry| entry.function == 0x8000_0008)
+            .map_or(64, |leaf| leaf.eax & 0xff);
+        1u64.checked_shl(bits).unwrap_or(u64::MAX)
+    }
+}
+
 pub struct KvmContext {
     kvm: Kvm,
     path: PathBuf,

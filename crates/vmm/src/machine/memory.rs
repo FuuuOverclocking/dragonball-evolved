@@ -7,21 +7,70 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use api::machine::MemoryBacking;
 use vm_memory::mmap::MmapRegionBuilder;
 use vm_memory::{FileOffset, GuestAddress, GuestRegionMmap};
 
+use crate::arch::x86_64::layout::{self, DEVICE_MEMORY_ALIGN, DEVICE_MEMORY_MAX_SIZE, PAGE_SIZE};
 use crate::devices::virtio::{GuestMemoryMmap, SharedGuestMemory};
+use crate::kvm_context::HostCapabilities;
 use crate::resources::GpaRange;
 
-/// Where guest RAM sits and what backs it. The ranges are guest ABI: a snapshot
-/// records them and a restore maps the same ranges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryPlan {
     pub backing: MemoryBacking,
-    /// Sorted and disjoint.
-    pub regions: Vec<GpaRange>,
+    pub ram: Vec<GpaRange>,
+    pub device_window: GpaRange,
+}
+
+impl MemoryPlan {
+    pub fn new(size: u64, backing: MemoryBacking, host: &HostCapabilities) -> Result<Self> {
+        let ram = layout::ram_regions(size)?;
+        let device_window =
+            layout::device_window(ram.last().unwrap().end(), host.physical_address_limit())?;
+        let plan = Self {
+            backing,
+            ram,
+            device_window,
+        };
+        plan.validate(host)?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self, host: &HostCapabilities) -> Result<()> {
+        if self.ram.is_empty()
+            || self.ram.iter().any(|range| {
+                range.is_empty()
+                    || !range.start().is_multiple_of(PAGE_SIZE)
+                    || !range.len().is_multiple_of(PAGE_SIZE)
+            })
+            || self
+                .ram
+                .windows(2)
+                .any(|pair| pair[0].end() > pair[1].start())
+        {
+            bail!("guest RAM ranges must be non-empty, page-aligned, ordered and disjoint");
+        }
+        if self.ram.len() > host.max_memslots {
+            bail!("guest memory exceeds KVM memslot limit");
+        }
+        if self.device_window.start() < layout::MMIO32_END
+            || !self
+                .device_window
+                .start()
+                .is_multiple_of(DEVICE_MEMORY_ALIGN)
+            || self.device_window.len() > DEVICE_MEMORY_MAX_SIZE
+            || self.ram.last().unwrap().end() > self.device_window.start()
+        {
+            bail!("invalid device memory window");
+        }
+        let limit = host.physical_address_limit();
+        if self.ram.last().unwrap().end() > limit || self.device_window.end() > limit {
+            bail!("guest memory exceeds supported physical address width");
+        }
+        Ok(())
+    }
 }
 
 /// A machine's guest RAM: the host mappings, and the plan they were mapped from.
@@ -45,8 +94,8 @@ impl GuestRam {
     /// Maps the planned regions, zero-filled. A shared region is backed by a
     /// memfd of its own, reachable through the region's file offset.
     pub fn map(plan: &MemoryPlan) -> Result<Self> {
-        let mut mappings = Vec::with_capacity(plan.regions.len());
-        for &region in &plan.regions {
+        let mut mappings = Vec::with_capacity(plan.ram.len());
+        for &region in &plan.ram {
             let len = usize::try_from(region.len()).context("guest memory region is too large")?;
             let builder = MmapRegionBuilder::<()>::new(len)
                 .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
@@ -128,10 +177,11 @@ mod tests {
     fn split(backing: MemoryBacking) -> MemoryPlan {
         MemoryPlan {
             backing,
-            regions: vec![
+            ram: vec![
                 GpaRange::new(0, 0x2000),
                 GpaRange::new(0x1_0000_0000, 0x1_0000_1000),
             ],
+            device_window: GpaRange::new(5 << 30, (5 << 30) + DEVICE_MEMORY_MAX_SIZE),
         }
     }
 
@@ -153,7 +203,7 @@ mod tests {
             let shared = backing == MemoryBacking::Shared;
             assert_eq!(
                 mapped,
-                plan.regions
+                plan.ram
                     .iter()
                     .map(|&range| (range, shared))
                     .collect::<Vec<_>>()

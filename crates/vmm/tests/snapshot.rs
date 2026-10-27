@@ -143,6 +143,8 @@ async fn read_sector(guest: &mut GuestDriver, bus: &Bus, base: u64, sector: u64)
 /// afterwards.
 #[tokio::test(flavor = "local")]
 async fn register_increment_round_trip_on_kvm() {
+    use vm_memory::{GuestAddress, GuestMemoryBackend};
+
     if !Path::new("/dev/kvm").exists() {
         return;
     }
@@ -152,6 +154,11 @@ async fn register_increment_round_trip_on_kvm() {
         let mut spec = spec(kernel.path(), Vec::new());
         spec.memory_backing = backing;
         let mut machine = build_machine(spec, &context);
+        assert!(
+            !machine
+                .memory()
+                .address_in_range(GuestAddress(machine.plan().memory.device_window.start()))
+        );
 
         machine.vcpus.as_ref().unwrap().resume().await.unwrap();
         time::sleep(Duration::from_millis(50)).await;
