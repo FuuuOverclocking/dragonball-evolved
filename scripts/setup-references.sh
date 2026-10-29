@@ -1,5 +1,6 @@
 #!/bin/bash
-# 在工作区根目录下准备只读参考资料：.references/{firecracker,cloud-hypervisor,qemu,linux,specs/}。
+# 在工作区根目录下准备只读参考资料：
+# .references/{firecracker,cloud-hypervisor,qemu,linux,specs/,specs-pdf-to-txt/}。
 # 已存在的条目跳过；要刷新某项，删除对应目录或文件后重跑。
 
 set -uo pipefail
@@ -45,6 +46,28 @@ unpack() {
     return $status
 }
 
+# 把 specs/ 下每个 PDF 抽成同名 .txt，逐行前缀 p<页号>：grep 命中即得页码，
+# 再用 pdftotext -layout -f N -l N 读该页原文。页号即 PDF 物理页。
+# 只有 intel-sdm、intel-mp、PCIe Base 非 PDF 不可；ACPI、UEFI、virtio 请直接查
+# specs/ 下的 .rst/.tex 源码，章节结构和交叉引用都在，比转出来的文本更准。
+pdf_to_txt() {
+    local dest=$1 pdf count=0
+    if ! command -v pdftotext >/dev/null; then
+        echo "pdftotext not found: install poppler-utils" >&2
+        return 1
+    fi
+    mkdir -p "$dest" || return
+    while IFS= read -r pdf; do
+        echo "    $pdf"
+        pdftotext -layout "$pdf" - |
+            awk -v RS='\f' '{n=split($0,L,"\n"); for(i=1;i<=n;i++) print "p" NR "\t" L[i]}' \
+            >"$dest/$(basename "$pdf" .pdf).txt" || return
+        count=$((count + 1))
+    done < <(find "$refs/specs" -name '*.pdf')
+    # 规范下载失败时不要留下空目录，否则重跑会被当作已完成而跳过。
+    ((count))
+}
+
 run clone firecracker https://github.com/firecracker-microvm/firecracker.git
 run clone cloud-hypervisor https://github.com/cloud-hypervisor/cloud-hypervisor.git
 run clone qemu https://gitlab.com/qemu-project/qemu.git
@@ -59,6 +82,9 @@ run clone specs/uefi-2.11 https://github.com/UEFI/UEFI-Specification-Release.git
 run download specs/intel-sdm.pdf https://cdrdv2.intel.com/v1/dl/getContent/671200
 # Intel 官网已下线，使用 MIT 6.828 的镜像。
 run download specs/intel-mp-1.4.pdf https://pdos.csail.mit.edu/6.828/2018/readings/ia32/MPspec.pdf
+
+# 依赖上面的 PDF，必须最后执行。
+run pdf_to_txt specs-pdf-to-txt
 
 if ((${#failed[@]})); then
     echo "failed: ${failed[*]}" >&2
