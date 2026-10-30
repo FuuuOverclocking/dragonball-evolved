@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VMM 结构关系 · Dragonball Evolved</title>
+<style>
+:root{color-scheme:light;--bg:#f4f6f9;--panel:#fff;--soft:#eef2f8;--text:#19283e;--muted:#66768b;--line:#d9e1ec;--own:#3765d8;--arc:#8751c2;--msg:#138b82;--flow:#b57017;--blue-soft:#eaf0ff;--shadow:0 8px 32px #172b4d08;--sans:"Noto Sans CJK SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;--mono:"SFMono-Regular",Consolas,"Noto Sans Mono",monospace}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#101721;--panel:#182230;--soft:#202e40;--text:#e5edf8;--muted:#a1b0c5;--line:#304056;--own:#85a6ff;--arc:#c79bf4;--msg:#65d4c5;--flow:#ebbd76;--blue-soft:#233552;--shadow:none}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#101721;--panel:#182230;--soft:#202e40;--text:#e5edf8;--muted:#a1b0c5;--line:#304056;--own:#85a6ff;--arc:#c79bf4;--msg:#65d4c5;--flow:#ebbd76;--blue-soft:#233552;--shadow:none}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.65 var(--sans)}button,input,select{font:inherit}button{cursor:pointer;appearance:none;-webkit-appearance:none}button:disabled{opacity:.4;cursor:default}button,input,select,a{outline-offset:4px}:focus-visible{outline:3px solid var(--msg)}a{color:var(--own);text-decoration:none}a:hover{text-decoration:underline}code{font-family:var(--mono);font-size:.88em;overflow-wrap:anywhere}h1,h2,h3,p{margin:0}h1{font-size:clamp(27px,3.6vw,43px);line-height:1.3;letter-spacing:-.035em}h2{font-size:21px;line-height:1.4}h3{font-size:16px}p+p{margin-top:8px}.muted{color:var(--muted)}.small{font-size:12px}.eyebrow{color:var(--muted);font:600 11px var(--mono);letter-spacing:.14em;text-transform:uppercase}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.topbar{max-width:1320px;margin:auto;padding:21px 28px;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand{font:600 13px var(--mono);display:flex;align-items:center;gap:10px}.brand-mark{width:22px;height:22px;display:grid;grid-template-columns:repeat(2,1fr);gap:3px}.brand-mark i{background:var(--own);border-radius:2px}.brand-mark i:last-child{background:var(--msg)}.button{background:var(--panel);border:1px solid var(--line);color:var(--text);padding:7px 13px;border-radius:8px;font-size:13px;line-height:1.5}.button:hover:not(:disabled){border-color:var(--own);color:var(--own)}.button.primary{background:var(--own);border-color:var(--own);color:var(--panel)}.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;background:var(--soft);border-radius:6px;color:var(--muted);font-size:11px}.dot{width:6px;height:6px;background:var(--msg);border-radius:50%}
+main{max-width:1320px;margin:auto;padding:12px 28px 56px;min-width:0}.hero{padding:24px 0 26px}.hero .eyebrow{margin-bottom:12px}.hero p{max-width:750px;margin-top:15px;color:var(--muted)}.hero-tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:19px}.intro-chain{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:26px}.intro-card{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:17px 18px;text-align:left;color:var(--text)}.intro-card:hover{border-color:var(--own)}.intro-card code{display:block;font-size:16px;font-weight:600;margin-bottom:5px}.intro-card p{color:var(--muted);font-size:12px}.intro-card .number{position:absolute;right:14px;top:16px;color:var(--line);font:600 26px var(--mono)}
+.search-area{position:relative;margin:0 0 21px}.search-row{display:flex;gap:10px;align-items:center;border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:10px 13px}.search-mark{width:14px;height:14px;border:2px solid var(--muted);border-radius:50%;position:relative;flex:none;margin:0 6px 3px 2px}.search-mark:after{content:"";position:absolute;background:var(--muted);height:2px;width:6px;right:-5px;bottom:-3px;transform:rotate(45deg)}#search{border:0;background:none;min-width:0;flex:1;color:var(--text);padding:2px;font-size:14px}#search::placeholder{color:var(--muted)}#search-clear{padding:3px 9px}.search-results{position:absolute;top:100%;left:0;right:0;z-index:5;margin-top:5px;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);padding:7px;max-height:360px;overflow:auto}.search-results[hidden]{display:none}.search-result{display:block;width:100%;background:none;border:0;color:var(--text);text-align:left;padding:9px 11px;border-radius:7px}.search-result:hover,.search-result:focus-visible{background:var(--soft)}.search-result code{display:block;font-weight:600}.search-result small{display:block;color:var(--muted);overflow-wrap:anywhere}.search-empty{padding:13px;color:var(--muted);overflow-wrap:anywhere}
+.workspace{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:18px;align-items:start}.workspace>*{min-width:0}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}.panel-head{padding:19px 21px 13px;border-bottom:1px solid var(--line)}.panel-head p{font-size:12px;color:var(--muted);margin-top:6px}.tabs{display:flex;flex-wrap:wrap;gap:5px;margin-top:15px}.tab{background:none;border:0;border-radius:7px;padding:7px 10px;color:var(--muted);font-size:12px}.tab:hover{color:var(--own);background:var(--soft)}.tab[aria-selected="true"]{background:var(--blue-soft);color:var(--own);font-weight:600}.legend{display:flex;flex-wrap:wrap;gap:9px 13px;padding:13px 20px 4px}.legend button{display:flex;align-items:center;gap:6px;padding:2px;background:none;border:0;font-size:11px;color:var(--muted)}.legend button[aria-pressed="false"]{opacity:.35}.sample-line{width:21px;border-top:2px solid var(--own)}.sample-line.arc{border-top:2px dashed var(--arc)}.sample-line.msg{border-top:2px dotted var(--msg)}.sample-line.flow{border-top:2px solid var(--flow)}
+.graph-wrap{padding:5px 11px 0;overflow:auto;background-image:radial-gradient(var(--line) .7px,transparent .7px);background-size:17px 17px}#graph{display:block;width:100%;min-width:630px;height:auto;overflow:visible}.edge{fill:none;stroke-width:1.6}.edge.own{stroke:var(--own)}.edge.arc{stroke:var(--arc);stroke-dasharray:6 4}.edge.msg{stroke:var(--msg);stroke-dasharray:2 4}.edge.flow{stroke:var(--flow)}.edge.is-muted{opacity:.26}.edge.is-focus{stroke-width:2.4}.edge-label{font:10px var(--sans);fill:var(--muted);paint-order:stroke;stroke:var(--panel);stroke-width:5px;stroke-linejoin:round}.edge-label.is-muted{opacity:.5}.node{cursor:pointer}.node rect{fill:var(--panel);stroke:var(--line);stroke-width:1.3}.node text{fill:var(--text);pointer-events:none}.node .node-name{font:600 13px var(--mono)}.node .node-caption{font:11px var(--sans);fill:var(--muted)}.node .node-stripe{stroke:none;fill:var(--own)}.node.is-selected rect.main-rect{stroke:var(--own);stroke-width:2.3;fill:var(--blue-soft)}.node.is-neighbor rect.main-rect{stroke:var(--own)}.node.is-muted{opacity:.65}.node:focus-visible{outline:none}.node:focus-visible rect.main-rect{stroke:var(--msg);stroke-width:3}.node-list{display:none}.graph-note{padding:11px 20px 17px;font-size:12px;color:var(--muted);border-top:1px solid var(--line)}
+.inspector{padding:20px;scroll-margin-top:16px}.inspector .eyebrow{margin-bottom:9px}#detail-name{font:600 21px/1.4 var(--mono);overflow-wrap:anywhere}#detail-role{color:var(--muted);font-size:13px;margin:9px 0 13px}.detail-badges{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:19px}.detail-label{font-size:11px;font-weight:600;letter-spacing:.05em;color:var(--muted);margin:18px 0 8px}.field{padding:8px 0;border-bottom:1px solid var(--line)}.field:last-child{border:0}.field code{display:block;font-size:11.5px;line-height:1.6}.field-kind{display:inline-block;font-size:10px;padding:0 5px;margin-top:3px;background:var(--soft);border-radius:4px;color:var(--muted)}.related-list{display:flex;flex-direction:column;gap:5px}.related-item{border:1px solid var(--line);background:none;color:var(--text);text-align:left;font-size:11px;padding:7px 8px;border-radius:6px}.related-item:hover{border-color:var(--own)}.related-item code{font-size:11px}.related-item small{color:var(--muted)}.detail-note{margin-top:15px;padding:10px 11px;background:var(--soft);border-radius:7px;font-size:12px;color:var(--muted)}#detail-source{display:block;font-size:10.5px;color:var(--muted);line-height:1.7;overflow-wrap:anywhere;margin-top:7px}
+.flows{margin-top:24px;padding:22px}.section-heading{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.section-heading p{font-size:12px;color:var(--muted);margin-top:6px}.scenario-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:17px 0}.scenario{background:var(--soft);border:1px solid transparent;color:var(--muted);padding:6px 12px;border-radius:7px;font-size:12px}.scenario[aria-selected="true"]{border-color:var(--own);color:var(--own);background:var(--blue-soft)}.step-track{display:flex;gap:5px;margin:12px 0 16px}.step-track button{flex:1;height:5px;border:0;border-radius:3px;background:var(--line);padding:0}.step-track button.done{background:var(--own);opacity:.45}.step-track button.current{background:var(--own)}.step-card{background:var(--soft);border-radius:10px;padding:17px 19px;min-height:172px}.step-card .eyebrow{margin-bottom:8px}.step-card h3{font-size:18px}.step-card p{font-size:13px;color:var(--muted);margin:9px 0}.step-owner{font:11.5px var(--mono);color:var(--arc);overflow-wrap:anywhere}.step-controls{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:13px}.step-controls .spacer{flex:1}.step-nodes{display:flex;flex-wrap:wrap;gap:5px;margin-top:12px}.type-chip{background:var(--panel);border:1px solid var(--line);border-radius:5px;color:var(--text);font:11px var(--mono);padding:3px 7px;overflow-wrap:anywhere;text-align:left}.type-chip:hover{color:var(--own);border-color:var(--own)}
+.pitfalls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:24px}.pitfall{padding:16px 18px;border:1px solid var(--line);border-radius:11px;background:var(--panel)}.pitfall summary{cursor:pointer;font-size:13px;font-weight:600;list-style:none;display:flex;align-items:center;gap:10px}.pitfall summary:before{content:"+";font:16px var(--mono);color:var(--own)}.pitfall[open] summary:before{content:"−"}.pitfall p{font-size:12px;color:var(--muted);margin-top:10px}.index{margin-top:23px;padding:19px 21px}.index summary{cursor:pointer;font-size:14px;font-weight:600}.index p{color:var(--muted);font-size:12px;margin:10px 0}.index-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}.footer{font-size:11px;color:var(--muted);padding:24px 0 0;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}.footer code{font-size:11px}
+@media(max-width:1050px){.workspace{grid-template-columns:minmax(0,1fr) 280px}main{padding-left:18px;padding-right:18px}.topbar{padding-left:18px;padding-right:18px}}
+@media(max-width:820px){.workspace{grid-template-columns:1fr}.inspector{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 22px}.inspector .intro-detail{grid-column:1/-1}.inspector .source-detail{grid-column:1/-1}.graph-wrap{padding:4px 8px 0}#graph{min-width:610px}.hero{padding-top:13px}.pitfalls{grid-template-columns:1fr}}
+@media(max-width:620px){main{padding:6px 12px 35px}.topbar{padding:16px 13px}.brand{font-size:11px}.hero h1{font-size:28px}.hero p{font-size:13px}.intro-chain{grid-template-columns:1fr;gap:7px}.intro-card{padding:12px 14px}.intro-card code{font-size:14px}.intro-card .number{top:10px;font-size:22px}.panel-head{padding:16px 15px 11px}.legend{padding:12px 15px 5px;gap:7px 12px}.graph-wrap{display:none}.node-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:12px 15px 15px}.node-list button{min-width:0;background:var(--panel);color:var(--text);border:1px solid var(--line);padding:10px 8px;border-radius:7px;text-align:left}.node-list code{display:block;font-size:11px;font-weight:600}.node-list small{display:block;color:var(--muted);font-size:10px;margin-top:4px}.node-list .is-selected{border-color:var(--own);background:var(--blue-soft)}.graph-note{padding:11px 15px;font-size:11px}.inspector{padding:17px 15px;display:block}.flows{padding:17px 15px}.step-card{padding:14px;min-height:185px}.step-card h3{font-size:16px}.step-controls .spacer{display:none}.step-controls .button{font-size:12px}.scenario{padding:6px 9px}.tabs{gap:2px}.tab{padding:7px 8px}.search-row{padding:8px 10px}#search{font-size:12px}.hero-tags .pill{font-size:10px}.index{padding:16px 15px}}
+@media(prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}.node rect,.button{transition:stroke .15s,border-color .15s}}
+.inspector{position:sticky;top:18px;max-height:calc(100vh - 36px);overflow:auto}.related-list{max-height:230px;overflow:auto}.related-item small{display:block;margin-top:2px}.step-track button{height:22px;background:none;position:relative}.step-track button:before{content:"";position:absolute;left:0;right:0;top:9px;height:5px;border-radius:3px;background:var(--line)}.step-track button.done{background:none;opacity:1}.step-track button.done:before{background:var(--own);opacity:.45}.step-track button.current{background:none}.step-track button.current:before{background:var(--own)}@media(max-width:820px){.inspector{position:static;max-height:none;overflow:visible}}
+</style>
+</head>
+<body>
+<header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>DRAGONBALL / VMM</div><button class="button" id="theme-toggle" type="button">切换主题</button></header>
+<main>
+<section class="hero"><div class="eyebrow">Code anatomy / 01</div><h1>从一台 <code>Machine</code>，<br>读懂整个 VMM。</h1><p>先别记所有类型。分清<strong>谁拥有资源</strong>、<strong>谁共享访问</strong>、<strong>谁通过消息协作</strong>，再沿着一次启动或 I/O 把它们串起来。</p><div class="hero-tags"><span class="pill"><span class="dot"></span>当前代码 e849215</span><span class="pill">x86-64 / KVM / Linux</span><span class="pill">内存 M0–M2 已完成</span><span class="pill">尚无 virtio-mem</span></div></section>
+<div class="intro-chain"><button class="intro-card" data-pick="MachineSpec"><span class="number">01</span><code>MachineSpec</code><p>想要什么：配置值，不打开资源。</p></button><button class="intro-card" data-pick="MachinePlan"><span class="number">02</span><code>MachinePlan</code><p>放在哪里：布局与 grant，恢复照搬。</p></button><button class="intro-card" data-pick="Machine"><span class="number">03</span><code>Machine</code><p>真正运行：fd、线程、任务与映射。</p></button></div>
+<form class="search-area" id="search-form" role="search"><div class="search-row"><span class="search-mark" aria-hidden="true"></span><label class="sr-only" for="search">检索类型、职责或源码路径</label><input id="search" type="search" autocomplete="off" placeholder="检索类型、职责或路径，例如 SlotPermit / 快照 / virtio"><button class="button" id="search-clear" type="button">清除</button></div><div id="search-results" class="search-results" aria-live="polite" hidden></div></form>
+<section class="workspace" id="workspace">
+<div class="panel"><div class="panel-head"><h2 id="view-title">结构关系</h2><p>点选节点看一跳联系；图例筛选连线，详情保留完整关系。箭头不全是所有权。</p><div class="tabs" id="view-tabs" role="tablist" aria-label="结构关系视图"></div></div><div class="legend" id="legend" aria-label="关系类型筛选"><button data-kind="own" aria-pressed="true"><span class="sample-line"></span>按值拥有</button><button data-kind="arc" aria-pressed="true"><span class="sample-line arc"></span>Arc 共享</button><button data-kind="msg" aria-pressed="true"><span class="sample-line msg"></span>消息 / 通知</button><button data-kind="flow" aria-pressed="true"><span class="sample-line flow"></span>构造 / 消耗</button></div><div class="graph-wrap"><svg id="graph" viewBox="0 0 780 540" role="group" aria-label="VMM 数据结构关系图"></svg></div><div class="node-list" id="node-list" aria-label="当前视图结构列表"></div><p class="graph-note" id="view-note"></p></div>
+<aside class="panel inspector" id="inspector" aria-label="选中结构详情"><div class="intro-detail"><div class="eyebrow">Selected structure</div><h2 id="detail-name" aria-live="polite">Machine</h2><p id="detail-role"></p><div class="detail-badges" id="detail-badges"></div></div><div><div class="detail-label">关键字段 / 携带方式</div><div id="detail-fields"></div></div><div><div class="detail-label">直接联系 / 点选继续</div><div class="related-list" id="detail-related"></div></div><div class="source-detail"><p class="detail-note" id="detail-note"></p><div class="detail-label">源码定位</div><code id="detail-source"></code></div></aside>
+</section>
+<section class="panel flows" id="flows"><div class="section-heading"><div><h2>让结构动起来</h2><p>按步骤观察资源移动；场景说明是代码路径，不是在执行 VMM。</p></div><span class="pill" id="step-count"></span></div><div class="scenario-tabs" id="scenario-tabs" role="tablist" aria-label="代码流程场景"></div><div class="step-track" id="step-track" aria-label="步骤定位"></div><div class="step-card" aria-live="polite"><div class="eyebrow" id="step-label"></div><h3 id="step-title"></h3><p id="step-description"></p><div class="step-owner" id="step-owner"></div><div class="step-nodes" id="step-nodes"></div></div><div class="step-controls"><button class="button" id="step-prev">上一步</button><button class="button primary" id="step-next">下一步</button><button class="button" id="step-reset">重置</button><span class="spacer"></span><button class="button" id="step-locate">在关系图中查看</button></div></section>
+<section class="pitfalls" aria-label="容易误解的关系"><details class="pitfall"><summary>Busy.stable 里还有一台 Machine 吗？</summary><p>没有。<code>stable</code> 只是给查询用的 <code>api::VmState</code>。真正的 <code>Machine</code> 已移入 <code>Operation.future</code>，直到操作完成再交回 <code>Vm</code>。</p></details><details class="pitfall"><summary>设备整体都在 Arc&lt;Mutex&lt;…&gt;&gt; 里吗？</summary><p>不是。transport 的寄存器状态有局部 Mutex；后端资源由自己的任务独占。<code>DeviceManager</code> 管停止、退出、gate 和 I/O 线程，不拥有一个万能的共享设备对象。</p></details><details class="pitfall"><summary>快照能同时带着源 VM 的 RAM 再启动一台吗？</summary><p><code>MachineSnapshot</code> 不持有 RAM。恢复需要按值交入不可克隆的 <code>GuestRam</code>，通常来自源机器的 teardown；字节视图的 Arc 不是绑定权限。</p></details><details class="pitfall"><summary>每次队列通知都会经过 userspace Bus 吗？</summary><p>配置寄存器访问会；正常 queue notify 可由 KVM 的 ioeventfd 直接触发后端 kick。不要把“配置通路”和“队列数据通路”画成同一条线。</p></details></section>
+<details class="panel index"><summary>本页结构索引 <span class="muted" id="type-count"></span></summary><p>主图只保留关键节点；辅助类型在这里检索。标为外部 crate 的字段只是边界，不属于 vmm 自己的定义。</p><div class="index-list" id="type-index"></div></details>
+<footer class="footer"><span>单文件、离线可读；关系以实际代码为准，不展示未来设备。</span><code>crates/vmm · e849215 · 2026-10-27</code></footer>
+<noscript><p class="detail-note">交互关系图需要 JavaScript；上面的概述与误区说明仍可阅读。</p></noscript>
+</main>
+<script>
+'use strict';
+const TYPES = {
+ResourceBook:{group:'overview',role:'分配 guest ABI 资源的值类型账本，不是宿主资源 manager。',ref:'resources.rs:279',threads:['纯数据 / plan 阶段'],fields:[['virtio_mmio: AddressPool','值','AddressPool'],['legacy_gsi: IdPool<Gsi>','值','IdPool'],['device_memory: AddressPool','值','AddressPool']],peers:[['MachinePlan','flow','规划时使用'],['VirtioMmioGrant','flow','分配 grant']],note:'每次分配返回新账本；grant 记在设备 plan 中，账本本身不保存进快照。恢复重放 grant。'},
+AddressPool:{group:'overview',role:'在固定 GPA 窗口内分配不相交、满足对齐的地址区间。',ref:'resources.rs:116',threads:['纯数据'],fields:[['window: GpaRange','值','GpaRange'],['allocated: Vec<GpaRange>','有序不相交区间','GpaRange']],note:'allocate/reserve/release 返回新池。reserve 用来重放旧 grant，拒绝越窗与重叠；不是运行期 mmap 入口。'},
+IdPool:{group:'overview',role:'固定范围内的小整数 ID 分配器；可用于 GSI，也可在 MemSlots 中用于宿主 memslot。',ref:'resources.rs:211',threads:['值类型 / 独占分配权内部'],fields:[['ids: RangeInclusive<T>','范围值'],['allocated: BTreeSet<T>','已分配 ID 集合']],note:'IdPool 本身可以克隆；但 MemSlots 的唯一外壳不可克隆，不能借此重复签发 SlotPermit。GSI 与 memslot 是不同类型。'},
+VirtioMmioGrant:{group:'overview',role:'一台 virtio-mmio 设备已经获配的窗口与中断线，属于 guest ABI。',ref:'machine/plan.rs:16',threads:['纯数据'],fields:[['mmio: GpaRange','地址区间','GpaRange'],['gsi: Gsi','中断线','Gsi']],note:'恢复按这个值把 transport 放回原位置。它不是 KVM memslot，也不持有 fd。'},
+GpaRange:{group:'overview',role:'半开 guest 物理地址区间，构造保证 end 不小于 start。',ref:'resources.rs:31',threads:['纯数据'],fields:[['Range<u64>','类型封装 / 半开区间']],note:'它表示 guest 地址，不是宿主指针 HVA；同一种空间内的重叠和对齐由布局/账本校验。'},
+Gsi:{group:'overview',role:'guest 中断控制器的输入线 ID；与 GPA、PIO 和 memslot 分开编码。',ref:'resources.rs:15',threads:['纯数据'],fields:[['u32','独立类型封装']],note:'它属于设备 grant 的 guest ABI；KVM 绑定中使用的 MemSlot 则只是宿主运行期编号。'},
+MachineSnapshot:{group:'snapshot',role:'一次暂停机器的状态数据：plan、KVM、vCPU、平台和逐设备状态。没有 RAM，也没有活的内核对象。',ref:'machine/snapshot.rs:25',threads:['读取暂停机器 / 纯数据'],fields:[['plan: MachinePlan','值','MachinePlan'],['vm: VmKvmState','值','VmKvmState'],['vcpus: Vec<VcpuSnapshot>','值','VcpuSnapshot'],['platform: PlatformSnapshot','值','PlatformSnapshot'],['devices: Vec<DeviceSnapshot>','值','DeviceSnapshot']],note:'rebuild 还需要按值提供 GuestRam；当前是同进程 Rust API，没有 HTTP 快照接口或持久化格式。'},
+VmKvmState:{group:'snapshot',role:'KVM VM 级别的普通状态值，不是 VmFd。',ref:'machine/snapshot.rs:44',threads:['暂停后提取'],fields:[['pic_master / pic_slave / ioapic','kvm_irqchip 值'],['pit: kvm_pit_state2','值'],['clock: kvm_clock_data','值']],note:'恢复时先建新 VM，再恢复 irqchip 和 PIT，vCPU 后恢复，clock 最后设置。'},
+VcpuSnapshot:{group:'snapshot',role:'一个 vCPU 的寄存器和 guest 可见 CPU 状态，不持有运行线程或 vCPU fd。',ref:'machine/snapshot.rs:55',threads:['暂停后读取 kick fd'],fields:[['index / mp_state / regs / sregs','值'],['xsave / lapic / cpuid / msrs','值'],['xcrs / debug_regs / vcpu_events','值']],note:'每个 vCPU 都要恰好出现一次并按 0..cpus 排列；恢复创建新的 KvmVcpu 再重放这些值。'},
+PlatformSnapshot:{group:'snapshot',role:'i8042 与可选 COM1 的 guest 可见状态。',ref:'machine/platform.rs:23',threads:['暂停后提取'],fields:[['i8042: I8042State','值'],['serial: Option<SerialState>','值']],note:'不保存终端 fd 或 raw mode；恢复时重新接入控制台资源。'},
+DeviceSnapshot:{group:'snapshot',role:'按 kind 的设备协议状态；恢复时先按 id 与 DevicePlan 对齐。',ref:'machine/snapshot.rs:71',threads:['纯数据'],fields:[['Block(BlockSnapshot)','枚举值','BlockSnapshot']],note:'恢复拒绝缺失、重复或多余的设备状态；它不等于重新按 spec 创建一台空设备。'},
+BlockSnapshot:{group:'snapshot',role:'磁盘的 transport 状态和可选后端队列状态，保存 guest 真正观察到的协议。',ref:'machine/block.rs:40',threads:['设备暂停后提取'],fields:[['id: String','值'],['transport: MmioTransportSnapshot','值'],['queue: Option<QueueState>','值 · virtio_queue']],note:'是否重激活由后端 QueueState 决定，不只看 transport status；尚未确认的中断在恢复时重新发出。'},
+MachineEvent:{group:'control',role:'平台或 vCPU 发给 vmm-main 的机器事件，区别于设备任务独立的 DeviceExit 通道。',ref:'machine/mod.rs:12',threads:['vCPU / 平台 → vmm-main'],fields:[['GuestReset','机器复位'],['VcpuFailed { index, error }','vCPU 故障']],peers:[['VcpuRunner','msg','发送事件'],['Controller','msg','主循环处理']],note:'GuestReset / vCPU 故障触发拆除；单个设备任务退出由 DeviceManager 的另一条通道处理，不直接终止 guest。'},
+Activator:{group:'io',role:'激活握手的发送半边，transport 在 DRIVER_OK 时把 Activation 发送给设备任务。',ref:'devices/virtio/mod.rs:101',threads:['vCPU 回调'],fields:[['tx: mpsc::Sender<Activation>','消息发送','Activation']],note:'activate 使用 try_send；这个握手不需要 eventfd，也不把后端对象跨线程共享。'},
+ActivationRx:{group:'io',role:'激活握手的接收半边，由设备后端任务持有。',ref:'devices/virtio/mod.rs:120',threads:['I/O 后端'],fields:[['rx: mpsc::Receiver<Activation>','消息接收','Activation']],note:'等待激活时也能处理停止和 quiesce；前端消失可使一个从未使用的设备正常结束。'},
+Session:{group:'io',role:'后端持有的一次会话生命周期：观察 reset，结束时确认已经放下会话资源。',ref:'devices/virtio/mod.rs:35',threads:['I/O 后端'],fields:[['reset: watch::Receiver<bool>','重置信号接收'],['finished: Option<oneshot::Sender<()>>','结束确认发送']],peers:[['SessionControl','msg','reset / finished']],note:'不等于整台设备：guest reset 可以结束这次会话，再通过 Activation 建立下一次会话。'},
+SessionControl:{group:'io',role:'transport 持有的会话控制半边，发 reset 并等待后端确认结束。',ref:'devices/virtio/mod.rs:41',threads:['transport / vCPU 回调'],fields:[['reset: watch::Sender<bool>','重置信号发送'],['finished: oneshot::Receiver<()>','结束确认接收']],peers:[['Session','msg','重置握手']],note:'控制和数据面分属两个拥有者；reset 的确认不是简单把寄存器 status 写回 0。'},
+BlockResources:{group:'io',role:'还未绑定到异步运行时的块设备资源包，可移动到 I/O 线程再构造设备。',ref:'devices/virtio/block.rs:139',threads:['创建侧 → I/O 线程'],fields:[['disk: Disk','文件资源'],['queue_kick: EventFd','队列通知 fd'],['activation: ActivationRx','接收半边','ActivationRx'],['quiesce_rx: Receiver<BlockQuiesceCmd>','控制消息接收']],note:'open 同时交出控制侧 BlockHandle 和 BlockQuiesceHandle；into_device 在目标运行时包装异步 fd。'},
+BlockHandle:{group:'io',role:'块设备资源创建时交给前端的一包连接件，随后被拆开装入 transport。',ref:'devices/virtio/block.rs:80',threads:['设备 attach'],fields:[['activator: Activator','消息发送','Activator'],['queue_notifier: EventFd','通知 fd'],['interrupt: Arc<IrqTrigger>','Arc','IrqTrigger'],['desc: DeviceDesc','值','DeviceDesc']],note:'它不是后端设备本体；BlockResources 才携带 disk 和接收半边去 I/O 线程。'},
+BlockDevice:{group:'io',role:'I/O 线程上实际运行的后端，独占磁盘、接收端和有界 staging 缓冲。',ref:'devices/virtio/block.rs:210',threads:['I/O LocalRuntime'],fields:[['disk: Disk / staging: Vec<u8>','独占资源'],['queue_kick: AsyncEventFd','异步通知 fd'],['activation: ActivationRx','消息接收','ActivationRx'],['quiesce_rx: Receiver<BlockQuiesceCmd>','控制消息接收']],peers:[['Active','flow','serve 会话局部值']],note:'run/serve 在自己的循环里处理队列和 quiesce，用 &mut 取 QueueState。当前磁盘 I/O 是同步的，async 不保证它不会阻塞线程。'},
+Active:{group:'io',role:'块设备一次激活会话的局部工作值，保存实际 Queue，而不是 transport 的队列寄存器。',ref:'devices/virtio/block.rs:528',threads:['I/O 后端会话'],fields:[['mem: SharedGuestMemory','Arc','SharedGuestMemory'],['queue: Queue','独占值 · virtio_queue'],['interrupt: Arc<IrqTrigger>','Arc','IrqTrigger']],note:'这是 block 后端内部的 Active，不是 Controller 的运行状态；其内容来自 Activation。'},
+BlockQuiesceHandle:{group:'io',role:'机器控制侧通过它要求后端暂停，并等待后端就地导出状态。',ref:'devices/virtio/block.rs:110',threads:['vmm-main → I/O 后端'],fields:[['id: String','值'],['tx: Sender<BlockQuiesceCmd>','控制消息发送']],peers:[['BlockDevice','msg','Quiesce / Resume'],['BlockQuiesced','msg','oneshot 回复']],note:'已退出的任务返回 Exited；不要因为一个设备无法 quiesce 就把整个 guest 终止。'},
+BlockQuiesced:{group:'io',role:'设备在暂停点回复的状态值，机器记录后供 capture 使用。',ref:'devices/virtio/block.rs:89',threads:['I/O 回复 → vmm-main'],fields:[['Inactive','未激活，没有队列'],['Active(QueueState)','状态值 · virtio_queue'],['Exited','任务已退出']],note:'不是共享的活 Queue。状态在设备自己的循环中提取；恢复已退出的设备会掩盖失败，因此 capture 拒绝它。'},
+IrqTrigger:{group:'io',role:'中断连接：后端设置状态并写 irqfd，KVM 注入 guest 中断，resample 处理 EOI。',ref:'devices/virtio/interrupt.rs:27',threads:['I/O 触发 / vmm-main resample / KVM'],fields:[['status: Arc<AtomicU32>','共享原子状态'],['irq_fd: EventFd','KVM 中断 fd'],['resample_fd: EventFd','KVM EOI 通知 fd']],peers:[['VcpuRunner','msg','经 KVM irqfd 注入']],note:'不是通过 Bus 调用 vCPU 来中断 guest；transport 和后端共享同一个 IrqTrigger。'},
+KvmNotify:{name:'KVM / ioeventfd',external:true,group:'io',role:'这是 KVM 通知机制，不是 vmm 的 Rust 结构。guest 的 queue notify 命中注册地址后，KVM 直接写 eventfd。',ref:'machine/block.rs:116',threads:['KVM 内核'],fields:[['register_ioevent(queue_notifier, MMIO address, 0u32)','attach 注册'],['eventfd → queue_kick','后端通知']],note:'这条快路径不必让 VcpuRunner 收到 userspace MMIO 退出。上方源码定位是注册位置，不是类型定义。'},
+DeviceManager:{group:'io',role:'管理任务的停止信号、gate、退出事件和 I/O 线程；不拥有一个万能的设备对象。',ref:'devices/mod.rs:179',threads:['vmm-main 管理'],fields:[['io_thread: Option<IoThread>','值','IoThread'],['stop_tx: watch::Sender<bool>','停止广播'],['exit_tx / exit_rx','退出消息'],['guest_gates: Vec<Sender<GateCommand>>','暂停 / 恢复消息']],note:'GuestAffecting 任务可以被 gate 冻结；块设备后端用自己的 quiesce 通道协作暂停，不把整个设备包进共享锁。'},
+IoThread:{group:'io',role:'另一条运行 LocalRuntime 的 I/O 线程，用 factory 在目标线程内构造可为 !Send 的设备 future。',ref:'devices/io_thread.rs:14',threads:['I/O LocalRuntime'],fields:[['tx: UnboundedSender<Job>','Send 工厂发送'],['thread: JoinHandle<()>','线程句柄']],note:'跨线程发送的是 Send 的 Job 工厂，设备 future 在 I/O LocalRuntime 内构造并运行，可为 !Send。async 不保证磁盘 I/O 不阻塞线程。'},
+AttachedDevice:{group:'io',role:'机器控制侧按 kind 持有已接入的设备，负责 quiesce、resume 和 capture。',ref:'machine/build.rs:44',threads:['vmm-main'],fields:[['Block(AttachedBlock)','枚举值','AttachedBlock']],note:'当前只有 Block；设备后端任务与这个控制侧对象是两个不同的拥有者。'},
+AttachedBlock:{group:'io',role:'一块盘在机器控制侧的连接：plan、共享 transport 和协作暂停句柄。',ref:'machine/block.rs:47',threads:['vmm-main'],fields:[['plan: BlockPlan','值','BlockPlan'],['transport: Arc<MmioTransport>','Arc','MmioTransport'],['quiesce: BlockQuiesceHandle','消息句柄','BlockQuiesceHandle'],['state: Option<BlockQuiesced>','暂停记录','BlockQuiesced']],note:'pause 记录后端状态，resume 清除记录；后端退出不使 guest 一并停止，但 capture 拒绝掩盖故障。'},
+Platform:{group:'io',role:'机器控制侧的平台设备：i8042 和可选 COM1，以及控制台 raw mode 的生命周期。',ref:'machine/platform.rs:29',threads:['vmm-main / vCPU 访问'],fields:[['i8042: Arc<I8042Device>','Arc'],['serial: Option<Arc<SerialHandle<ConsoleOut>>>','Arc'],['_raw_mode: Option<RawModeGuard>','值 / RAII']],note:'这些设备通过 PIO Bus 接入。串口输入任务由 DeviceManager 管，i8042 的复位事件交给 vmm-main。'},
+Bus:{group:'io',role:'固定地址表，把 PIO/MMIO 访问分派给对应的 BusDevice。它不是设备任务调度器。',ref:'machine/bus.rs:17',threads:['vCPU 线程 / 控制侧'],fields:[['entries: Box<[Entry]>','不可变表'],['Entry.range: Range<u64>','地址范围'],['Entry.device: Arc<dyn BusDevice>','Arc trait 对象']],note:'表在 assemble 时建好；read/write 同步调用设备回调。未命中的 MMIO 读由 vCPU 运行循环填 0。'},
+VcpuRunner:{group:'io',role:'真正运行 KVM_RUN 的 vCPU 线程主体，处理退出并在控制命令到来时切换状态。',ref:'machine/vcpu.rs:47',threads:['vCPU 线程'],fields:[['fd: KvmVcpu','值','KvmVcpu'],['pio / mmio: Arc<Bus>','Arc','Bus'],['commands: Receiver<VcpuCommand>','控制消息接收'],['events: UnboundedSender<MachineEvent>','机器事件发送']],note:'Handled 的 MMIO/PIO 先再次进入 KVM；只在 Interrupted 后处理命令，因而 Pause ACK 不会遗漏 pending userspace I/O。'},
+MmioTransport:{group:'io',role:'guest 可见的 virtio-mmio 前端：保存协商寄存器，把激活会话交给后端任务。',ref:'devices/virtio/mmio.rs:174',threads:['vCPU 回调 / vmm-main'],fields:[['state: Mutex<TransportState>','寄存器 / session 局部锁'],['desc: DeviceDesc','值','DeviceDesc'],['memory: SharedGuestMemory','Arc','SharedGuestMemory'],['activator: Activator','消息发送','Activator'],['interrupt: Arc<IrqTrigger>','Arc','IrqTrigger'],['queue_notifiers: Vec<EventFd>','通知 fd']],note:'寄存器 queues 只是地址与状态；DRIVER_OK 时校验并创建 Queue，按值发送 Activation。reset 通过 SessionControl 等后端结束会话。'},
+DeviceDesc:{group:'io',role:'设备对 guest 提供的静态描述：设备种类、支持的特性、队列上限和配置字节。',ref:'devices/virtio/mmio.rs:23',threads:['值 / transport 读取'],fields:[['device_type / features','数值'],['queue_max: Vec<u16>','队列上限'],['config: Vec<u8>','配置字节']],note:'快照保存 guest 看到的描述；恢复时后端描述变化（如盘大小）会被拒绝，而不是悄悄换掉 ABI。'},
+MmioRegs:{group:'io',role:'virtio-mmio 寄存器值：guest 写入的选择器、协商特性、设备 status 和队列地址。',ref:'devices/virtio/mmio.rs:40',threads:['transport Mutex 内'],fields:[['status / driver_features','数值'],['queues: Vec<QueueRegs>','寄存器数据']],note:'它不是活的后端 Queue；活 Queue 通过 Activation 进入设备任务。'},
+Activation:{group:'io',role:'一次 DRIVER_OK 的交接包：把协商结果与队列移交给设备任务。',ref:'devices/virtio/mod.rs:26',threads:['transport → I/O 后端'],fields:[['mem: SharedGuestMemory','Arc','SharedGuestMemory'],['queues: Vec<Queue>','移交值 · virtio_queue'],['interrupt: Arc<IrqTrigger>','Arc','IrqTrigger'],['driver_features: u64','值'],['session: Session','值','Session']],note:'不是整个设备的共享锁。一个 Activation 对应一段设备会话；reset 后可以重新激活。'},
+MemoryPlan:{group:'memory',role:'启动 RAM 布局、后端选择和设备地址窗口。窗口是地址账本，不是已映射的 RAM。',ref:'machine/memory.rs:21',threads:['纯数据'],fields:[['backing: api::MemoryBacking','值 · api'],['ram: Vec<GpaRange>','启动 RAM 区段'],['device_window: GpaRange','地址窗口']],note:'e820/PVH 内存表只取 ram；设备窗口不会自动映射。额外设备 grant 随消费者接入。'},
+GuestRam:{group:'memory',role:'不可克隆的 RAM 所有权句柄，记录映射时的 plan，并统一保存宿主映射。',ref:'machine/memory.rs:90',threads:['VM 持有 / 多线程字节访问'],fields:[['plan: MemoryPlan','值','MemoryPlan'],['memory: SharedGuestMemory','Arc 字节视图','SharedGuestMemory'],['mappings: Vec<RamMapping>','分区 Arc','RamMapping']],note:'map(plan, runtime_ram) 在创建 VM 前映射；运行期只切换 KVM 绑定，不更新视图。它不能同时被移入两台 VM。'},
+SharedGuestMemory:{group:'memory',role:'设备和 loader 看到的可克隆字节视图，不是“允许绑定到 KVM”的权限。',ref:'devices/virtio/mod.rs:21',threads:['vmm-main / I/O 线程'],fields:[['Arc<GuestMemoryMmap>','引用计数'],['GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>','外部映射集合']],note:'可以读写 guest 字节；Arc 保持映射存活，但不自动提供寄存器状态的同步，也不是 GuestMemoryAtomic。'},
+RamMapping:{group:'memory',role:'单个 guest RAM 区段的宿主映射 Arc，用于绑定一个映射中的页对齐子范围。',ref:'machine/memory.rs:76',threads:['VM / 绑定持有'],fields:[['Arc<GuestRegionMmap<()>>','分区引用 · vm_memory']],note:'Binding 保留它，直到删除 slot 成功；成功 unbind 交回 Arc，最后一个引用释放后才 munmap。'},
+KvmVm:{group:'memory',role:'一台具体 KVM VM 的 fd 与 RAM 所有者。new 只创建 VM，并交出唯一 slot 分配权。',ref:'machine/vm.rs:45',threads:['构建 / vCPU / 绑定'],fields:[['fd: VmFd','拥有 fd · kvm_ioctls'],['ram: GuestRam','值','GuestRam']],note:'fd 在 ram 之前声明，先关闭；into_ram 经 Arc::try_unwrap 确认没有 vCPU、绑定或凭据持有者后交还 RAM。'},
+MemSlots:{group:'memory',role:'每台 VM 只有一份的 slot 分配权；外壳不 Clone，内部账本仍按值分配。',ref:'machine/vm.rs:159',threads:['Machine 独占 / vmm-main'],fields:[['vm: Arc<KvmVm>','Arc','KvmVm'],['pool: IdPool<MemSlot>','值类型账本']],note:'allocate 全部成功才提交新池。slot 是宿主资源，不进快照；丢弃凭据不会自动重发编号。'},
+SlotPermit:{group:'memory',role:'不可克隆、属于一台 VM 的 slot 凭据。绑定消耗它，成功解绑才归还。',ref:'machine/vm.rs:190',threads:['分配方 → 绑定持有方'],fields:[['vm: Arc<KvmVm>','Arc','KvmVm'],['slot: MemSlot','数值 ID，不是另一份权限']],note:'仅有可复制的 MemSlot 不够：KVM 允许同一 slot 重复注册。唯一凭据防止两个 RAII 句柄互相删除。'},
+Binding:{group:'memory',role:'一次活的 KVM memslot 绑定：凭据保持 VM 存活，映射 Arc 保持地址可访问。',ref:'machine/vm.rs:214',threads:['启动绑定由 Machine 持有'],fields:[['permit: Option<SlotPermit>','独占凭据','SlotPermit'],['range: GpaRange','页对齐子范围'],['mapping: RamMapping','Arc','RamMapping']],note:'unbind 失败原样归还 Binding；成功交回 permit 和映射。Drop 尽力删除，失败故意保留映射，不冒险提前 unmap。'},
+Vcpus:{group:'memory',role:'一组 vCPU 控制句柄，批量发命令并等待每个 vCPU 的确认。',ref:'machine/vcpu.rs:43',threads:['vmm-main 控制'],fields:[['handles: Vec<VcpuHandle>','值','VcpuHandle']],note:'pause ACK 意味着 pending userspace MMIO/PIO 已完成；stop 等退出通知并 join 线程。'},
+VcpuHandle:{group:'memory',role:'控制侧句柄：发 Pause/Resume/Stop，复制 fd 用于踢出 KVM_RUN 和读取状态。',ref:'machine/vcpu.rs:35',threads:['vmm-main'],fields:[['kick_fd: Mutex<KvmVcpu>','局部 Mutex','KvmVcpu'],['commands: Sender<VcpuCommand>','消息发送'],['exited: Option<oneshot::Receiver<()>>','退出确认'],['thread: Option<JoinHandle<()>>','线程句柄']],note:'Mutex 只保护控制侧 kick fd；guest 的 KVM_RUN 发生在另一个拥有 fd 的 VcpuRunner 中。'},
+KvmVcpu:{group:'memory',role:'vCPU fd 加上其 VM 的 Arc。复制的 kick fd 也通过这个类型保持 VM 和 RAM 存活。',ref:'machine/vm.rs:260',threads:['vCPU 线程 / 控制侧 kick'],fields:[['fd: VcpuFd','拥有 fd · kvm_ioctls'],['vm: Arc<KvmVm>','Arc','KvmVm']],note:'不是裸 VcpuFd：即使主侧放下 VM，只要任何 vCPU fd 还活着，RAM 就不会先解除映射。'},
+Machine:{group:'overview',role:'一次启动的运行时资源集合。不是一个全局 manager；它把资源交给各自的拥有者。',ref:'machine/build.rs:28',threads:['vmm-main 持有'],fields:[['vcpus: Option<Vcpus>','值','Vcpus'],['tasks: DeviceManager','值','DeviceManager'],['devices: Vec<AttachedDevice>','值','AttachedDevice'],['vm: Arc<KvmVm>','Arc','KvmVm'],['mmio: Arc<Bus>','Arc','Bus'],['ram_bindings: Vec<Binding>','值','Binding'],['memslots: MemSlots','值','MemSlots']],note:'Idle 时由 Vm 持有；Busy 时移入操作 future。teardown 先停 vCPU 与设备，再释放绑定和分配权，最后交还 GuestRam。'},
+MachineSpec:{group:'overview',role:'用户想要的机器配置。apply 返回新配置，validate 只检查数据与宿主能力。',ref:'spec.rs:17',threads:['纯数据 / vmm-main'],fields:[['cpus / memory_mib','值'],['memory_backing: api::MemoryBacking','值 · api'],['console: api::ConsoleConfig','值 · api'],['kernel: Option<KernelConfig>','值 · api'],['devices: Vec<DeviceSpec>','值','DeviceSpec']],note:'不会打开文件或 KVM；当前 DeviceSpec 只有 Block，没有 virtio-mem。'},
+DeviceSpec:{group:'overview',role:'按种类表示配置中的设备，而不是一个可变的设备 trait 对象。',ref:'spec.rs:28',threads:['纯数据'],fields:[['Block(BlockSpec)','枚举值'],['BlockSpec: id, path, read_only, root','配置值']],note:'配置描述意图，设备还没有地址、fd、线程或激活的队列。'},
+MachinePlan:{group:'overview',role:'把配置落实成布局、设备 grant 和命令行。构建后保留为数据，快照记录它。',ref:'machine/plan.rs:47',threads:['纯数据 / vmm-main'],fields:[['spec: MachineSpec','值','MachineSpec'],['memory: MemoryPlan','值','MemoryPlan'],['devices: Vec<DevicePlan>','值','DevicePlan'],['cmdline: Cmdline','值 · linux_loader']],note:'new 经资源账本分配；replay 重放记录的窗口与 grant，而不是按新算法重新排地址。'},
+DevicePlan:{group:'overview',role:'设备的配置加上已经确定的 guest ABI 资源。',ref:'machine/plan.rs:57',threads:['纯数据'],fields:[['Block(BlockPlan)','枚举值','BlockPlan']],note:'目前只有块设备；同一设备的 spec、plan、attached、snapshot 分别表示四个阶段。'},
+BlockPlan:{group:'overview',role:'一块磁盘的持久配置，以及 guest 看到的 virtio-mmio 窗口与中断线。',ref:'machine/block.rs:29',threads:['纯数据'],fields:[['id / path / read_only / root','值'],['grant: VirtioMmioGrant','值'],['grant.mmio: GpaRange','guest 地址区间'],['grant.gsi: Gsi','中断线 ID']],note:'MMIO/GSI grant 进入快照；KVM memslot、HVA 和 fd 不进入这里。'},
+ProcessCtx:{group:'control',role:'VMM 进程层的环境：身份、KVM 上下文和日志更新入口。不是 guest 的运行状态。',ref:'process_ctx.rs:6',threads:['vmm-main'],fields:[['id: String / version: String','值'],['kvm_ctx: KvmContext','值','KvmContext'],['update_logger: fn(LoggerConfig) → ApiResult<()>','函数指针 · api']],note:'start 把它移入 vmm-main；它为配置校验和机器构建提供宿主环境。'},
+KvmContext:{group:'control',role:'打开并检查宿主 /dev/kvm；保存可供纯校验使用的能力投影。',ref:'kvm_context.rs:47',threads:['vmm-main / 构建'],fields:[['kvm: Kvm','拥有 fd · kvm_ioctls'],['path: PathBuf','值'],['capabilities: HostCapabilities','值','HostCapabilities']],note:'KvmContext 代表宿主 KVM 环境；KvmVm 才是一台具体 VM 的 fd 与 RAM。'},
+HostCapabilities:{group:'control',role:'从 KVM 与宿主 CPUID 取得的能力数据，供 spec/plan 校验而无需再次做 ioctl。',ref:'kvm_context.rs:28',threads:['纯数据'],fields:[['supported_cpuid: CpuId','值 · kvm_bindings'],['host_cpuid: HostCpuid','值'],['max_vcpus / max_memslots','数值']],note:'物理地址上限来自支持的 CPUID。它是数据，不是持有 VM 的句柄。'},
+VmmClient:{group:'control',role:'调用方持有的请求发送端；可以克隆，克隆不复制一台 VM。',ref:'vmm_server.rs:55',threads:['API 调用方'],fields:[['tx: UnboundedSender<api::VmmRequest>','消息发送'],['thread_handle: Arc<Mutex<Option<JoinHandle>>>','Arc + 局部 Mutex']],note:'所有 clone 共享一次性 join 句柄；请求携带回复通道。全部客户端断开不直接停止已经启动的 guest。'},
+VmmServer:{group:'control',role:'vmm-main 持有的请求接收端，向主循环交出 Request 或一次性的 Detached。',ref:'vmm_server.rs:19',threads:['vmm-main'],fields:[['rx: Option<UnboundedReceiver<api::VmmRequest>>','消息接收']],note:'Detached 被报告后接收端变 None；之后 next_inbound 等待不再完成，避免主循环空转。'},
+Controller:{group:'control',role:'vmm-main 的状态机外壳：稳定时持有 Vm，执行操作时持有 Operation。',ref:'lifecycle.rs:99',threads:['vmm-main / LocalRuntime'],fields:[['Idle(Vm)','枚举值','Vm'],['Busy { stable: api::VmState, operation: Operation }','状态值 + future','Operation']],note:'Busy.stable 只是查询返回的前一状态，不持有另一台 Machine。'},
+Vm:{group:'control',role:'机器的三个逻辑状态；用枚举把“只有配置”和“拥有运行时资源”分开。',ref:'lifecycle.rs:20',threads:['vmm-main'],fields:[['NotStarted(MachineSpec)','值','MachineSpec'],['Running(Machine) / Paused(Machine)','值','Machine']],note:'Running 与 Paused 都拥有同一种 Machine；只有状态和设备暂停记录不同。'},
+Operation:{group:'control',role:'进行中的 Start/Pause/Resume 操作，future 独占 Machine 和该请求的 reply。',ref:'lifecycle.rs:87',threads:['vmm-main / !Send future'],fields:[['future: Pin<Box<dyn Future<Output=OperationCompletion>>>','独占 future','OperationCompletion'],['cancel_tx: Option<oneshot::Sender<()>>','取消消息']],note:'主循环继续接收请求；Shutdown 可以发送取消，但必须等待 future 交回 Vm 才能拆除资源。'},
+OperationCompletion:{group:'control',role:'操作 future 的完成值，把 Vm 和下一步行为交回主循环。',ref:'lifecycle.rs:78',threads:['vmm-main'],fields:[['vm: Vm','值','Vm'],['step: Step','Continue / Stop']],note:'发起操作的请求由 future 自己回复；completion 负责恢复 Controller 的稳定所有权。'},
+};
+const VIEWS = {
+io:{title:'设备与 I/O · 前端与后端分开',note:'上方是 vCPU 的同步配置通路：Bus → transport。右侧 KVM/ioeventfd 是队列通知的快路径，不必回到 userspace Bus；后端在 I/O 线程独占资源并消费 Activation。',default:'MmioTransport',nodes:[['VcpuRunner',25,30,'vCPU 线程 / KVM_RUN'],['Bus',294,30,'同步配置分派'],['MmioTransport',565,30,'寄存器前端'],['BlockResources',25,170,'待交接的后端资源'],['Activation',294,170,'队列与会话交接包'],['KvmNotify',565,170,'KVM 队列通知机制'],['DeviceManager',25,310,'管理任务而非设备对象'],['BlockDevice',294,310,'I/O 后端独占资源'],['Active',565,310,'活 Queue 的会话局部值'],['IoThread',25,450,'I/O LocalRuntime'],['IrqTrigger',294,450,'irqfd / resample']],edges:[['VcpuRunner','Bus','arc','pio / mmio'],['Bus','MmioTransport','arc','Entry.device'],['MmioTransport','Activation','flow','DRIVER_OK'],['Activation','BlockDevice','msg','Activator / Rx'],['KvmNotify','BlockDevice','msg','eventfd kick'],['BlockResources','BlockDevice','flow','into_device'],['DeviceManager','IoThread','own','io_thread'],['IoThread','BlockDevice','flow','spawn factory'],['BlockDevice','Active','flow','serve 会话'],['Active','IrqTrigger','arc','interrupt'],['MmioTransport','IrqTrigger','arc','同一 interrupt'],['IrqTrigger','VcpuRunner','msg','经 KVM 注入 guest']]},
+snapshot:{title:'快照 · 数据与 RAM 分别交接',note:'capture 读取暂停机器；快照不拥有 Machine、RAM 或 fd。teardown 关闭源 VM 后交还 GuestRam；rebuild 消耗两份输入，创建新的暂停机器。这里是 Rust API，不是 HTTP 快照接口。',default:'MachineSnapshot',nodes:[['Machine',25,30,'先暂停，再读取状态'],['MachineSnapshot',294,30,'快照只有状态数据'],['GuestRam',565,30,'teardown 后单独交还'],['MachinePlan',25,190,'保留布局与 grant'],['VmKvmState',294,190,'irqchip / PIT / clock'],['VcpuSnapshot',565,190,'寄存器与 CPU 状态'],['PlatformSnapshot',25,360,'i8042 / COM1'],['DeviceSnapshot',294,360,'逐设备协议状态'],['BlockSnapshot',565,360,'transport + QueueState']],edges:[['Machine','MachineSnapshot','flow','capture 借用读取'],['Machine','GuestRam','flow','teardown 消耗机器'],['MachineSnapshot','MachinePlan','own','plan'],['MachineSnapshot','VmKvmState','own','vm'],['MachineSnapshot','VcpuSnapshot','own','vcpus'],['MachineSnapshot','PlatformSnapshot','own','platform'],['MachineSnapshot','DeviceSnapshot','own','devices'],['DeviceSnapshot','BlockSnapshot','own','Block 变体']]},
+control:{title:'控制与状态 · Machine 归谁',note:'Idle 与 Busy 的两条拥有链互斥：Idle → Vm → Machine；Busy → Operation.future → Machine。stable 只是一份 API 状态值，不是第二台机器。',default:'Controller',nodes:[['VmmClient',25,30,'API 调用方的发送端'],['VmmServer',294,30,'vmm-main 的接收端'],['ProcessCtx',565,30,'进程环境'],['Controller',294,165,'Idle / Busy'],['KvmContext',565,165,'宿主 KVM 环境'],['Vm',25,300,'NotStarted / Running / Paused'],['Operation',294,300,'future + cancel'],['HostCapabilities',565,300,'纯能力数据'],['MachineSpec',25,445,'未启动时的配置'],['Machine',294,445,'操作中被移动的资源'],['OperationCompletion',565,445,'交回 Vm + Step']],edges:[['VmmClient','VmmServer','msg','request + reply'],['VmmServer','Controller','msg','Inbound / 主循环'],['ProcessCtx','KvmContext','own','kvm_ctx'],['KvmContext','HostCapabilities','own','capabilities'],['Controller','Vm','own','Idle'],['Controller','Operation','own','Busy'],['Vm','MachineSpec','own','NotStarted'],['Vm','Machine','own','Running / Paused'],['Operation','Machine','own','future 捕获'],['Operation','OperationCompletion','flow','future 完成'],['OperationCompletion','Vm','own','vm 交回']]},
+memory:{title:'机器与内存 · 生命周期由谁保证',note:'实线是值拥有，虚线是 Arc。KvmVcpu、MemSlots、SlotPermit 都保持 KvmVm 存活；字节视图不是绑定权限。额外 RAM 预映射，但只有拿到唯一凭据后才绑定。',default:'KvmVm',nodes:[['Machine',25,30,'运行时总拥有者'],['MemSlots',294,30,'唯一 slot 分配权'],['SlotPermit',565,30,'不可克隆的凭据'],['Vcpus',25,170,'控制句柄集合'],['KvmVm',294,170,'fd 先关，RAM 后放'],['Binding',565,170,'活的 memslot 绑定'],['KvmVcpu',25,310,'fd + VM Arc'],['GuestRam',294,310,'不可克隆的 RAM'],['RamMapping',565,310,'单个分区 Arc'],['MemoryPlan',25,450,'布局记录'],['SharedGuestMemory',294,450,'设备字节视图']],edges:[['Machine','MemSlots','own','memslots'],['Machine','Vcpus','own','vcpus'],['Machine','KvmVm','arc','vm'],['Machine','Binding','own','启动 ram_bindings'],['MemSlots','KvmVm','arc','vm'],['MemSlots','SlotPermit','flow','allocate'],['SlotPermit','Binding','flow','bind 消耗'],['Binding','SlotPermit','own','唯一 permit'],['SlotPermit','KvmVm','arc','vm'],['KvmVcpu','KvmVm','arc','vm'],['KvmVm','GuestRam','own','ram'],['GuestRam','MemoryPlan','own','plan'],['GuestRam','SharedGuestMemory','arc','memory'],['GuestRam','RamMapping','arc','mappings'],['Binding','RamMapping','arc','mapping']]},
+overview:{title:'总览 · 找到 Machine',note:'先看中央的 Machine：上方是配置与状态数据，左侧是控制权，下方是实际运行的资源。MachinePlan 与 MachineSnapshot 都是数据；Idle 经 Vm 与 Busy 经 future 的两条拥有链互斥，不同时存在。',default:'Machine',nodes:[['MachineSpec',25,30,'想要什么'],['MachinePlan',294,30,'布局与 grant'],['MachineSnapshot',565,30,'暂停时提取的数据'],['Controller',25,170,'稳定态 / 操作态'],['Machine',294,170,'运行时资源的中心'],['Operation',565,170,'Busy 时独占 Machine'],['Vcpus',25,320,'控制多条 vCPU 线程'],['KvmVm',294,320,'VM fd 与 RAM'],['AttachedDevice',565,320,'当前只有 Block'],['DeviceManager',25,450,'任务与 I/O 线程'],['Bus',565,450,'地址分派表']],edges:[['MachineSpec','MachinePlan','flow','validate + plan'],['MachinePlan','Machine','flow','build / assemble'],['Machine','MachineSnapshot','flow','capture (&Machine)'],['Controller','Machine','own','经 Idle(Vm)'],['Operation','Machine','own','future 持有'],['Machine','Vcpus','own','vcpus'],['Machine','KvmVm','arc','vm'],['Machine','AttachedDevice','own','devices'],['Machine','DeviceManager','own','tasks'],['Machine','Bus','arc','mmio'],['Vcpus','Bus','arc','运行线程访问']]},
+};
+const SCENARIOS = {
+snapshot:{label:'同进程快照',steps:[
+{title:'先调用 Machine::pause',description:'此处演示 Rust 的 Machine/snapshot API，不是一个 HTTP 快照请求。调用方先让 vCPU 与设备静默，再读取状态。',owner:'调用方持有 Machine；尚未移动 RAM',view:'snapshot',focus:'Machine',ids:['Machine']},
+{title:'capture 只读取，不接管机器',description:'capture(&machine) 先读设备与平台，再读 vCPU 和 VM 状态，得到 MachineSnapshot。源 Machine 仍活着；快照只持有普通数据。',owner:'MachineSnapshot = plan + KVM/vCPU/平台/设备状态；没有 RAM',view:'snapshot',focus:'MachineSnapshot',ids:['Machine','MachineSnapshot','DeviceSnapshot','VmKvmState']},
+{title:'teardown 单独交还 GuestRam',description:'teardown 消耗源 Machine，停止线程与设备，放下绑定和分配权。没有其他 VM 持有者后先关闭 fd，再交还不可克隆的 GuestRam。',owner:'调用方现在分别持有 snapshot 和 ram，源 VM 已关闭',view:'snapshot',focus:'GuestRam',ids:['Machine','GuestRam','MachineSnapshot']},
+{title:'把两份输入按值交入 rebuild',description:'rebuild(snapshot, ram, context) 先 replay 记录的 grant，并核对设备、vCPU 和 RAM plan。没有 RAM 就不能恢复，同一份 GuestRam 也不能用两次。',owner:'恢复函数消费 MachineSnapshot + GuestRam',view:'snapshot',focus:'MachinePlan',ids:['MachineSnapshot','MachinePlan','GuestRam']},
+{title:'创建新内核对象，重放旧 guest 状态',description:'create_vm 重建启动 RAM 绑定，随后恢复 irqchip/PIT、vCPU 寄存器和 clock，再 assemble 设备。设备仍位于快照记录的 grant，而非重新排序的位置。',owner:'新的 fd / 线程；原来的 RAM 内容与 guest ABI',view:'memory',focus:'KvmVm',ids:['KvmVm','GuestRam','MemSlots','Binding']},
+{title:'得到 vCPU 初始暂停的 Machine',description:'vCPU 线程等 resume，设备按 captured QueueState 重建会话。调用 resume 可继续 guest；若要再次 capture，先调用 pause 获得设备静默记录。当前还没有持久化格式。',owner:'返回 Machine；vCPU 初始 Paused，快照不是另一个活 VM',view:'overview',focus:'Machine',ids:['Machine','Vcpus','AttachedDevice']}
+]},
+io:{label:'一次块设备 I/O',steps:[
+{title:'attach 分开前端与后端资源',description:'BlockResources 携带磁盘与接收端去 I/O 线程；BlockHandle 的发送端、描述和中断装入 MmioTransport，transport 的 Arc 接入 Bus。',owner:'前端由 AttachedBlock/Bus 共享；后端资源由 I/O 任务独占',view:'io',focus:'BlockResources',ids:['BlockResources','BlockDevice','MmioTransport','IoThread']},
+{title:'guest 配置写入走 userspace Bus',description:'guest 写状态、特性和队列地址产生同步 MMIO 退出。VcpuRunner 通过 Bus 调用 transport，后者在局部 Mutex 中更新寄存器。',owner:'VcpuRunner → Bus → MmioTransport；此时是配置通路',view:'io',focus:'MmioTransport',ids:['VcpuRunner','Bus','MmioTransport']},
+{title:'DRIVER_OK 把真实 Queue 移给后端',description:'transport 校验寄存器中的队列地址，创建 Queue 和 Session，经 Activator 发送 Activation。后端取得独占 Queue，RAM 与 IrqTrigger 则只是共享 Arc。',owner:'Activation → 后端 Active：Queue 是值，mem / interrupt 是 Arc',view:'io',focus:'Activation',ids:['MmioTransport','Activation','BlockDevice','Active']},
+{title:'队列通知可以不经过 userspace Bus',description:'guest 在 RAM 里发布描述符后写 queue notify。匹配 KVM 的 ioeventfd 注册时，KVM 直接写后端的 queue_kick；不必让 vCPU 线程再回调 Bus。',owner:'KVM ioeventfd → eventfd kick → I/O 后端',view:'io',focus:'KvmNotify',ids:['KvmNotify','BlockDevice']},
+{title:'后端消费队列并写回 guest 字节',description:'BlockDevice 的 serve 读取描述符、访问磁盘，并更新 guest buffer、状态和 used ring。它持有 Queue 与磁盘，不需要一个整个设备的共享 Mutex。',owner:'I/O 任务独占 Queue / disk；通过 SharedGuestMemory 访问字节',view:'io',focus:'BlockDevice',ids:['BlockDevice','Active','IrqTrigger']},
+{title:'中断由 KVM 注入，配置 ACK 又走前端',description:'后端更新共享中断状态并写 irqfd，KVM 注入 guest 中断；guest 的 interrupt ACK 寄存器访问经 transport 处理。resample 通知配合 EOI，不是 Bus 调用 vCPU。',owner:'IrqTrigger → KVM → guest；前端与后端共享同一中断连接',view:'io',focus:'IrqTrigger',ids:['IrqTrigger','VcpuRunner','MmioTransport']}
+]},
+start:{label:'一次 Start',steps:[
+{title:'先改变配置，不先打开资源',description:'配置请求到达主循环，Vm::NotStarted 中的 MachineSpec 经 apply 返回新值。CPU 数、RAM 大小、内核和磁盘都只是意图。',owner:'Machine 的拥有者：尚未创建；只有 Vm::NotStarted(spec)',view:'overview',focus:'MachineSpec',ids:['MachineSpec','Controller']},
+{title:'把意图变成确定的布局',description:'MachinePlan::new 检查宿主能力，经值类型资源账本分配设备 grant，并生成 cmdline。RAM 与设备窗口被记入 plan。',owner:'持有的数据：MachinePlan { spec, memory, devices, cmdline }',view:'overview',focus:'MachinePlan',ids:['MachineSpec','MachinePlan']},
+{title:'映射 RAM，创建具体 VM',description:'build 同步创建宿主映射、KvmVm 和唯一 MemSlots；create_vm 用凭据给启动 RAM 创建 Binding。plan 不是 fd，地址窗口也不会自动映射。',owner:'此时仍在同步构建；尚未进入 Busy 的 Start future',view:'memory',focus:'KvmVm',ids:['GuestRam','KvmVm','MemSlots','Binding']},
+{title:'接入设备，启动等待中的 vCPU 线程',description:'加载内核和启动数据后，assemble 接入平台与块设备、建立 Bus，再启动初始 Paused 的 vCPU 线程。Machine 获得全部运行时资源。',owner:'Machine { vcpus, tasks, devices, vm, bindings, memslots, … }',view:'overview',focus:'Machine',ids:['Machine','Vcpus','AttachedDevice','DeviceManager','Bus']},
+{title:'把 Machine 移进操作 future',description:'make_start_operation 让 Controller 进入 Busy。Operation.future 独占构建好的 Machine 并恢复 vCPU；主循环仍可处理查询和 Shutdown。',owner:'Operation.future 拥有 Machine；Busy.stable = NotStarted',view:'control',focus:'Operation',ids:['Controller','Operation','Machine']},
+{title:'完成后交回稳定所有权',description:'启动成功后 future 回复请求，并通过 OperationCompletion 交回 Vm::Running(machine)。Controller 回到 Idle，主循环继续处理机器与设备事件。',owner:'Controller::Idle(Vm::Running(machine))',view:'control',focus:'Vm',ids:['Controller','Vm','Machine','OperationCompletion']}
+]},
+pause:{label:'Pause / Resume',steps:[
+{title:'运行中的机器收到 Pause',description:'Idle(Vm::Running) 拥有 Machine。Pause 是生命周期操作，不是重新构建一台机器，也不释放 RAM。',owner:'Controller::Idle → Vm::Running → Machine',view:'control',focus:'Vm',ids:['Controller','Vm','Machine']},
+{title:'稳定状态留下来，Machine 移走',description:'Controller 进入 Busy(stable=Running)。只有状态值留下，Machine 被移入 Operation.future；Busy 期间机器事件暂不被主循环 poll。',owner:'Operation.future 独占 Machine；stable 不是 Machine 副本',view:'control',focus:'Operation',ids:['Controller','Operation','Machine']},
+{title:'先让 vCPU 真正停在完成边界',description:'Vcpus 发 Pause 并踢出 KVM_RUN，等待所有 ACK。运行循环先完成 pending userspace MMIO/PIO，再处理 Pause，而不是读完退出数据就算停止。',owner:'操作持有 Machine；vCPU 线程停在 Paused',view:'memory',focus:'Vcpus',ids:['Machine','Vcpus','KvmVcpu']},
+{title:'设备在自己的循环里静默',description:'AttachedBlock 经 quiesce 通道等待后端停驻并回复 BlockQuiesced/QueueState；然后 DeviceManager 静默其他 gate 类任务。后端对象仍由 I/O 任务独占。',owner:'会话 / Queue 留在后端；状态值回复到 AttachedBlock',view:'io',focus:'BlockDevice',ids:['BlockDevice','DeviceManager','Active']},
+{title:'交回 Vm::Paused',description:'操作完成值交回同一台 Machine。暂停没有销毁 fd、队列会话或映射；保存的设备暂停记录使后续 capture 有一致的读取点。',owner:'Controller::Idle(Vm::Paused(machine))',view:'control',focus:'Vm',ids:['Controller','Vm','Machine','OperationCompletion']},
+{title:'恢复顺序与暂停相反',description:'Resume 又把 Machine 移进 future。先恢复任务 gates，再让每个设备继续原来的会话；最后才恢复 vCPU，使 guest 可以立即发起 I/O。',owner:'Operation.future 持有 Machine；先设备，后 vCPU',view:'io',focus:'DeviceManager',ids:['DeviceManager','BlockDevice','Active']},
+{title:'回到 Running，而不是重新启动',description:'所有恢复动作完成后交回 Vm::Running。RAM、磁盘会话和线程仍是原来的运行时资源，变化的是逻辑状态与暂停记录。',owner:'Controller::Idle(Vm::Running(machine))',view:'control',focus:'Vm',ids:['Controller','Vm','Machine']}
+]},
+};
+const KIND_LABELS = {own:'按值拥有',arc:'Arc 共享持有',msg:'消息 / 通知',flow:'构造 / 消耗'};
+const VIEW_ORDER = ['overview','control','memory','io','snapshot'];
+const VIEW_LABELS = {overview:'总览',control:'控制与状态',memory:'机器与内存',io:'设备与 I/O',snapshot:'快照'};
+const SCENARIO_ORDER = ['start','pause','snapshot','io'];
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const enabledKinds = new Set(Object.keys(KIND_LABELS));
+const $ = id => document.getElementById(id);
+let currentView = 'overview';
+let selectedType = 'Machine';
+let currentScenario = 'start';
+let currentStep = 0;
+let flowFocus = new Set();
+let searchMatches = [];
+TYPES.Machine.peers = [['Platform','own','platform'],['MachinePlan','own','plan'],['MachineEvent','msg','events 接收']];
+const relations = [];
+const relationKeys = new Set();
+function addRelation(from,to,kind,label){
+  if(!TYPES[from] || !TYPES[to]) return;
+  const key = [from,to,kind].join('|');
+  if(relationKeys.has(key)) return;
+  relationKeys.add(key);
+  relations.push({from,to,kind,label});
+}
+for(const v of Object.values(VIEWS)) for(const e of v.edges) addRelation(...e);
+for(const [id,t] of Object.entries(TYPES)){
+  for(const [label,mode,target] of t.fields){
+    if(!target) continue;
+    const kind = mode.includes('Arc') ? 'arc' : /消息|接收|发送/.test(mode) ? 'msg' : 'own';
+    addRelation(id,target,kind,label.split(':')[0]);
+  }
+  for(const p of t.peers || []) addRelation(id,...p);
+}
+addRelation('MmioTransport','MmioRegs','own','state.regs');
+addRelation('MmioTransport','SessionControl','own','state.session');
+addRelation('Activation','Active','flow','run 构造会话');
+addRelation('BlockResources','BlockHandle','flow','open 返回前端连接');
+addRelation('BlockResources','BlockQuiesceHandle','flow','open 返回控制句柄');
+addRelation('BlockHandle','MmioTransport','flow','拆开装入前端');
+addRelation('VcpuHandle','VcpuRunner','msg','commands / ACK');
+function label(id){ return TYPES[id].name || id; }
+function element(tag,cls,text){
+  const el = document.createElement(tag);
+  if(cls) el.className = cls;
+  if(text !== undefined) el.textContent = text;
+  if(tag === 'button') el.type = 'button';
+  return el;
+}
+function svgElement(tag,attrs,text){
+  const el = document.createElementNS(SVG_NS,tag);
+  for(const [key,value] of Object.entries(attrs || {})) el.setAttribute(key,String(value));
+  if(text !== undefined) el.textContent = text;
+  return el;
+}
+function nearby(id){
+  const ids = new Set([id]);
+  for(const r of relations) if(enabledKinds.has(r.kind)){
+    if(r.from === id) ids.add(r.to);
+    if(r.to === id) ids.add(r.from);
+  }
+  return ids;
+}
+function chooseType(id,view,scroll=false){
+  if(!TYPES[id]) return;
+  selectedType = id;
+  currentView = view || TYPES[id].group;
+  flowFocus = new Set();
+  renderWorkspace();
+  if(scroll){
+    const target = matchMedia('(max-width:620px)').matches ? $('inspector') : $('workspace');
+    target.scrollIntoView({block:'start',behavior:matchMedia('(prefers-reduced-motion:reduce)').matches?'auto':'smooth'});
+  }
+}
+function renderViewTabs(){
+  const tabs = $('view-tabs');
+  tabs.replaceChildren();
+  for(const id of VIEW_ORDER){
+    const button = element('button','tab',VIEW_LABELS[id]);
+    button.setAttribute('role','tab');
+    button.setAttribute('aria-selected',String(currentView === id));
+    button.addEventListener('click',()=>chooseType(VIEWS[id].default,id));
+    button.addEventListener('keydown',event=>{
+      if(!['ArrowLeft','ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      const next = (VIEW_ORDER.indexOf(id)+(event.key === 'ArrowRight'?1:-1)+VIEW_ORDER.length)%VIEW_ORDER.length;
+      chooseType(VIEWS[VIEW_ORDER[next]].default,VIEW_ORDER[next]);
+      $('view-tabs').children[next].focus();
+    });
+    tabs.append(button);
+  }
+}
+function edgeGeometry(a,b,split){
+  const dx = b.x-a.x, dy = b.y-a.y;
+  const horizontal = Math.abs(dx)>Math.abs(dy);
+  const offset = split ? 12 : 0;
+  let sx,sy,tx,ty,path;
+  if(horizontal){
+    sx = a.x+(dx>0?a.w:0); sy = a.y+a.h/2+(dx>0?offset:-offset);
+    tx = b.x+(dx>0?0:b.w); ty = b.y+b.h/2+(dx>0?offset:-offset);
+    const bend = Math.max(28,Math.abs(tx-sx)*.5);
+    const direction = dx>0?1:-1;
+    path = `M ${sx} ${sy} C ${sx+direction*bend} ${sy}, ${tx-direction*bend} ${ty}, ${tx} ${ty}`;
+  }else{
+    sx = a.x+a.w/2+(dy>0?offset:-offset); sy = a.y+(dy>0?a.h:0);
+    tx = b.x+b.w/2+(dy>0?offset:-offset); ty = b.y+(dy>0?0:b.h);
+    const bend = Math.max(28,Math.abs(ty-sy)*.5);
+    const direction = dy>0?1:-1;
+    path = `M ${sx} ${sy} C ${sx} ${sy+direction*bend}, ${tx} ${ty-direction*bend}, ${tx} ${ty}`;
+  }
+  return {path,x:(sx+tx)/2,y:(sy+ty)/2-7};
+}
+function renderGraph(){
+  const v = VIEWS[currentView];
+  const graph = $('graph');
+  graph.replaceChildren();
+  const defs = svgElement('defs');
+  for(const kind of Object.keys(KIND_LABELS)){
+    const marker = svgElement('marker',{id:`arrow-${kind}`,viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto-start-reverse'});
+    marker.append(svgElement('path',{d:'M 0 0 L 10 5 L 0 10 z',fill:`var(--${kind})`}));
+    defs.append(marker);
+  }
+  graph.append(defs);
+  const boxes = new Map(v.nodes.map(([id,x,y,caption])=>[id,{id,x,y,caption,w:192,h:62}]));
+  let focused = flowFocus.size ? new Set(flowFocus) : nearby(selectedType);
+  if(!v.nodes.some(([id])=>focused.has(id))) focused = new Set(boxes.keys());
+  for(const [from,to,kind,text] of v.edges){
+    if(!enabledKinds.has(kind)) continue;
+    const a = boxes.get(from), b = boxes.get(to);
+    if(!a || !b) continue;
+    const split = v.edges.some(e=>e[0] === to && e[1] === from);
+    const geometry = edgeGeometry(a,b,split);
+    const active = flowFocus.size ? focused.has(from) && focused.has(to) : from === selectedType || to === selectedType;
+    const dim = !active && (boxes.has(selectedType) || flowFocus.size);
+    graph.append(svgElement('path',{d:geometry.path,class:`edge ${kind} ${dim?'is-muted':'is-focus'}`,'marker-end':`url(#arrow-${kind})`}));
+    graph.append(svgElement('text',{x:geometry.x,y:geometry.y,'text-anchor':'middle',class:`edge-label ${dim?'is-muted':''}`},text));
+  }
+  for(const [id,box] of boxes){
+    const selected = id === selectedType;
+    const cls = selected ? 'is-selected' : focused.has(id) ? 'is-neighbor' : 'is-muted';
+    const node = svgElement('g',{class:`node ${cls}`,transform:`translate(${box.x},${box.y})`,tabindex:0,role:'button','data-id':id,'aria-pressed':String(selected),'aria-label':`${label(id)}：${TYPES[id].role}`});
+    node.append(svgElement('title',{},`${label(id)} · ${TYPES[id].role}`));
+    node.append(svgElement('rect',{width:box.w,height:box.h,rx:9,class:'main-rect'}));
+    node.append(svgElement('rect',{x:0,y:13,width:3,height:36,rx:1,class:'node-stripe'}));
+    node.append(svgElement('text',{x:15,y:25,class:'node-name'},label(id)));
+    node.append(svgElement('text',{x:15,y:45,class:'node-caption'},box.caption));
+    node.addEventListener('click',()=>chooseType(id,currentView));
+    node.addEventListener('keydown',event=>{
+      if(!['Enter',' '].includes(event.key)) return;
+      event.preventDefault();
+      chooseType(id,currentView);
+      $('graph').querySelector(`[data-id="${id}"]`).focus({preventScroll:true});
+    });
+    graph.append(node);
+  }
+  const list = $('node-list');
+  list.replaceChildren();
+  for(const [id,,,caption] of v.nodes){
+    const button = element('button',id === selectedType?'is-selected':'');
+    button.setAttribute('aria-pressed',String(id === selectedType));
+    button.append(element('code','',label(id)),element('small','',caption));
+    button.addEventListener('click',()=>chooseType(id,currentView,true));
+    list.append(button);
+  }
+  const auxiliary = boxes.has(selectedType) ? '' : ` 当前查看辅助类型 ${label(selectedType)}，字段和完整联系见详情面板。`;
+  const stepHint = flowFocus.size ? ` 当前流程：${SCENARIOS[currentScenario].steps[currentStep].title}。` : '';
+  $('view-note').textContent = v.note + auxiliary + stepHint;
+}
+function renderInspector(){
+  const t = TYPES[selectedType];
+  $('detail-name').textContent = label(selectedType);
+  $('detail-role').textContent = t.role;
+  $('detail-note').textContent = t.note;
+  $('detail-source').textContent = `crates/vmm/src/${t.ref}`;
+  const badges = $('detail-badges');
+  badges.replaceChildren(element('span','pill',VIEW_LABELS[t.group]));
+  if(t.external) badges.append(element('span','pill','外部机制 / 非 Rust 类型'));
+  for(const thread of t.threads) badges.append(element('span','pill',thread));
+  const fields = $('detail-fields');
+  fields.replaceChildren();
+  for(const [text,mode,target] of t.fields){
+    const field = element('div','field');
+    if(target && TYPES[target]){
+      const button = element('button','type-chip');
+      button.append(element('code','',text));
+      button.addEventListener('click',()=>chooseType(target,undefined,true));
+      field.append(button);
+    }else field.append(element('code','',text));
+    field.append(element('span','field-kind',mode));
+    fields.append(field);
+  }
+  const list = $('detail-related');
+  list.replaceChildren();
+  const links = relations.filter(r=>r.from === selectedType || r.to === selectedType);
+  for(const r of links){
+    const outgoing = r.from === selectedType;
+    const target = outgoing ? r.to : r.from;
+    const button = element('button','related-item');
+    button.append(element('code','',`${outgoing?'→':'←'} ${label(target)}`),element('small','',`${KIND_LABELS[r.kind]} · ${r.label}`));
+    button.addEventListener('click',()=>chooseType(target,undefined,true));
+    list.append(button);
+  }
+  if(!links.length) list.append(element('p','muted small','主图未展开此辅助类型；关键字段给出它的联系。'));
+}
+function renderWorkspace(){
+  $('view-title').textContent = VIEWS[currentView].title;
+  renderViewTabs();
+  renderGraph();
+  renderInspector();
+}
+function renderScenarioTabs(){
+  const tabs = $('scenario-tabs');
+  tabs.replaceChildren();
+  for(const id of SCENARIO_ORDER){
+    const button = element('button','scenario',SCENARIOS[id].label);
+    button.setAttribute('role','tab');
+    button.setAttribute('aria-selected',String(currentScenario === id));
+    button.addEventListener('click',()=>{
+      currentScenario = id;
+      currentStep = 0;
+      renderScenarioTabs();
+      renderStep();
+    });
+    button.addEventListener('keydown',event=>{
+      if(!['ArrowLeft','ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      const next = (SCENARIO_ORDER.indexOf(id)+(event.key === 'ArrowRight'?1:-1)+SCENARIO_ORDER.length)%SCENARIO_ORDER.length;
+      currentScenario = SCENARIO_ORDER[next];
+      currentStep = 0;
+      renderScenarioTabs();
+      renderStep();
+      $('scenario-tabs').children[next].focus();
+    });
+    tabs.append(button);
+  }
+}
+function renderStep(updateMap=true){
+  const scenario = SCENARIOS[currentScenario];
+  currentStep = Math.max(0,Math.min(currentStep,scenario.steps.length-1));
+  const step = scenario.steps[currentStep];
+  $('step-count').textContent = `${currentStep+1} / ${scenario.steps.length}`;
+  $('step-label').textContent = `${scenario.label} / STEP ${String(currentStep+1).padStart(2,'0')}`;
+  $('step-title').textContent = step.title;
+  $('step-description').textContent = step.description;
+  $('step-owner').textContent = step.owner;
+  $('step-prev').disabled = currentStep === 0;
+  $('step-next').disabled = currentStep === scenario.steps.length-1;
+  const track = $('step-track');
+  track.replaceChildren();
+  scenario.steps.forEach((s,index)=>{
+    const button = element('button',index === currentStep?'current':index<currentStep?'done':'');
+    button.setAttribute('aria-label',`第 ${index+1} 步：${s.title}`);
+    button.setAttribute('aria-current',String(index === currentStep));
+    button.title = s.title;
+    button.addEventListener('click',()=>{currentStep = index; renderStep();});
+    track.append(button);
+  });
+  const nodes = $('step-nodes');
+  nodes.replaceChildren();
+  for(const id of step.ids){
+    const button = element('button','type-chip',label(id));
+    button.addEventListener('click',()=>chooseType(id,step.view,true));
+    nodes.append(button);
+  }
+  if(updateMap){
+    currentView = step.view;
+    selectedType = step.focus;
+    flowFocus = new Set(step.ids);
+    renderWorkspace();
+  }
+}
+function clearSearch(){
+  $('search').value = '';
+  searchMatches = [];
+  $('search-results').replaceChildren();
+  $('search-results').hidden = true;
+}
+function openSearchResult(id){
+  clearSearch();
+  chooseType(id,undefined,true);
+}
+function updateSearch(){
+  const query = $('search').value.trim().toLocaleLowerCase();
+  const results = $('search-results');
+  results.replaceChildren();
+  if(!query){results.hidden = true; searchMatches = []; return;}
+  searchMatches = Object.keys(TYPES).filter(id=>{
+    const t = TYPES[id];
+    return [id,label(id),VIEW_LABELS[t.group],t.role,t.ref,t.note,...t.fields.map(f=>f.join(' '))].join(' ').toLocaleLowerCase().includes(query);
+  }).sort((a,b)=>{
+    const score = id => {
+      const name = label(id).toLocaleLowerCase();
+      const group = VIEW_LABELS[TYPES[id].group].toLocaleLowerCase();
+      if(name === query || id.toLocaleLowerCase() === query) return 0;
+      if(group.includes(query) && VIEWS[TYPES[id].group].default === id) return 1;
+      if(name.includes(query)) return 2;
+      if(TYPES[id].role.toLocaleLowerCase().includes(query)) return 3;
+      if(group.includes(query)) return 4;
+      return 5;
+    };
+    return score(a)-score(b) || label(a).localeCompare(label(b));
+  });
+  results.hidden = false;
+  if(!searchMatches.length){
+    results.append(element('p','search-empty',`没有找到“${$('search').value.trim()}”。试试 Machine、Queue、快照或源码路径。`));
+    return;
+  }
+  results.append(element('p','muted small',`${searchMatches.length} 个匹配 · 显示前 ${Math.min(8,searchMatches.length)} 个`));
+  for(const id of searchMatches.slice(0,8)){
+    const button = element('button','search-result');
+    button.append(element('code','',label(id)),element('small','',`${VIEW_LABELS[TYPES[id].group]} · ${TYPES[id].role}`));
+    button.addEventListener('click',()=>openSearchResult(id));
+    button.addEventListener('keydown',event=>{
+      if(event.key === 'Escape'){clearSearch(); $('search').focus(); return;}
+      if(!['ArrowDown','ArrowUp'].includes(event.key)) return;
+      event.preventDefault();
+      const buttons = [...results.querySelectorAll('button')];
+      const next = (buttons.indexOf(button)+(event.key === 'ArrowDown'?1:-1)+buttons.length)%buttons.length;
+      buttons[next].focus();
+    });
+    results.append(button);
+  }
+}
+function updateThemeLabel(){
+  const forced = document.documentElement.dataset.theme;
+  const dark = forced ? forced === 'dark' : matchMedia('(prefers-color-scheme:dark)').matches;
+  $('theme-toggle').textContent = dark?'切到浅色':'切到深色';
+  $('theme-toggle').setAttribute('aria-pressed',String(dark));
+}
+function initialize(){
+  for(const button of document.querySelectorAll('[data-pick]')) button.addEventListener('click',()=>chooseType(button.dataset.pick,undefined,true));
+  for(const button of $('legend').querySelectorAll('button')) button.addEventListener('click',()=>{
+    const kind = button.dataset.kind;
+    enabledKinds.has(kind)?enabledKinds.delete(kind):enabledKinds.add(kind);
+    button.setAttribute('aria-pressed',String(enabledKinds.has(kind)));
+    renderGraph();
+  });
+  $('search').addEventListener('input',updateSearch);
+  $('search').addEventListener('keydown',event=>{
+    if(event.key === 'Escape') clearSearch();
+    if(event.key === 'ArrowDown'){
+      const button = $('search-results').querySelector('button');
+      if(button){event.preventDefault(); button.focus();}
+    }
+  });
+  $('search-clear').addEventListener('click',()=>{clearSearch(); $('search').focus();});
+  $('search-form').addEventListener('submit',event=>{event.preventDefault(); if(searchMatches[0]) openSearchResult(searchMatches[0]);});
+  document.addEventListener('click',event=>{if(!$('search-form').contains(event.target)) $('search-results').hidden = true;});
+  $('step-prev').addEventListener('click',()=>{currentStep--; renderStep();});
+  $('step-next').addEventListener('click',()=>{currentStep++; renderStep();});
+  $('step-reset').addEventListener('click',()=>{currentStep = 0; renderStep();});
+  $('step-locate').addEventListener('click',()=>{renderStep(); $('workspace').scrollIntoView({block:'start'});});
+  $('theme-toggle').addEventListener('click',()=>{
+    const forced = document.documentElement.dataset.theme;
+    const dark = forced ? forced === 'dark' : matchMedia('(prefers-color-scheme:dark)').matches;
+    document.documentElement.dataset.theme = dark?'light':'dark';
+    updateThemeLabel();
+  });
+  matchMedia('(prefers-color-scheme:dark)').addEventListener('change',updateThemeLabel);
+  const index = $('type-index');
+  for(const id of Object.keys(TYPES).sort((a,b)=>label(a).localeCompare(label(b)))){
+    const button = element('button','type-chip',label(id));
+    button.addEventListener('click',()=>chooseType(id,undefined,true));
+    index.append(button);
+  }
+  const types = Object.values(TYPES);
+  $('type-count').textContent = `· ${types.filter(t=>!t.external).length} 个结构 + ${types.filter(t=>t.external).length} 个外部机制`;
+  updateThemeLabel();
+  renderWorkspace();
+  renderScenarioTabs();
+  renderStep(false);
+}
+initialize();
+</script>
+</body>
+</html>

@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>新内存设施 · 设计评审</title>
+<style>
+:root{--bg:#f5f6f3;--panel:#fff;--panel-soft:#f0f3f2;--text:#223447;--muted:#657381;--border:#dce3e1;--accent:#167967;--accent-soft:#e4f2ed;--blue:#536faf;--blue-soft:#edf1fb;--amber:#aa6034;--amber-soft:#fbefe6;--wire:#78848c;--code:#2b4d62;--shadow:0 8px 30px #1a344509;--radius:16px;color-scheme:light}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#101920;--panel:#17232d;--panel-soft:#1c2b36;--text:#e0e9ef;--muted:#9eafbc;--border:#30404c;--accent:#79cfb7;--accent-soft:#193c35;--blue:#a3b9f0;--blue-soft:#26334b;--amber:#edb485;--amber-soft:#3b2b22;--wire:#94a7b3;--code:#b4d8eb;--shadow:none;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#101920;--panel:#17232d;--panel-soft:#1c2b36;--text:#e0e9ef;--muted:#9eafbc;--border:#30404c;--accent:#79cfb7;--accent-soft:#193c35;--blue:#a3b9f0;--blue-soft:#26334b;--amber:#edb485;--amber-soft:#3b2b22;--wire:#94a7b3;--code:#b4d8eb;--shadow:none;color-scheme:dark}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:85px}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC","Droid Sans Fallback",sans-serif;font-size:14px;line-height:1.75}button,textarea{font:inherit;color:inherit}button{appearance:none;cursor:pointer;background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:8px 13px;line-height:1.4}button:hover{border-color:var(--accent)}button:disabled{cursor:default;opacity:.45}a{color:var(--accent);text-underline-offset:4px}button:focus-visible,a:focus-visible,summary:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:3px solid var(--blue);outline-offset:4px}h1,h2,h3,h4,p{margin:0}h2{font-size:25px;line-height:1.4;letter-spacing:-.5px}h3{font-size:17px;line-height:1.6}h4{font-size:13px;color:var(--muted);font-weight:600}p+p{margin-top:10px}code,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;overflow-wrap:anywhere}code{color:var(--code);font-size:.92em}.muted{color:var(--muted)}.eyebrow{font-size:11px;font-weight:700;letter-spacing:1.8px;color:var(--accent)}.skip{position:fixed;top:6px;left:12px;z-index:20;transform:translateY(-160%);padding:10px;background:var(--panel)}.skip:focus{transform:none}.topbar{position:sticky;top:0;z-index:10;border-bottom:1px solid var(--border);background:var(--panel)}.top-inner{max-width:1380px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 28px}.brand{font-size:12px;font-weight:750;letter-spacing:1px;white-space:nowrap}.brand span{color:var(--muted);font-weight:500}.nav{display:flex;align-items:center;gap:22px;font-size:12px}.nav a{color:var(--muted);text-decoration:none}.nav a:hover{color:var(--accent)}.theme{padding:7px 11px;font-size:12px;white-space:nowrap}.page{max-width:1380px;margin:auto;padding:32px 28px 55px}.hero{display:grid;grid-template-columns:minmax(0,1fr) 335px;gap:40px;padding:10px 0 32px}.hero h1{font-size:clamp(29px,3.1vw,43px);line-height:1.32;letter-spacing:-1.2px;margin:14px 0 15px;font-weight:750}.hero .lead{font-size:16px;color:var(--muted);max-width:710px}.badges{display:flex;gap:8px;flex-wrap:wrap;margin-top:20px}.badge{font-size:11px;line-height:1.5;padding:5px 9px;border:1px solid var(--border);border-radius:6px;color:var(--muted);background:var(--panel)}.badge.draft{color:var(--amber);background:var(--amber-soft);border-color:transparent}.context-card{border-left:3px solid var(--accent);background:var(--panel);border-radius:0 12px 12px 0;padding:19px 22px;align-self:center}.context-card h3{font-size:14px;margin-bottom:8px}.context-card p{font-size:12px;color:var(--muted)}.quick-links{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}.quick-links button{font-size:12px;padding:6px 9px;background:var(--panel-soft)}.section{margin-bottom:34px;scroll-margin-top:85px}.section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:22px;margin-bottom:16px}.section-head .eyebrow{margin-bottom:6px}.section-head p{color:var(--muted);font-size:12px;max-width:510px}.panel{border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow)}.tabs{display:flex;gap:6px;flex-wrap:wrap;padding:13px;border-bottom:1px solid var(--border)}.tab{font-size:12px;padding:8px 13px;background:transparent;border-color:transparent}.tab[aria-selected="true"]{background:var(--accent-soft);color:var(--accent);border-color:transparent;font-weight:650}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 335px;align-items:start;min-width:0}.graph-panel{padding:21px 20px 14px;min-width:0}.graph-intro{display:flex;align-items:baseline;justify-content:space-between;gap:15px;margin-bottom:7px}.graph-intro h3{font-size:15px}.graph-intro span{font-size:11px;white-space:nowrap;color:var(--muted)}.graph-description{font-size:12px;color:var(--muted);min-height:38px}.graph-scroll{overflow:auto;overscroll-behavior:contain;min-width:0;margin:5px -5px 0}.graph{display:block;min-width:710px;width:100%;height:auto;background-image:radial-gradient(var(--border) .8px,transparent .8px);background-size:19px 19px}.edge{fill:none;stroke-width:1.8}.edge.own{stroke:var(--accent)}.edge.arc{stroke:var(--wire);stroke-dasharray:3 5}.edge.flow{stroke:var(--blue);stroke-dasharray:8 4}.edge.msg{stroke:var(--amber);stroke-dasharray:10 3 2 3}.edge.faint{opacity:.35}.edge.focus{stroke-width:2.6}.edge-label{font-size:11px;fill:var(--muted);paint-order:stroke;stroke:var(--panel);stroke-width:5px;stroke-linejoin:round}.edge-label.faint{opacity:.58}.node{cursor:pointer}.node rect{fill:var(--panel);stroke:var(--border);stroke-width:1.4}.node .node-title{fill:var(--text);font-size:14px;font-weight:650;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.node .node-caption{fill:var(--muted);font-size:12px}.node .node-kind{fill:var(--accent);font-size:10px;letter-spacing:.4px}.node:hover rect,.node:focus rect{stroke:var(--accent);stroke-width:2}.node.selected rect{fill:var(--accent-soft);stroke:var(--accent);stroke-width:2}.node.related rect{stroke:var(--wire)}.node.faint{opacity:.84}.node:focus{outline:none}.node:focus rect{stroke:var(--blue);stroke-width:3}.legend{display:flex;flex-wrap:wrap;gap:10px 17px;border-top:1px solid var(--border);padding:12px 1px 1px;font-size:11px;color:var(--muted)}.legend-item{display:flex;align-items:center;gap:7px}.line-sample{width:27px;border-top:2px solid}.line-sample.own{color:var(--accent)}.line-sample.arc{color:var(--wire);border-top-style:dotted}.line-sample.flow{color:var(--blue);border-top-style:dashed}.line-sample.msg{color:var(--amber);border-top-style:dashed}.mobile-nodes{display:none}.inspector{border-left:1px solid var(--border);padding:22px;position:sticky;top:75px;max-height:calc(100vh - 94px);overflow:auto;border-radius:0 0 var(--radius) 0;min-width:0}.detail-header{border-bottom:1px solid var(--border);padding-bottom:13px;margin-bottom:14px}.detail-header h3{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:18px;line-height:1.6;overflow-wrap:anywhere;margin:5px 0}.detail-header .badge{display:inline-block;font-size:10px;padding:3px 7px}.detail-section{margin-bottom:16px}.detail-section p,.detail-section li{font-size:12px;line-height:1.8}.detail-section ul{margin:5px 0 0;padding-left:17px}.detail-section h4{margin-bottom:5px}.authority{padding:10px 12px;background:var(--accent-soft);color:var(--accent);font-size:12px;border-radius:8px;margin-bottom:16px}.warning{border-left:2px solid var(--amber);padding-left:11px}.source{font:11px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--muted);overflow-wrap:anywhere}.related-links{display:flex;gap:6px;flex-wrap:wrap}.related-links button{font-size:10px;padding:5px 7px;max-width:100%;overflow-wrap:anywhere}.evidence-list{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.evidence-card{padding:15px 16px;border-top:3px solid var(--blue);box-shadow:none}.evidence-card h3{font-size:13px;margin-bottom:8px}.evidence-card .yes{font-size:12px;margin-bottom:9px}.evidence-card .not{font-size:11px;color:var(--amber);border-top:1px solid var(--border);padding-top:8px}.case-panel{overflow:hidden}.case-tabs{padding:13px;display:flex;flex-wrap:wrap;gap:7px;background:var(--panel-soft);border-bottom:1px solid var(--border)}.case-tab{font-size:12px;border-color:transparent;background:transparent}.case-tab[aria-selected="true"]{background:var(--panel);border-color:var(--border);font-weight:650}.case-content{display:grid;grid-template-columns:330px minmax(0,1fr);min-height:360px}.case-copy{padding:24px;border-right:1px solid var(--border);min-width:0}.step-kicker{font-size:11px;color:var(--accent);font-weight:650}.case-copy h3{font-size:19px;margin:8px 0 12px}.case-copy>p{font-size:12px;color:var(--muted)}.fact-list{margin:16px 0 0;display:grid;gap:12px}.fact-list div{min-width:0}.fact-list dt{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}.fact-list dd{margin:2px 0 0;font-size:12px}.fact-list dd.keep{color:var(--amber)}.case-visual{padding:24px;display:flex;flex-direction:column;gap:16px;min-width:0;justify-content:center}.demo-disclaimer{font-size:10px;color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:5px 9px;align-self:flex-start}.demo-title{font-size:12px;font-weight:600}.state-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.state-tile{background:var(--panel-soft);border:1px solid var(--border);border-radius:10px;padding:13px;min-width:0}.state-label{font-size:10px;color:var(--muted);margin-bottom:5px}.state-value{font-size:13px;font-weight:650;overflow-wrap:anywhere}.state-tile.caution{background:var(--amber-soft);border-color:transparent}.state-tile.caution .state-value{color:var(--amber)}.state-tile.strong{background:var(--accent-soft);border-color:transparent}.state-tile.strong .state-value{color:var(--accent)}.demo-note{font-size:12px;color:var(--muted);border-left:2px solid var(--blue);padding-left:12px}.block-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.block{padding:15px 5px;border:1px dashed var(--wire);border-radius:7px;text-align:center;background:var(--panel-soft);font-size:12px;color:var(--muted)}.block.plugged{border:1px solid var(--accent);background:var(--accent-soft);color:var(--accent)}.block span{display:block;font-size:10px;margin-top:3px}.chunk-bar{padding:8px 12px;border:1px solid var(--blue);background:var(--blue-soft);color:var(--blue);border-radius:6px;text-align:center;font-size:11px}.case-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:13px 22px;border-top:1px solid var(--border)}.case-controls{display:flex;gap:8px}.case-controls button{font-size:12px}.step-dots{display:flex;gap:6px;align-items:center}.step-dot{width:26px;height:26px;padding:0;border-radius:50%;font-size:10px;background:var(--panel-soft)}.step-dot[aria-current="step"]{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}.locate{font-size:11px;color:var(--blue)}.topics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.topic-card{padding:21px;box-shadow:none;min-width:0}.topic-heading{display:flex;gap:12px;margin-bottom:12px}.topic-number{color:var(--accent);font-size:12px;font-weight:700;padding-top:4px}.topic-card h3{font-size:17px}.topic-question{font-size:12px;color:var(--muted);margin:4px 0 0}.topic-body{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}.topic-body p{font-size:12px}.topic-body .topic-label{font-size:10px;font-weight:650;color:var(--muted);margin-bottom:4px}.topic-cost{font-size:11px;padding:9px 11px;background:var(--panel-soft);border-radius:7px;color:var(--muted);margin-bottom:12px}.topic-card label{font-size:11px;color:var(--muted);display:block;margin-bottom:5px}.topic-card textarea{width:100%;resize:vertical;min-height:88px;border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--panel);font-size:12px;line-height:1.7}.notes-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-top:15px;padding:15px 20px}.notes-bar p{font-size:11px;color:var(--muted)}.notes-bar button{font-size:12px;color:var(--accent)}details.history{padding:18px 22px}summary{cursor:pointer;display:list-item;font-size:14px;font-weight:650}summary span{font-weight:400;color:var(--muted);font-size:11px;margin-left:10px}.rounds{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:16px;padding-top:22px}.round{border-top:2px solid var(--border);padding-top:10px}.round h3{font-size:13px;margin:5px 0 9px}.round p{font-size:11px;color:var(--muted);margin:8px 0 0}.round b{color:var(--text);font-weight:550}.footer{padding-top:20px;border-top:1px solid var(--border);display:flex;justify-content:space-between;gap:20px;font-size:11px;color:var(--muted)}.static-note{padding:15px;color:var(--muted);font-size:12px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:1100px){.workspace{grid-template-columns:minmax(0,1fr) 300px}.inspector{padding:18px}.evidence-list{grid-template-columns:repeat(3,minmax(0,1fr))}.rounds{grid-template-columns:repeat(3,minmax(0,1fr))}.hero{grid-template-columns:minmax(0,1fr) 290px;gap:25px}.case-content{grid-template-columns:290px minmax(0,1fr)}}
+@media(max-width:850px){.page{padding:25px 20px 40px}.top-inner{padding:12px 20px}.hero{grid-template-columns:1fr;gap:20px;padding-bottom:25px}.context-card{max-width:none}.workspace{grid-template-columns:1fr}.inspector{position:static;max-height:none;border-left:0;border-top:1px solid var(--border);border-radius:0 0 var(--radius) var(--radius)}.detail-header{margin-bottom:12px}.section-head{align-items:flex-start}.case-content{grid-template-columns:1fr}.case-copy{border-right:0;border-bottom:1px solid var(--border)}.state-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.nav{gap:14px}.evidence-list{grid-template-columns:repeat(2,minmax(0,1fr))}.rounds{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:620px){.page{padding:20px 14px 30px}.top-inner{padding:11px 14px;gap:12px}.nav a{display:none}.brand{font-size:11px}.hero h1{font-size:30px}.hero .lead{font-size:14px}.section-head{display:block}.section-head p{margin-top:8px}h2{font-size:22px}.tabs{gap:4px;padding:10px}.tab{font-size:11px;padding:7px 9px}.graph-panel{padding:17px 14px}.graph-scroll{display:none}.mobile-nodes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}.mobile-node{padding:11px 9px;text-align:left;font-size:11px;overflow-wrap:anywhere;min-width:0}.mobile-node span{display:block;font-size:10px;color:var(--muted);font-family:system-ui,sans-serif;margin-top:4px}.mobile-node[aria-pressed="true"]{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}.graph-intro{display:block}.graph-intro span{display:block;margin-top:3px}.graph-description{min-height:0}.legend{font-size:10px;gap:9px 13px}.inspector{padding:18px}.evidence-list{grid-template-columns:1fr}.evidence-card{padding:12px 15px}.case-tabs{gap:3px;padding:9px}.case-tab{font-size:11px;padding:8px}.case-copy,.case-visual{padding:19px 16px}.state-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.case-toolbar{padding:12px 15px;gap:12px}.step-dots{order:3;width:100%;justify-content:center}.topics-grid{grid-template-columns:1fr}.topic-card{padding:17px}.topic-body{gap:12px}.notes-bar{padding:14px}.rounds{grid-template-columns:1fr}.round{padding-top:10px}details.history{padding:16px}summary span{display:block;margin-left:0}.footer{display:block}.footer span{display:block;margin-top:7px}.section{margin-bottom:26px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<a class="skip" href="#map">跳到数据关系</a>
+<header class="topbar"><div class="top-inner"><div class="brand">MEMORY <span>/ DESIGN REVIEW</span></div><nav class="nav" aria-label="页面目录"><a href="#map">数据关系</a><a href="#cases">反例推演</a><a href="#review">评审议题</a><button class="theme" id="theme" type="button">主题：跟随系统</button></nav></div></header>
+<main class="page">
+<section class="hero" aria-labelledby="page-title"><div><div class="eyebrow">WORKING DRAFT · ROUND 05</div><h1 id="page-title">内存，不只是一张区域表。</h1><p class="lead">把字节、放置、访问许可和外部映射分开，再审视它们之间的关系。目标是现代 microVM，兼具 VFIO 与迁移；能力范围最接近 Cloud Hypervisor。</p><div class="badges"><span class="badge draft">第五轮候选 · 非实现 · 非定案</span><span class="badge">依据 design.new-mem.md</span><span class="badge">本地离线 · 无上传</span></div><div class="quick-links"><button type="button" data-jump-view="storage">字节放在哪里</button><button type="button" data-jump-view="access">谁可以访问</button><button type="button" data-jump-view="dma">何时能释放</button></div></div><aside class="context-card"><h3>这是一份评审材料，不是证明。</h3><p>两份独立审阅只读过首轮，并未认可第五轮。图中都是候选关系；场景演示不代表已经运行 VMM。</p><p>最应争论的是租约的成本、控制 owner 的宽度，以及外部权限能否真正撤销。不追求 QEMU 式任意地址树；机密内存仍是单列扩展。</p></aside></section>
+<section class="section" id="map" aria-labelledby="map-heading"><div class="section-head"><div><div class="eyebrow">01 / DATA & OWNERSHIP</div><h2 id="map-heading">先看关系，再看工作名。</h2></div><p>点击节点查看职责、修改权、真实需求与反例。字段是概念形状，不是已有 Rust 定义；线的含义比颜色更重要。</p></div><div class="panel"><div class="tabs" id="view-tabs" role="tablist" aria-label="数据关系视图"></div><div class="workspace" id="workspace"><div class="graph-panel" id="view-panel" role="tabpanel"><div class="graph-intro"><h3 id="graph-title">核心关系</h3><span id="graph-count">候选结构与概念</span></div><p class="graph-description" id="graph-description">存储身份、guest 放置与执行者的映射不是同一份事实。</p><div class="graph-scroll"><svg class="graph" id="graph" viewBox="0 0 900 515" role="group" aria-label="内存数据关系图"></svg></div><div class="mobile-nodes" id="mobile-nodes" aria-label="关系节点列表"></div><div class="legend" aria-label="关系图例"><span class="legend-item"><i class="line-sample own"></i>独占 / 修改权</span><span class="legend-item"><i class="line-sample arc"></i>仅保活引用</span><span class="legend-item"><i class="line-sample flow"></i>派生数据</span><span class="legend-item"><i class="line-sample msg"></i>请求 / 结果</span></div></div><aside class="inspector" id="inspector" aria-label="节点详情"><div class="static-note">选择节点阅读概念形状；权威数据与外部实际登记需要分别理解。</div></aside></div></div></section>
+<section class="section" id="evidence" aria-labelledby="evidence-heading"><div class="section-head"><div><div class="eyebrow">02 / EVIDENCE BOUNDARIES</div><h2 id="evidence-heading">撤销证据不能相互代替。</h2></div><p>能保活，不代表能继续访问；已 unmap，不代表旧用途结束。以下是草稿要求的证据边界，并非已验证能力。§14.1</p></div><div class="evidence-list" id="evidence-list"></div></section>
+<section class="section" id="cases" aria-labelledby="cases-heading"><div class="section-head"><div><div class="eyebrow">03 / COUNTEREXAMPLES</div><h2 id="cases-heading">用反例，推一推这些边界。</h2></div><p>手动步进，观察哪种事实改变、什么资源还不能释放。这里没有真实 ioctl、设备或性能测量。</p></div><div class="panel case-panel"><div class="case-tabs" id="case-tabs" role="tablist" aria-label="反例场景"></div><div class="case-content" id="case-panel" role="tabpanel"><div class="case-copy"><div class="step-kicker" id="step-kicker">概念演示</div><h3 id="step-title">在途 I/O 与撤销</h3><p id="step-event">旧读视图存在，并不意味着旧权限可以永久使用。</p><dl class="fact-list" id="step-facts"></dl></div><div class="case-visual" id="case-visual"><div class="demo-disclaimer">概念示意 · 不构成实现或验证证据</div></div></div><div class="case-toolbar"><div class="case-controls"><button id="previous" type="button">上一步</button><button id="next" type="button">下一步</button><button id="reset" type="button">重置</button></div><div class="step-dots" id="step-dots" aria-label="选择步骤"></div><button class="locate" id="locate" type="button">查看相关关系</button></div></div><p class="source" id="case-source" style="margin-top:9px"></p><div class="sr-only" id="case-announcement" role="status" aria-live="polite"></div></section>
+<section class="section" id="review" aria-labelledby="review-heading"><div class="section-head"><div><div class="eyebrow">04 / HUMAN JUDGMENT</div><h2 id="review-heading">代价是否值得，由专家判断。</h2></div><p>不是勾选任务，也不计算通过率。可以保留核心关系，也可以否决核心抽象；请留下反例与理由。§13–14</p></div><div class="topics-grid" id="topics"></div><div class="panel notes-bar"><div><p>备注只在当前页面内存中；不自动保存、不上传，刷新会丢失未导出的内容。</p><p id="notes-status" role="status" aria-live="polite">尚未填写备注。</p></div><button id="export-notes" type="button" disabled>导出评审备注 .txt</button></div></section>
+<section class="section" id="history"><details class="panel history"><summary>五轮变化简史<span>原假设 → 反例 → 修改 → 剩余风险；不是五次“设计通过”。</span></summary><div class="rounds" id="rounds"></div></details></section>
+<footer class="footer"><div>只读依据：design.new-mem.md，第五轮工作稿。所有位置均指草稿，不冒充当前代码。</div><span>网页可用 ≠ 内存设计成立</span></footer>
+<noscript><p class="panel static-note">此页面需要 JavaScript 展示关系与反例。全文依据位于项目根目录 design.new-mem.md；本页不开启网络访问。</p></noscript>
+</main>
+<script id="review-data">
+const TYPES = {
+MemorySpec:{name:'MemorySpec',kind:'候选输入',view:'overview',role:'声明现代 microVM 的内存能力与配置，不把未来高级能力都变成当前已支持。',fields:['容量、对象内容契约、guest 内存设备要求','宿主物化要求与消费者能力要求'],authority:'配置输入不是 GPA grant、KVM 绑定或外部 DMA 权限。',need:'先拒绝不成立的 backing、粒度与消费者组合，而不是运行后偷偷添加复制或零页回退。',cost:'能力协商与构建验证必须说清楚哪些组合尚不支持。',counter:'共享 memfd 并不持久；有 fd 并不证明 vhost backend 可以在线撤销。',question:'能力拒绝边界是否准确，而非把设计 scope 当作已实现支持？',doc:'§1、§3.1–3.2',lines:'7–9, 82–116'},
+MemoryLayout:{name:'MemoryLayout',kind:'候选纯值',view:'storage',role:'记录已经选定的对象身份、guest 放置与地址预留描述，恢复时重放 guest 结构。',fields:['objects：ObjectId → 容量、内容契约','windows：WindowId → ObjectSlice、GPA、owner、kind、guest NUMA','claims：已选地址的可复制描述'],authority:'布局是放置事实；不可复制的 GpaGrant 才是运行期分配权限。',need:'同一连续存储跨低/高 RAM 放置时，不把 guest 地址洞复制到 backing 或内容文件。',cost:'索引与外部登记必须保留明确的派生关系，不能各自挑地址。',counter:'恢复到不同宿主不能按新偏好默改 GPA 或 guest NUMA，也不能机械照搬源 host NUMA。',question:'Object/Window 分离是否比一张 region 表更符合实际需求？',doc:'§3.1',lines:'82–106',reference:'QEMU 用两个 alias 放置同一 RAM 的低端和高端部分。',ref:'.references/qemu/hw/i386/pc.c:795'},
+Object:{name:'Object',kind:'概念：存储身份',view:'storage',role:'逻辑字节身份，不等于一次 mmap、文件 fd 或 guest 地址。',fields:['ObjectId、capacity、content_contract','一个 Object 内采用一致 HostPolicy'],authority:'MemoryStore 唯一拥有 ObjectId 到 runtime backing 的记录。',need:'换宿主、换 backing 后仍能以同一对象内 offset 描述内容；政策不同则拆 Object。',cost:'可写共享文件要按真实实体与 offset 检查，不能只比较 ObjectId。',counter:'两个路径可以打开同一文件；重叠共享写映射能绕过形式上的无 alias 限制。',question:'非重叠切片限制是否足够，何时才有真实 alias 需求？',doc:'§3.1–3.2',lines:'98–114'},
+ObjectSlice:{name:'ObjectSlice',kind:'概念：坐标值',view:'storage',role:'对象中的半开区间，为 Window 覆盖范围与内容传输提供坐标。',fields:['ObjectId + object_offset + length','长度同时定义 Window 覆盖，不另设可独立修改的长度'],authority:'纯描述值不拥有映射、GPA 或注册权限。',need:'区分 GPA、对象 offset 和文件 source_offset；一个地址洞不等于存储空洞。',cost:'所有转换都必须保留区间界限与来源身份。',counter:'把 GPA 当文件 offset，会将布局洞误写入内容文件或恢复错误字节。',question:'这里的坐标区分能否简化快照与外部映射，而非只是多包一层？',doc:'§3.1、§9.1',lines:'102, 323–336'},
+Window:{name:'Window',kind:'概念：guest 放置',view:'storage',role:'把 ObjectSlice 放在确定 GPA，固定其设备归属与 guest 可见语义。',fields:['WindowId、ObjectSlice、GPA、MemoryDeviceId/启动 owner','kind、guest NUMA；块级 kind 包含 block_size'],authority:'WindowControl 只能操作其 owner 和 WindowId 所限定的范围。',need:'一 Object 可分成不重叠的低/高 Window；Reserved claim 则根本不产生 RAM。',cost:'重用相同 GPA 要新 WindowId 与新准入，不能唤醒旧视图的旧权限。',counter:'一个 Role 标签不是设备身份，block index 缺少 block_size 就没有完整坐标。',question:'Window 是否也是合适的撤销屏障单位？',doc:'§3.1、§3.3',lines:'98–106, 133–135'},
+HostPolicy:{name:'HostPolicy',kind:'候选纯值',view:'storage',role:'独立决定宿主物化方式，与 guest 布局分开。',fields:['ObjectId、allocation、host NUMA、hugepage','reserve、prefault；显式的恢复物化政策'],authority:'目标宿主政策可显式替换，不反向修改 guest GPA/NUMA。',need:'源 host node 2 可能在目标机不存在；持久性、共享、页尺寸也不是一个维度。',cost:'兼容性验证必须接受、明确替换或拒绝，不能默默降级。',counter:'共享不等于持久；私有文件写入不更新原文件，不能当 pmem durability。',question:'按政策边界拆 Object 是否足够，是否过早需要对象内政策树？',doc:'§3.1–3.2',lines:'98, 106–116',reference:'Cloud Hypervisor 的 zone 保存区域分组与 backing 政策，guest NUMA 另有投影。',ref:'.references/cloud-hypervisor/vmm/src/memory_manager.rs:140'},
+HostBacking:{name:'HostBacking',kind:'候选资源',view:'storage',role:'拥有实际 host mapping、文件与释放责任；引用仅保活，不授予重放或新注册权限。',fields:['映射、可选文件与 offset、宿主页粒度','导出/丢弃能力、具体物化政策'],authority:'由 MemoryStore 的唯一记录关联；CPU binding、lease、外部登记分别保活。',need:'字节可以共享，分配/注册权不能复制；pmem 内容不能被普通 balloon/virtio-mem 打洞。',cost:'未能证实撤销时必须保留 backing，即使会损失回收能力。',counter:'VFIO unmap 失败后仅保留 Arc 仍允许 DMA；此时清零重用同样不安全。',question:'是否准确区分保活、pin、导出和持久来源？',doc:'§3.2、§8.3',lines:'108–116, 297–301',reference:'QEMU RAMBlock 记录 host、fd、页尺寸与迁移身份，GPA 拓扑另行表达。',ref:'.references/qemu/include/system/ramblock.h:25'},
+MemoryStore:{name:'MemoryStore',kind:'候选资源集合',view:'storage',role:'独占对象到 backing 的记录，不拥有一套独立 guest 地址分配器。',fields:['ObjectId → HostBacking','可写共享来源及对象切片的物化检查'],authority:'修改记录的权限只属于 MemoryRuntime 的内存控制 owner。',need:'一份存储可被不同索引和消费者保活，但不能出现多份可独立 mint 注册权的 owner。',cost:'对象、视图与登记需要有清楚的关联，不将多份索引误认为重复 RAM。',counter:'检查两个 Window 不重叠仍不足以排除两个 Object 共享同文件的重叠写映射。',question:'Store 是否仅记录存储事实，还是又成为布局的第二权威？',doc:'§2.1、§3.1–3.2',lines:'42–48, 100–116'},
+GpaGrant:{name:'GpaGrant',kind:'候选权限',view:'storage',role:'机器地址分配 owner 交出的不可复制运行期 grant。',fields:['已选 GPA 预留与拥有权','Layout 中的 claim 只是描述，不是这份权限'],authority:'内存服务不能凭可复制的 claim 另造一份 GPA 分配权。',need:'内存和 MMIO 必须在同一机器地址权威下协调，不让两个 allocator 各自成功。',cost:'撤销证据齐全才交出可释放 grant；StalledChange 不归还。',counter:'撤销超时后提前归还 GPA，新的用途可能与旧 DMA 或旧 CPU 投影相撞。',question:'grant 的移交能否独立完成，而不等待 Busy 的 vmm-main 回应？',doc:'§3.1',lines:'104–106'},
+MemoryRuntime:{name:'MemoryRuntime',kind:'候选控制 owner',view:'overview',role:'唯一协调内存变更与真实资源，不拥有完整设备、普通 I/O 或机器运行权。',fields:['Store、Layout、WindowState、CPU 注册权','变更进度、发布入口、外部 DMA 消费者成员关系'],authority:'内存事实与发布权独占；设备协议、IOMMU domain 和暂停仍各有 owner。',need:'已接收操作不能随回复 future 消失；进展不能依赖正在等待 pause 的 vmm-main。',cost:'独立控制服务不自动免除万能 manager 风险，跨 owner 输入必须足够让它独立推进。',counter:'服务等 DMA ack，adapter 又回调服务查 HVA，会形成新的互等。',question:'协调职责是否仍太宽？哪些能力应留给设备、域或机器 owner？',doc:'§2.1、§7.1、§13',lines:'42–58, 205–211, 434'},
+RamReader:{name:'RamReader',kind:'候选读入口',view:'access',role:'软件设备取得当前 RamView 的只读入口；只读的是索引入口，不是 guest 字节内容。',fields:['共享的已发布 RamView 入口','不包含替换表或新建绑定权限'],authority:'发布入口只有一份，普通设备只有读取与受控借用能力。',need:'控制面可替换索引而不复制 RAM，普通 I/O 不经过 MemoryRuntime 的消息循环。',cost:'不能直接公开一个可绕过准入的 GuestMemoryMmap；第三方 API 适配需原型。',counter:'ArcSwap 替换只能保活旧版本，不能等待旧指针不再被使用。',question:'读入口加租约对队列和零拷贝 I/O 的影响能否接受？',doc:'§3.2–3.3',lines:'116–137',reference:'Cloud Hypervisor block worker 持有 atomic 内存入口，数据面不取整个 manager 的锁。',ref:'.references/cloud-hypervisor/virtio-devices/src/block.rs:168'},
+RamView:{name:'RamView',kind:'候选派生索引',view:'access',role:'软件 RAM 的不可变查址表版本，不是完整机器地址空间或字节快照。',fields:['Window / backing 的查址项','每项关联显式 WindowAccess；Population 不能只缓存成旧 bitmap'],authority:'派生自 Layout 与 Store；持表不等于持 grant、slot 或外部 DMA 权限。',need:'旧索引可以存在，但旧 Window 永久关闭后不能再产生新访问。',cost:'pmem、设备内存与 MMIO 不自动全部进入软件 RAM 视图。',counter:'同一 GPA 已放入新 Window 时，旧表必须仍指向已关闭的旧身份。',question:'索引、生命周期和准入边界是否足够明确？',doc:'§2.1、§3.3',lines:'56, 118–137'},
+WindowAccess:{name:'WindowAccess',kind:'候选访问准入',view:'access',role:'每 Window 的准入、在途计数和当前可访问范围，不是整台 VM 内存的锁。',fields:['admission、inflight、current_population','关闭与领取租约的原子判定'],authority:'MemoryRuntime 持关闭/发布权，软件请求只能领取受限许可。',need:'关闭新访问后，在途 I/O 可以完成；旧表不保留永久写入权。',cost:'初版整个 Window 关门，拔一个 block 也可能干扰同 Window 的其他 I/O。',counter:'先检查 open，再单独增加计数，撤销可在两者之间看见零在途并释放。',question:'粗粒度屏障是否值得？更细粒度是否真有测量依据？',doc:'§3.3、§7.3',lines:'122–137, 227–235'},
+MemoryLease:{name:'MemoryLease',kind:'候选在途权限',view:'access',role:'覆盖一次 I/O 的真实完成时间，持有访问方向、对象范围、代次及保活关系。',fields:['payload、状态字、used-ring 所需完整范围','backing 保活、准入凭据、写入记脏责任'],authority:'可以受控访问字节，不能新增 KVM 或外部 DMA 注册。',need:'内核与回调不再使用指针之后才排空，而不是 syscall 提交或等待 future 被取消。',cost:'跨 Window 取得完整租约必须非阻塞失败重试，不持部分许可等待另一扇门。',counter:'payload 已完成，却又等关闭窗口的新 used-ring 许可，自己阻止排空。',question:'第三方 queue / async buffer API 能否无额外拷贝地持有这份责任？',doc:'§3.3、§7.3、§14.3',lines:'131–135, 227–235, 466–472'},
+IOCompletion:{name:'I/O 完成 owner',kind:'概念：完成边界',view:'access',role:'实际异步请求的拥有者，继续处理完成与控制事件，不被一个嵌套 await 停住。',fields:['请求所用租约与受控指针','PendingMemory、完成/取消证据、dirty 责任'],authority:'设备仍是单一 !Send owner；pause 关闭新提交而不关闭排空路径。',need:'内存变更已接收后仍须完成或保留资源，回复订阅消失不能取消副作用。',cost:'事件循环需要显式 pending 状态；取消语义按具体 backend 验证。',counter:'取消 future 已返回，io_uring/内核仍写入；提前 drop lease 或导出 quiesce 都不成立。',question:'是否确实能在等待内存结果时推进已有 I/O 与控制？',doc:'§3.5、§14.3',lines:'153–157, 466–472'},
+WindowState:{name:'WindowState',kind:'候选权威状态',view:'access',role:'唯一保存已接受的 Population、revision 与变更关联；外部投影另有真实登记。',fields:['逻辑已插入 block 集合、revision','相关 CPU/DMA 操作记录与未结束变更'],authority:'Population 由 MemoryRuntime 独占修改；设备不独立维护第二份 plugged bitmap。',need:'资源已提交但回复丢失时，设备不能仍通过自增计数报告旧容量。',cost:'关联实际登记不能变成另一份可独立写入的外部映射表。',counter:'较粗的 KVM chunk 仍覆盖 unplugged block；logical population 不证明 CPU 不可达。',question:'这里的记录与 DmaProjection 的真实登记是否划清权威？',doc:'§3.5、§8.4',lines:'145–157, 303–314'},
+WindowStatus:{name:'WindowStatus',kind:'候选只读投影',view:'access',role:'WindowState 提交时发布的计数/revision，供设备读取实际 plugged_size。',fields:['已接受容量、Population revision','不反向决定资源事实'],authority:'设备拥有 requested_size、特性和队列，但实际插入量从这一权威投影取得。',need:'分清管理端期望与 guest 已接受的事实；不在收到成功回复后再独立累加。',cost:'停机切面仍须对齐设备协议与内存状态，不靠一份计数替代排空。',counter:'请求取消并不撤销已提交操作，requested_size 不会自动成为实际容量。',question:'派生状态读取是否比跨 owner 的双写更清晰？',doc:'§3.5',lines:'147–157'},
+CpuBindings:{name:'CpuBindings',kind:'候选 CPU 投影',view:'dma',role:'实际成功的 KVM 注册及唯一 slot 使用权，保活 VM 与 backing。',fields:['VM 身份、slot、GPA/HVA、范围','稳定 chunk 边界与成功登记'],authority:'slot 是 runtime 编号，safe 层不能从可复制数字 mint 第二份绑定权。',need:'Window、guest block 和 KVM chunk 不一一对应；保持 guest 布局而重新分配编号。',cost:'粗 chunk 降低 slot 压力，但不承诺逐 block 硬件不可访问。',counter:'A/B 共用 chunk，拔 A 仍须保留 B 的 CPU 映射，不能向上取整回收两块。',question:'CPU 粒度与协议保证、slot 预算的取舍是否合理？',doc:'§3.4、§8.4',lines:'139–143, 303–314',reference:'Firecracker 在 chunk 中仍有 plugged block 时保留该 KVM slot。',ref:'.references/firecracker/src/vmm/src/devices/virtio/mem/device.rs:514'},
+AllowedRam:{name:'AllowedRam',kind:'候选 DMA 输入',view:'dma',role:'这个外部消费者可以使用的存储范围与 backing 导出描述。',fields:['Window/Object 范围、Population、来源 revision','受限 BackingExport 引用'],authority:'来自内存 owner，不包含 guest IOVA 页表的修改权。',need:'IOMMU 映射只能与允许范围相交，旧 DomainMap 不能把撤销 Window 重新装回。',cost:'对 fd backend 是描述性范围，不等于能硬件强制的子范围权限。',counter:'一个 fd 可以授权整份共享文件，即使导出消息只给一个 offset/length。',question:'统一输入是否掩盖了不同消费者的权限强度？',doc:'§8.1',lines:'243–265'},
+DomainMap:{name:'DomainMap',kind:'候选 DMA 输入',view:'dma',role:'guest IOMMU owner 的地址翻译与访问权限；没有 IOMMU 时为显式 identity 模式。',fields:['domain、IOVA → GPA、读写权限','独立于 AllowedRam 的 revision'],authority:'域的生命周期和页表归 IOMMU owner，不归内存分配器。',need:'同一 backing 在不同设备地址域里可以有不同翻译。',cost:'两个输入不是全局原子事务；真实外部副作用必须串行与对账。',counter:'内存服务等 adapter，adapter 又回调服务查 HVA，造成控制面互等。',question:'两个 owner 的输入是否足够 adapter 独立推进？',doc:'§8.1',lines:'243–261'},
+DmaProjection:{name:'DmaProjection',kind:'候选外部域 owner',view:'dma',role:'为一个 host DMA 地址域串行协调 AllowedRam、DomainMap 与真实外部登记。',fields:['两个独立来源及 revision','实际成功映射、导出会话、pending 结果','BackingExport 保活与 consumer 成员关系'],authority:'不拥有内存分配、设备协议或 IOMMU 页表；共享 VFIO 域不一定一设备一份。',need:'新成员回放当前状态后才能 Ready；失败成员仍须保留已创建的映射。',cost:'不同 backend 的撤销证据不可被一个通用 Mapping 名字抹平。',counter:'软件 MappingId 不在硬件请求中，迟到 DMA 可命中新 IOVA。',question:'它是合适的投影边界，还是第二个万能 manager？',doc:'§8.1、§14.4',lines:'239–265, 476–477',reference:'QEMU VFIO 按可独立撤销的粒度分段 map，并接受 discard 状态。',ref:'.references/qemu/hw/vfio/listener.c:220'},
+ActualMappings:{name:'实际 DMA 登记',kind:'概念：外部事实',view:'dma',role:'保存实际成功结果，不把提案或消息已发送当成已映射/已解除。',fields:['DmaDomainId、MappingId/代次、IOVA/GPA 范围','host handle、pin/导出状态、残留范围'],authority:'由 DmaProjection 拥有；变更记录关联它，不独立修改第二份映射表。',need:'失败补偿必须知道什么已完成、什么仍可能访问，迟到清理不能只按 IOVA 定位。',cost:'未确认副作用阻止同地址新用途越过，可能影响同域其他变更。',counter:'忽略旧 revision 的回复，不能撤销已经发生的内核 map。',question:'成功登记、残留范围和新用途复用的关系是否可操作？',doc:'§8.1–8.3',lines:'257–301'},
+MemoryChange:{name:'MemoryChange',kind:'候选操作资源',view:'dma',role:'一个已接收变更的实际拥有状态，不是可随回复 future 丢弃的纯函数调用。',fields:['operation_id、before、proposal','retained backing/grant、closed_windows','applied 成功范围/handle、pending 外部结果'],authority:'接收后属于内存服务；操作 ID 对账未结束请求，不创建无限历史日志。',need:'跨 KVM 和多个 DMA 域没有原子成功，真实资源必须留给完成或补偿路径。',cost:'记录应具体到可收尾的副作用，而不是一个进度整数或通用 saga 框架。',counter:'按反序 drop 不会自动补偿失败 unmap，discard 的旧内容也不一定能恢复。',question:'每种失败是否都有实际 owner 和明确恢复动作？',doc:'§8.2',lines:'267–287'},
+StalledChange:{name:'StalledChange',kind:'候选失败资源',view:'dma',role:'无法完成或补偿的具体残留状态，仍持有未证实可释放的资源与关闭凭据。',fields:['未确认外部范围、affected Window/domain','保留 backing/grant/handle、下一可用收尾方式'],authority:'不归还 grant、不改变对象用途；无交集操作不必全局停在 Busy。',need:'超时不是释放权限。无法恢复 guest 已接受 CPU 状态时要暂停而非破坏正确性继续运行。',cost:'保留资源会降低回收与可用性；如果只是“留着以后再说”，设计仍不成立。',counter:'unmap 失败后清零并重插，旧 DMA 可以写坏新内容。',question:'残留能否诊断、重试或隔离，而不变成永久黑箱？',doc:'§8.2–8.3、§12.1',lines:'285–301, 409–413'},
+DmaStopEvidence:{name:'DMA 停止证据',kind:'概念：用途结束',view:'dma',role:'证明指定 endpoint/domain 的旧用途已经停止或排空，独立于 unmap 回执。',fields:['endpoint/domain、代次、范围/共享成员覆盖','backend 明确定义的完成证据'],authority:'由执行后端的生命周期 owner 提供，不是一个通用 stopped bool。',need:'host 更换用途、域移交或跨 VM 重用需要防止旧请求命中新 IOVA。',cost:'无法取得证据就不能承诺有限时间回收；关闭队列、发 reset 或关 socket 都不够。',counter:'unmap 成功但 endpoint 还能发送旧请求；换个 MappingId 不改变硬件。',question:'不同后端真正可以证明什么，是否宁可拒绝不支持的组合？',doc:'§14.1–14.2',lines:'446–464'},
+SnapshotFields:{name:'快照内存字段',kind:'概念：恢复数据',view:'migration',role:'机器快照拥有 Layout、Population 与对象内容清单，不增加独立 MemoryImage runtime 层。',fields:['版本化布局与已接受 Population','ObjectContents、具体来源身份与一致性要求'],authority:'恢复数据不是源/目标运行权，也不保存 HVA/fd/slot/DMA handle。',need:'保持 guest 结构，重新物化 runtime 资源；协议 requested_size 来自设备快照。',cost:'布局/设备/内容切面要一致，host 政策变化必须显式。',counter:'仅保存 pmem 路径或源 inode，不能保证目标拿到同一内容版本。',question:'恢复字段是否具有明确独立语义，而非重复 runtime 结构？',doc:'§9.1',lines:'318–336'},
+ObjectContents:{name:'ObjectContents',kind:'候选内容描述',view:'migration',role:'以 ObjectId 和对象内范围描述内容来源，不以 GPA 或 slot 定义文件布局。',fields:['object_id','extents：object_offset、length、source、source_offset'],authority:'每个需要恢复的范围有明确来源，缺口不能默认为零。',need:'区分快照字节、显式零、持久来源、pager 和增量父代；不传 guest 地址洞。',cost:'父代与持久来源需要身份、完整性和重连约束。',counter:'“本次未发送”不是“全零”，私有 CoW fault 也可能重新读回旧文件。',question:'来源契约能否覆盖恢复、回收与持久内存而不引入隐式回退？',doc:'§9.1',lines:'323–336'},
+Population:{name:'Population',kind:'候选逻辑纯值',view:'migration',role:'guest 已接受的具体 block 集合；不是 KVM 覆盖、宿主页驻留或 DMA pin bitmap。',fields:['WindowId、已协商 block_size、已插入集合','不可变转移的新值与 revision'],authority:'WindowState 是其唯一 owner；目标容量由设备协议另行持有。',need:'散布的插入位置不能由单一 plugged_size 表达，也不能据此推断 RSS。',cost:'需要与实际投影协调，但不能将投影的部分失败塞成新的逻辑 bitmap。',counter:'discard 失败可以仍逻辑已拔出；CPU 粗 chunk 仍可能可达。',question:'一个事实是否只有一个可修改来源？',doc:'§3.5、§8.4',lines:'145–157, 303–314'},
+DirtySet:{name:'DirtySet',kind:'候选写入汇合',view:'migration',role:'软件对象写入的汇合点，完成时报告所写对象范围。',fields:['对象内脏范围、真实写入完成责任','跨 epoch 的在途写入与当前追踪关系'],authority:'完成 owner 报告，不能只把取得租约时的旧 epoch 当当前追踪。',need:'内核写 guest 不经过 KVM；提交时标脏后，稍后完成的写不能漏掉。',cost:'采集清位与完成之间的内存序还需实现证明。',counter:'先标脏、迁移复制并清位、内核后写，最终 KVM 位图遗漏该页。',question:'完成、清位与复制的时间边是否可验证？',doc:'§9.2、§14.3',lines:'340–346, 466–472'},
+DirtyEpoch:{name:'DirtyEpoch',kind:'候选迁移会话',view:'migration',role:'绑定布局版本和全部 dirty 生产者的一轮追踪，不拥有设备或运行权。',fields:['CPU、软件、直通设备 dirty 参与者','固定 Layout/Population 的 epoch 与最终切面'],authority:'迁移会话汇合各 owner 的结果；pause 只关新工作，必须保留排空能力。',need:'VFIO 在线迁移还要设备状态恢复与最终停写，不是有 dirty 接口就够。',cost:'初版拒绝迁移期间热插与 block 插拔，是明确范围取舍。',counter:'vCPU 已停但设备仍 DMA，stop-and-copy 仍不具备一致内容切面。',question:'固定拓扑/Population 是否符合业务需求？',doc:'§9.2',lines:'338–354'},
+TransferSet:{name:'TransferSet',kind:'候选传输工作集',view:'migration',role:'将所有 dirty 来源变换到对象内坐标，表达需要传输的范围。',fields:['ObjectId + object_offset + length','已发送、再次变脏、目的已接收分别是工作状态'],authority:'传输记录不是 Population，也不是 RAM 字节的所有者。',need:'KVM、软件和 DMA 写入不能靠一份 slot bitmap 代表；传过的页仍可能再写。',cost:'源坐标、范围粒度、epoch 与来源一致性需维护。',counter:'把“已发送”当成“不再变化”，会丢掉 precopy 后续写入。',question:'工作记录是否足够而不过度包装成新 manager？',doc:'§9.2',lines:'338–354'}
+};
+const VIEWS = [
+{id:'overview',label:'核心关系',title:'同一份字节，不同种事实',description:'内存控制 owner 只协调内存资源；软件 I/O、外部 DMA 域和机器快照各有边界。',default:'MemoryRuntime',nodes:[['MemorySpec',20,30,'配置与能力要求'],['MemoryLayout',330,30,'已选 guest 结构'],['SnapshotFields',640,30,'纯恢复字段'],['HostBacking',20,200,'实际映射与文件'],['MemoryRuntime',330,200,'内存控制，非整个设备'],['CpuBindings',640,200,'KVM 成功登记'],['RamReader',20,370,'软件 I/O 读入口'],['DmaProjection',640,370,'外部地址域与实际登记']],edges:[['MemorySpec','MemoryLayout','flow','纯规划'],['MemoryRuntime','MemoryLayout','own','独占布局修改权'],['MemoryLayout','SnapshotFields','flow','恢复字段'],['MemoryRuntime','HostBacking','own','经 Store 唯一拥有'],['MemoryRuntime','CpuBindings','own','唯一注册权'],['CpuBindings','HostBacking','arc','绑定保活','below'],['MemoryRuntime','RamReader','flow','发布读索引入口'],['MemoryRuntime','DmaProjection','msg','范围请求 / 回执'],['DmaProjection','HostBacking','arc','导出 / 登记保活','corridor']]},
+{id:'storage',label:'存储与放置',title:'Object 是字节身份，Window 是 guest 放置',description:'同一连续 backing 可放成低/高两段。宿主政策与 guest 布局独立，文件 offset 不是 GPA。',default:'Window',nodes:[['Object',20,30,'逻辑内容身份'],['MemoryLayout',330,30,'对象与放置的纯值'],['ObjectSlice',640,30,'对象内半开区间'],['HostPolicy',20,200,'明确的宿主物化'],['MemoryStore',330,200,'Object → backing 记录'],['Window',640,200,'GPA、owner、协议粒度'],['GpaGrant',20,370,'不可复制的地址权限'],['HostBacking',330,370,'实际映射与文件'],['RamView',640,370,'软件 RAM 派生索引']],edges:[['MemoryLayout','Object','own','拥有描述值'],['MemoryLayout','ObjectSlice','own','窗口切片描述'],['MemoryLayout','Window','own','拥有放置描述'],['Window','ObjectSlice','flow','以切片界定长度'],['HostPolicy','MemoryStore','flow','物化输入'],['MemoryStore','HostBacking','own','唯一 backing 记录'],['Object','MemoryStore','flow','逻辑身份关联'],['GpaGrant','MemoryLayout','flow','claim 是描述非权限'],['Window','RamView','flow','派生查址项'],['RamView','HostBacking','arc','引用保活']]},
+{id:'access',label:'软件访问与撤销',title:'旧索引可以存在，旧权限不能永久存在',description:'租约覆盖真实 I/O 完成；关准入仍要保留排空能力，不能让完成路径再次等待关门后的新许可。',default:'MemoryLease',nodes:[['RamReader',20,30,'只有读发布入口'],['RamView',330,30,'一致的索引版本'],['HostBacking',640,30,'保活不等于访问权'],['MemoryLease',20,200,'完整 I/O 范围与责任'],['WindowAccess',330,200,'准入 / 在途 / 当前范围'],['WindowState',640,200,'已接受的 Population'],['IOCompletion',20,370,'单一设备完成 owner'],['WindowStatus',640,370,'派生计数与 revision']],edges:[['RamReader','RamView','arc','取得索引版本'],['RamView','HostBacking','arc','索引保活'],['RamView','WindowAccess','arc','关联准入对象'],['WindowAccess','MemoryLease','msg','授予受限许可'],['MemoryLease','HostBacking','arc','实际 I/O 保活'],['IOCompletion','MemoryLease','own','直到真实完成'],['WindowState','WindowAccess','flow','发布当前允许范围'],['WindowState','WindowStatus','flow','实际容量投影']]},
+{id:'dma',label:'外部投影与失败',title:'提案、成功登记与撤销证据不是同一状态',description:'AllowedRam 与 DomainMap 分别有权威。失败留下真实资源；unmap 回执不是结束旧硬件用途的证据。',default:'DmaProjection',nodes:[['MemoryRuntime',20,30,'内存事实与操作 owner'],['AllowedRam',330,30,'可使用的存储范围'],['DomainMap',640,30,'guest IOVA 翻译 / 权限'],['CpuBindings',20,200,'CPU 绑定与 chunk'],['DmaProjection',330,200,'外部地址域的串行投影'],['ActualMappings',640,200,'真实成功 / 残留登记'],['MemoryChange',20,370,'副作用与保留资源'],['StalledChange',330,370,'尚未能完成或补偿'],['DmaStopEvidence',640,370,'旧用途确已停止 / 排空']],edges:[['MemoryRuntime','AllowedRam','flow','允许范围版本'],['MemoryRuntime','CpuBindings','own','唯一 CPU 注册权'],['MemoryRuntime','MemoryChange','own','接收后拥有操作','left'],['AllowedRam','DmaProjection','msg','范围与来源 revision'],['DomainMap','DmaProjection','msg','域翻译与独立 revision'],['DmaProjection','ActualMappings','own','独占真实登记'],['MemoryChange','StalledChange','flow','失败转为保留态'],['StalledChange','DmaProjection','msg','重试 / 隔离请求'],['DmaStopEvidence','ActualMappings','msg','用途结束的独立证据']]},
+{id:'migration',label:'迁移与内容',title:'内容用对象坐标，完成决定记脏时间',description:'机器快照不序列化 runtime owner。初版 precopy 固定 Layout/Population，最终切面还要排空设备与所有写入。',default:'DirtyEpoch',nodes:[['MemoryLayout',20,30,'guest 结构保持'],['Population',330,30,'已接受插入集合'],['SnapshotFields',640,30,'机器快照内存字段'],['DirtySet',20,200,'软件完成后的写入汇合'],['DirtyEpoch',330,200,'全部写入参与者'],['ObjectContents',640,200,'显式对象内容来源'],['IOCompletion',20,370,'实际完成，非提交'],['TransferSet',330,370,'对象内待传 / 再脏范围']],edges:[['MemoryLayout','SnapshotFields','flow','结构与身份','top'],['Population','SnapshotFields','flow','同一停机切面'],['SnapshotFields','ObjectContents','own','拥有来源清单'],['IOCompletion','DirtySet','msg','完成后记脏'],['DirtySet','DirtyEpoch','flow','软件写集'],['DirtyEpoch','TransferSet','flow','汇合全部来源'],['TransferSet','ObjectContents','flow','内容传输描述']]}
+];
+const CASES = [
+{id:'inflight',label:'在途 I/O 与撤销',view:'access',focus:'MemoryLease',related:['WindowAccess','IOCompletion','HostBacking','RamView'],source:'design.new-mem.md:118–157, 227–235, 446–456',steps:[
+{title:'先取得完整 I/O 授权',event:'设备在提交外部 I/O 前取得 payload、状态字和 used-ring 的完整租约集合；内核尚在使用指针。',change:'在途授权成立；真实 I/O 完成 owner 持有租约。',keep:'HostBacking、完整 I/O 租约与完成/记脏责任。',missing:'内核与回调不再使用指针的真实完成证据。',states:[['准入','开放','strong'],['在途 I/O','1 个未完成','caution'],['payload / used-ring','均在租约中',''],['旧 RamView','仍可被保活',''],['backing','不能释放','caution'],['新绑定权限','租约不提供','']],note:'不是每个字节取锁；是按请求/批次持有完成责任。'},
+{title:'关门，但让已有工作完成',event:'撤销关闭 Window 的新准入。已经授予的请求继续使用自己的租约，不能被 pause 关掉完成路径。',change:'不再授予新访问；旧授权仍在途。',keep:'旧请求的数据与队列元数据访问权仍保留到完成。',missing:'在途计数归零；不是“设备收到 pause”就足够。',states:[['准入','已关闭','caution'],['在途 I/O','仍为 1','caution'],['新请求','被拒绝 / 可重试',''],['完成路径','必须继续推进','strong'],['backing','仍保留','caution'],['索引版本','可以仍存在','']],note:'既有请求若再等待关门后的新 used-ring 租约，会自己阻止排空。'},
+{title:'等待超时，不意味着 I/O 被撤销',event:'等待者取消或超时，但内核请求尚未证实结束。回复订阅消失不能抹掉资源操作。',change:'等待状态改变；实际 I/O 与访问许可没有自动结束。',keep:'服务中的已接收操作、内核仍使用的 buffers、租约与 backing。',missing:'真正完成，或 backend 明确定义的取消完成证据。',states:[['等待 future','已取消 / 超时',''],['真实 I/O','仍在途','caution'],['operation owner','仍承担收尾','strong'],['在途授权','不能强行清零','caution'],['backing / grant','不能据此回收','caution'],['pause','不关闭完成能力','']],note:'安全保留可以强制；有限时间回收不能靠超时保证。'},
+{title:'完成发生之后，才排空授权',event:'内核和回调真正结束，完成处理用已有许可更新 used-ring，并报告软件写入；随后释放租约。',change:'该窗口的软件在途授权排空。',keep:'CPU、VFIO 或远端 fd 的权限可能仍然存在。',missing:'各外部执行者独立的撤销/用途结束证据。',states:[['真实 I/O','已完成','strong'],['used-ring 更新','在旧授权内完成',''],['软件 dirty','完成后报告','strong'],['在途授权','0','strong'],['CPU / DMA','不能由此推断','caution'],['backing','仍须按所有权限判断','']],note:'软件排空证据不能代替 KVM 删除或 DMA 停止。'},
+{title:'旧表可以活着，但旧门永久关闭',event:'旧 WindowAccess 永久关闭。旧 RamView 即使保活映射，也不能领取新租约；同 GPA 再放置必须用新身份。',change:'旧 Window 的新访问权被永久撤销。',keep:'旧表可持引用；它不再持有新用途的字节访问许可。',missing:'若要重用 backing，还要解除外部权限并结束旧用途。',states:[['旧 RamView','仍可存在',''],['旧 WindowAccess','永久关闭','caution'],['旧表的新访问','拒绝','strong'],['相同 GPA 新放置','新 WindowId / 准入',''],['跨 VM 重用','仍需完整证据','caution'],['软件类型保证','不等于硬件保证','']],note:'这解释候选准入机制的责任，不证明其性能或实际 API 适配已成立。'}]},
+{id:'chunks',label:'block 与粗 CPU chunk',view:'dma',focus:'CpuBindings',related:['AllowedRam','MemoryChange'],source:'design.new-mem.md:145–157, 303–314, 458–464',steps:[
+{title:'四个 block，一段 CPU chunk',event:'示意 A、B 已插入，C、D 未插入。一个粗 CPU chunk 覆盖四块；示意 host 大页覆盖 A+B。',change:'Population 表达具体位置，不是 slot 或 RSS 数量。',keep:'A、B 的 CPU 与 DMA 可达性及数据。',missing:'每一投影的真实回执，不能从 bitmap 直接推断。',blocks:[1,1,0,0],chunk:'粗 CPU chunk：因 A / B 已插入，仍注册',states:[['Population','A、B 已插入','strong'],['软件 DMA','只允许已插入范围',''],['CPU 覆盖','可能包含 C、D','caution'],['host 大页 A+B','两块共同占用','']],note:'示例不是建议默认值；guest block、host 页、CPU chunk、DMA 可撤销粒度分别存在。'},
+{title:'拔 A，不应牵连 B',event:'逻辑 A 退出，但 B 仍插入。粗 chunk 仍需保留；软件准入与外部 DMA 范围分别更新。',change:'Population 不再包含 A；不是把整个 chunk 拔掉。',keep:'B 的数据和 CPU 注册；A+B 的 host 大页不能整页打洞。',missing:'A 的 DMA 撤销证据；不能声称 CPU 对 A 硬件不可达。',blocks:[0,1,0,0],chunk:'粗 CPU chunk：B 仍使用，继续注册',states:[['Population','只有 B','strong'],['CPU chunk','仍注册','caution'],['软件 DMA 的 A','不再授予',''],['host 大页 A+B','不能整页 discard','caution']],note:'不能向上取整回收相邻 plugged block；也不能把 bitmap 画成逐 block CPU 隔离。'},
+{title:'B 也退出，但空 bitmap 不是回执',event:'四块逻辑上都未插入，整个 CPU chunk 已成为可撤销候选。是否已删除还需要真实注册结果。',change:'Population 为空；绑定与 DMA 记录要各自对账。',keep:'所有未确认登记和相关 backing 仍被保留。',missing:'KVM 删除、DMA 范围解除与实际回收结果。',blocks:[0,0,0,0],chunk:'粗 CPU chunk：完全空闲，可撤销 ≠ 已撤销',states:[['Population','空集合',''],['CPU chunk','等待实际删除结果','caution'],['DMA','等待实际撤销结果','caution'],['RSS / backing','不能由空集合推断','']],note:'逻辑可用性、成功登记、物理回收是不同状态。'},
+{title:'登记已解除，再看物理回收',event:'本示意取得 CPU/DMA 登记解除结果。A+B 大页终于不含仍在用的邻块，可以尝试物理回收。',change:'投影结果确认；回收资格与回收成功仍分开。',keep:'对象身份、固定 Window 容量和 guest 地址不变。',missing:'discard 是否成功，以及若换用途所需的更强停止证据。',blocks:[0,0,0,0],chunk:'粗 CPU chunk：删除回执已确认',states:[['CPU 注册','已删除','strong'],['DMA 登记','已解除','strong'],['host 大页','可以尝试回收',''],['对象 / Window','身份与容量仍在','']],note:'这是合作 guest 协议下的退插示意；host 跨 VM 换用途还要求完整的旧权限结束。'},
+{title:'discard 失败，不把块重新算作插入',event:'尝试回收 backing 失败。逻辑已退插仍成立，但驻留量可能没减少，需保留可重试回收记录。',change:'物理回收失败；Population 不被错误回滚。',keep:'backing 与回收责任，不改变对象用途。',missing:'后续回收成功证据；不能报一个虚构 RSS 降幅。',blocks:[0,0,0,0],chunk:'粗 CPU chunk：仍未注册',states:[['Population','仍为空','strong'],['CPU / DMA','按实际登记不变',''],['discard','失败，待重试','caution'],['物理驻留','可能未减少','caution']],note:'回收失败通常不应终止 guest；未确认外部权限的范围则根本不能先打洞。'}]},
+{id:'vfio',label:'VFIO 失败与迟到 DMA',view:'dma',focus:'StalledChange',related:['DmaProjection','ActualMappings','DmaStopEvidence'],source:'design.new-mem.md:239–301, 446–464',steps:[
+{title:'一个外部域持有真实映射',event:'VFIO 的域内 IOVA 指向 guest 存储，并有真实 pin。软件准入和 KVM 绑定并不是它的映射 owner。',change:'外部登记已经成功，其生命周期需要独立追踪。',keep:'backing、domain、实际登记与所覆盖的地址权限。',missing:'后续 unmap 与 endpoint 停止/排空证据。',states:[['DMA 登记','实际已映射',''],['endpoint','仍运行','caution'],['backing','被登记保活 / pin',''],['软件代次','只有宿主账本含义','']],note:'一个 host 域可能有多个共享设备，停止证据要覆盖相关成员。'},
+{title:'软件排空，并未停止硬件',event:'窗口新软件准入已关、软件租约归零。外部 endpoint 的 DMA 仍需专门撤销。',change:'软件证据成立；硬件状态不能由软件结果推断。',keep:'尚未解除的外部映射、pin、backing 与 grant。',missing:'实际 unmap 回执和旧执行用途结束。',states:[['软件在途','0','strong'],['CPU 投影','另需对账',''],['VFIO 映射','仍存在','caution'],['释放资格','尚不成立','caution']],note:'三种执行者不能共用一个 stopped bool。'},
+{title:'unmap 失败，资源不能消失',event:'VFIO unmap 返回失败，映射可能仍覆盖目标范围。变更留在 StalledChange，不能把失败返回当未发生。',change:'形成具体残留；记录已完成与未解除范围。',keep:'未确认范围的 backing、pin、domain、grant 和关闭凭据。',missing:'补偿成功、重试完成或后端明确的隔离证据。',states:[['unmap','失败 / 未确认','caution'],['StalledChange','拥有残留资源','strong'],['discard / 清零','禁止','caution'],['GPA / backing 重用','禁止','caution']],note:'保留 Arc 不代表撤销完成；保留资源也不是“以后再说”的黑箱。'},
+{title:'重试解除映射，不等于旧用途结束',event:'重试得到 unmap 回执，但 endpoint 仍可能继续发送旧队列请求。当前没有映射与可以换用途是两件事。',change:'旧映射解除已确认；endpoint 生命周期证据尚缺。',keep:'换用途所需的保留责任与旧操作/域关系。',missing:'旧请求源已经停止或排空的证据。',states:[['当前旧映射','已解除','strong'],['旧 endpoint','未证实停止','caution'],['复用同 IOVA','仍禁止新用途','caution'],['mapping 代次','不进入硬件请求','']],note:'不能用 unmap 或 stop 任一成功，泛化成所有资源均可释放。'},
+{title:'换 MappingId，挡不住旧硬件请求',event:'host 想在同一 IOVA 安装新用途。即使软件编号更新，旧 endpoint 的请求也不携带这个编号，所以应拒绝越过停止边界。',change:'只是新用途提案；不安装不安全的新映射。',keep:'旧用途未结束的证据缺口，不清零或重置内容。',missing:'endpoint/domain 的真实停止与共享成员覆盖。',states:[['新 MappingId','只是软件标识',''],['旧 DMA 请求','可能仍发出','caution'],['新用途 map','拒绝','strong'],['内容重置','不允许','caution']],note:'guest 自己管理 IOMMU 的重映射协议，不等于 host 获得跨 VM 安全移交证明。'},
+{title:'旧请求源的停止证据单独到达',event:'后端确认指定 endpoint/domain 及相关成员已停止或排空；这条证据不能倒过来充当 unpin 完成回执。',change:'旧执行用途结束被确认。',keep:'CPU、软件、导出文件等其他权限仍须逐项核对。',missing:'所有相关旧访问路径均已结束，而不只是这个 endpoint。',states:[['endpoint/domain','停止证据齐全','strong'],['旧 DMA 映射','此前已解除','strong'],['其他访问路径','各自核对',''],['跨 VM 移交','不能只看两张回执','caution']],note:'发出 reset 不等于 reset/停止已经完成；可信 fd backend 又有不同协议边界。'},
+{title:'齐备之后，才讨论释放或复用',event:'假设软件准入/租约、CPU 投影、全部外部权限及旧用途的证据都已确认，host 才可交出 grant 或授予新 VM 代次。',change:'这组前提现在足以讨论新的用途，不是网页验证已通过。',keep:'恢复数据与新身份的建立仍有自己的完整性约束。',missing:'实际 backend 的证据强度与实现，需要另外验证。',states:[['软件 / CPU','已分别排空 / 解除','strong'],['全部外部权限','已解除','strong'],['旧用途','已结束','strong'],['新 Window / VM','使用新访问身份','']],note:'这个终点是设计要求的条件集合，不是一次真正跑过的 DMA 实验。'}]},
+{id:'dirty',label:'异步写与迁移清位',view:'migration',focus:'DirtySet',related:['IOCompletion','DirtyEpoch','TransferSet'],source:'design.new-mem.md:338–354, 466–472',steps:[
+{title:'提交写入，不代表字节已经写完',event:'磁盘异步读入 guest 页 P 已提交，假设内核尚未真正写 P。提交时提前标脏最多是保守记录。',change:'真实写授权仍在途，并持有完成后记脏责任。',keep:'租约、指针生命周期与当前对象写入汇合关系。',missing:'实际完成后重新报告脏范围。',states:[['实际 I/O','未完成','caution'],['提前 dirty 标记','P = 1',''],['P 当前内容','旧字节',''],['完成记脏责任','仍需保留','strong']],note:'软件写不经 KVM；如果此后只依赖 KVM bitmap，这页会漏掉。'},
+{title:'先采集并清位，再复制',event:'迁移采集包含 P 的写集，并清位。清位应在相应复制之前，期间/之后完成的写留给下一轮。',change:'本轮 TransferSet 包含 P，当前 dirty 位暂为 0。',keep:'未完成 I/O 仍持有责任，不能因开始追踪而归入失效旧 epoch。',missing:'P 的真实完成；复制不能使未来写入消失。',states:[['本轮传输集合','包含 P',''],['采集后的 dirty','P = 0',''],['实际 I/O','仍未完成','caution'],['epoch 变更','不丢弃在途责任','strong']],note:'采集、清位、完成的内存序需要实现证明，本演示只说明时间边界。'},
+{title:'复制到的是旧内容',event:'示意本轮已经复制 P 的旧字节，但内核写仍未结束。“已发送”不能变成“不再变化”。',change:'目的暂存旧 P；当前软件 dirty 仍为 0。',keep:'源端仍在途的写授权与完成 owner。',missing:'完成后标脏，不能只记“提交时已标过”。',states:[['目的 P','暂为旧内容','caution'],['当前 dirty','P = 0',''],['源端 I/O','仍持写授权','caution'],['已发送记录','不是最终内容保证','']],note:'这是 precopy 中允许的暂态，目的 guest 此时不能据此获得运行权。'},
+{title:'真实写完成后，再进入当前写集',event:'内核现在写入新 P，完成 owner 报告当前对象的 DirtySet。即使租约早于 epoch 取得，责任也不能被旧 epoch 吞掉。',change:'源 P 变新；当前 dirty 的 P 重新为 1。',keep:'下一轮传输责任；不能只在提交时标脏。',missing:'下一次采集复制与最终 producer 排空。',states:[['源 P','新内容','strong'],['完成后 dirty','P = 1','strong'],['目的 P','仍为旧内容','caution'],['完成 owner','释放之前报告写入','']],note:'若完成不再标记，这个时间序列就会丢失软件写。'},
+{title:'后续复制修正旧页，最后排空',event:'下一轮采集 P 后复制新字节。最终切面还必须停止新业务并排空 CPU、软件、直通设备等全部生产者。',change:'目的可取得新 P；软件路径的后续写入被追踪。',keep:'其他 producer 的独立 dirty 与停写责任。',missing:'全部参与者一致切面，不是只停 vCPU。',states:[['后续 TransferSet','重新包含 P','strong'],['目的 P','可被新内容修正',''],['最终写授权','必须全部排空','caution'],['Layout / Population','初版 epoch 内固定','']],note:'正确的时间边界不等于设计/实现已验证；完成适配、dirty 同步与设备迁移仍待实证。'}]}
+];
+const TOPICS = [
+{id:'lease',title:'租约的收益，是否值得它的成本？',question:'能否和第三方 queue、异步 buffer、I/O batching 无额外拷贝地组合？',support:'访问索引与真实完成权限分离，让旧视图保活不再等于永久写权，撤销也有明确的在途边界。',counter:'若请求取得 payload 后还要等待关门后的 used-ring 许可，屏障会自锁。若等待 future 取消就 drop 租约，内核还可能写入。',cost:'需要真正的完成 owner、受控指针接口与完整租约集合。没有适配原型和性能实证。',view:'access',focus:'MemoryLease',source:'design.new-mem.md:433, 466–476'},
+{id:'owners',title:'控制 owner 是否只是两个新 manager？',question:'MemoryRuntime 与 DmaProjection 能否靠输入独立前进，而不接管整个设备？',support:'内存变更排序与资源进度由一个 owner 承担，设备仍单一 !Send，IOMMU 页表和域生命周期仍有自己的 owner。',counter:'内存服务等 DMA ack，adapter 又回调内存服务获取 HVA；或设备嵌套 await 停住了唯一能释放租约的完成路径。',cost:'必须正面列出职责和消息输入，不能以“专门服务”免责。成功登记不能双写成第二权威。',view:'dma',focus:'DmaProjection',source:'design.new-mem.md:205–211, 251–259, 434, 477'},
+{id:'granularity',title:'一扇 Window 的门，会不会太粗？',question:'拔一个 block 干扰整个 Window 的 I/O，是否是可接受的起点？',support:'不为每个 block 增加原子计数或通用区间锁，以可解释的粗屏障降低状态复杂性。',counter:'大窗口里零星插拔会扰动无关 I/O；guest block、host 大页、CPU chunk 和 DMA 撤销单位又不同。',cost:'更细粒度不是免费优化，必须有真实负担/消费者证据；CPU 粗 chunk 不承诺逐 block 不可访问。',view:'dma',focus:'CpuBindings',source:'design.new-mem.md:135, 303–314, 435'},
+{id:'export',title:'外部权限真的能被撤销吗？',question:'哪些 backend 可在线撤销，哪些只能固定导出生命周期？',support:'AllowedRam 与 DomainMap 保留独立来源；实际登记、pin 和停止证据各有 owner，不让旧请求穿过新用途。',counter:'fd 授予的是整份文件；关 socket/发 REM 不会自动收回已有映射。unmap 成功也不等于硬件旧请求源停止。',cost:'初版 vhost-user 固定导出生命周期，未证明的组合直接拒绝。保留资源可能无法保证有限时间回收。',view:'dma',focus:'DmaStopEvidence',source:'design.new-mem.md:261–265, 436, 446–464'},
+{id:'migration',title:'冻结热插与 Population，是否符合 scope？',question:'迁移期拒绝 resize/插拔是早期约束，还是遗漏了核心业务能力？',support:'固定结构使 dirty 坐标和最终切面更易证明；普通 guest/设备 I/O 在 precopy 期间继续运行。',counter:'若业务依赖连续 resize，就必须表达结构变化与 epoch 的关系，不能只删掉限制句子。VFIO 还需要设备状态与停写支持。',cost:'对 guest 请求需要协议合法的 busy/retry；并发结构变化是新的状态模型，不是小优化。',view:'migration',focus:'DirtyEpoch',source:'design.new-mem.md:348–354, 437'},
+{id:'stalled',title:'失败保留能否真正操作，而非无限留着？',question:'每个残留能否说明未确认什么、保留什么、怎样重试或隔离？',support:'副作用接收后仍有 owner。缺撤销证据时不释放、不清零、不归还 grant；不自动终止所有局部故障。',counter:'只有一个进度整数不够补偿；把 StalledChange 留成永久全局 Busy 也会拖死无交集操作。',cost:'保留 backing/handle/grant 会消耗资源；若 guest 已接受的 CPU 状态无法恢复，需要暂停而非破坏正确性继续运行。',view:'dma',focus:'StalledChange',source:'design.new-mem.md:267–301, 409–413, 438'}
+];
+const ROUNDS = [
+{number:'01',title:'存储、放置与投影分开',assumption:'一张区域表承担全部内存事实。',counter:'地址洞、多个消费者和内容传输使用不同坐标。',change:'Object / Window；纯 Layout；派生视图与外部登记。',risk:'撤销、设备互等、双写与部分失败未解决。'},
+{number:'02',title:'旧视图安全 ≠ 旧访问撤销',assumption:'Arc 保活或发布新表就足够。',counter:'旧异步请求仍有 host 指针，回复丢失也不撤销副作用。',change:'WindowAccess / MemoryLease；唯一 Population；操作独立拥有。',risk:'租约排空与 queue 完成可能自锁。'},
+{number:'03',title:'失败与迁移不是序列化流程',assumption:'反序 drop 能回滚；一个范围代表所有映射。',counter:'unmap 可失败，IOMMU 有另一坐标，dirty 有多个生产者。',change:'DmaProjection、真实副作用登记、StalledChange 与对象内容坐标。',risk:'外部域、异步完成与资源保留仍需审视。'},
+{number:'04',title:'收紧身份，删掉空包装',assumption:'ObjectId 不同就独立；宿主政策原样重放。',counter:'同文件重叠共享写；目标 host NUMA 不同。',change:'真实来源检查、HostPolicy、owner/block_size；删除独立 MemoryImage 层。',risk:'租约成本与 backend 撤销能力需要原型/协议证据。'},
+{number:'05',title:'时间边界不能藏在代次里',assumption:'新 MappingId 能隔离旧 DMA；提交时记脏即可。',counter:'硬件请求无软件代次；复制清位后内核才写。',change:'用途结束证据、完整完成责任、完成后记脏与当前 epoch。',risk:'两份审阅只读过首轮，不是对第五轮的认可。'}
+];
+const EVIDENCE = [
+{title:'软件访问已排空',proves:'旧 Window 准入关闭，已有授权结束；新软件访问被拒绝。',not:'不能证明 vCPU、硬件 DMA 或远端 fd 停止。'},
+{title:'KVM 删除 / 旧 VM 关闭',proves:'在对应删除与生命周期保证下，旧 CPU 投影不再访问。',not:'不能替代软件、VFIO 或导出权限的解除。'},
+{title:'外部 DMA unmap 回执',proves:'登记范围按 backend 的语义解除；要记录实际成功范围。',not:'不能证明 endpoint 不再发旧请求，也不授予新用途复用权。'},
+{title:'endpoint / domain 停止',proves:'指定代次的旧用途不再发出/完成影响新用途的 DMA。',not:'不能替代 unpin；共享域成员也必须被证据覆盖。'},
+{title:'远端导出停止证据',proves:'可信撤销/排空协议完成，或相应进程终止证据。',not:'仅关 socket、发送 REM 或 reset 都不等于已停止。'}
+];
+</script>
+<script id="review-runtime">
+const $ = id => document.getElementById(id);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const KIND_LABELS = {own:'独占 / 修改权',arc:'仅保活引用',flow:'派生数据',msg:'请求 / 结果'};
+const COLORS = {own:'var(--accent)',arc:'var(--wire)',flow:'var(--blue)',msg:'var(--amber)'};
+const NODE_W = 240;
+const NODE_H = 86;
+let currentView = 'overview';
+let selectedType = 'MemoryRuntime';
+let currentCase = 'inflight';
+let currentStep = 0;
+const notes = new Map();
+const relations = [];
+const relationKeys = new Set();
+for(const view of VIEWS) for(const [from,to,kind,label] of view.edges){
+  const key = [from,to,kind,label].join('|');
+  if(!relationKeys.has(key)){relationKeys.add(key);relations.push({from,to,kind,label});}
+}
+function element(tag,cls,text){
+  const el = document.createElement(tag);
+  if(cls) el.className = cls;
+  if(text !== undefined) el.textContent = text;
+  if(tag === 'button') el.type = 'button';
+  return el;
+}
+function svgElement(tag,attrs,text){
+  const el = document.createElementNS(SVG_NS,tag);
+  for(const [key,value] of Object.entries(attrs || {})) el.setAttribute(key,String(value));
+  if(text !== undefined) el.textContent = text;
+  return el;
+}
+function nearby(view){
+  const ids = new Set([selectedType]);
+  for(const [from,to] of view.edges){
+    if(from === selectedType) ids.add(to);
+    if(to === selectedType) ids.add(from);
+  }
+  return ids;
+}
+function chooseType(id,viewId,scroll=false,focusNode=false){
+  const view = VIEWS.find(v=>v.id === viewId);
+  if(!TYPES[id] || !view || !view.nodes.some(n=>n[0] === id)) return;
+  selectedType = id;
+  currentView = viewId;
+  renderWorkspace();
+  if(scroll){
+    const target = matchMedia('(max-width:620px)').matches ? $('inspector') : $('map');
+    target.scrollIntoView({block:'start',behavior:matchMedia('(prefers-reduced-motion:reduce)').matches?'auto':'smooth'});
+  }
+  if(focusNode){
+    const selector = matchMedia('(max-width:620px)').matches ? `#mobile-nodes [data-type="${id}"]` : `#graph [data-type="${id}"]`;
+    document.querySelector(selector)?.focus({preventScroll:true});
+  }
+}
+function renderViewTabs(){
+  const tabs = $('view-tabs');
+  tabs.replaceChildren();
+  for(const view of VIEWS){
+    const button = element('button','tab',view.label);
+    button.id = `view-tab-${view.id}`;
+    button.setAttribute('role','tab');
+    button.setAttribute('aria-selected',String(currentView === view.id));
+    button.setAttribute('aria-controls','view-panel');
+    button.tabIndex = currentView === view.id ? 0 : -1;
+    button.addEventListener('click',()=>{
+      chooseType(view.default,view.id);
+      $(`view-tab-${view.id}`).focus({preventScroll:true});
+    });
+    button.addEventListener('keydown',event=>{
+      if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
+      event.preventDefault();
+      const index = VIEWS.findIndex(v=>v.id === view.id);
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? VIEWS.length-1 : (index+(event.key === 'ArrowRight'?1:-1)+VIEWS.length)%VIEWS.length;
+      chooseType(VIEWS[next].default,VIEWS[next].id);
+      $(`view-tab-${VIEWS[next].id}`).focus({preventScroll:true});
+    });
+    tabs.append(button);
+  }
+  $('view-panel').setAttribute('aria-labelledby',`view-tab-${currentView}`);
+}
+function edgeGeometry(a,b,route){
+  const ax=a[1],ay=a[2],bx=b[1],by=b[2];
+  const acx=ax+NODE_W/2,acy=ay+NODE_H/2,bcx=bx+NODE_W/2,bcy=by+NODE_H/2;
+  if(route === 'below'){
+    const y = Math.max(ay,by)+NODE_H+30;
+    return {d:`M${acx},${ay+NODE_H} V${y-9} Q${acx},${y} ${acx-9},${y} H${bcx+9} Q${bcx},${y} ${bcx},${y-9} V${by+NODE_H}`,x:(acx+bcx)/2,y:y-5};
+  }
+  if(route === 'corridor'){
+    const y = 342;
+    return {d:`M${acx},${ay} V${y+9} Q${acx},${y} ${acx-9},${y} H${bcx+9} Q${bcx},${y} ${bcx},${y-9} V${by+NODE_H}`,x:(acx+bcx)/2,y:y-5};
+  }
+  if(route === 'top'){
+    const y = 15;
+    return {d:`M${acx},${ay} V${y+5} Q${acx},${y} ${acx+5},${y} H${bcx-5} Q${bcx},${y} ${bcx},${y+5} V${by}`,x:(acx+bcx)/2,y:y-4};
+  }
+  if(route === 'left'){
+    const x = 7;
+    return {d:`M${ax},${acy} H${x+5} Q${x},${acy} ${x},${acy+5} V${bcy-5} Q${x},${bcy} ${x+5},${bcy} H${bx}`,x:113,y:139};
+  }
+  if(Math.abs(acx-bcx)<12){
+    const sign = bcy>acy?1:-1;
+    const sy = ay+(sign>0?NODE_H:0),ty=by+(sign>0?0:NODE_H);
+    return {d:`M${acx},${sy} L${bcx},${ty}`,x:acx+71,y:(sy+ty)/2+3};
+  }
+  const sign = bcx>acx?1:-1;
+  const sx = ax+(sign>0?NODE_W:0),tx=bx+(sign>0?0:NODE_W);
+  const gap = Math.max(25,Math.abs(tx-sx)/2);
+  return {d:`M${sx},${acy} C${sx+sign*gap},${acy} ${tx-sign*gap},${bcy} ${tx},${bcy}`,x:(sx+tx)/2,y:(acy+bcy)/2-8};
+}
+function renderGraph(view){
+  const graph = $('graph');
+  graph.replaceChildren();
+  graph.setAttribute('aria-label',`${view.title}，使用 Tab 和 Enter 选择节点`);
+  const defs = svgElement('defs');
+  for(const [kind,color] of Object.entries(COLORS)){
+    const marker = svgElement('marker',{id:`arrow-${kind}`,viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto'});
+    marker.append(svgElement('path',{d:'M1,1 L9,5 L1,9 Z',fill:color}));
+    defs.append(marker);
+  }
+  graph.append(defs);
+  const nodeMap = new Map(view.nodes.map(node=>[node[0],node]));
+  const adjacent = nearby(view);
+  const edges = svgElement('g',{'aria-hidden':'true'});
+  for(const [from,to,kind,label,route] of view.edges){
+    const geometry = edgeGeometry(nodeMap.get(from),nodeMap.get(to),route);
+    const focused = from === selectedType || to === selectedType;
+    edges.append(svgElement('path',{d:geometry.d,class:`edge ${kind} ${focused?'focus':'faint'}`,'marker-end':`url(#arrow-${kind})`,'data-from':from,'data-to':to}));
+    edges.append(svgElement('text',{x:geometry.x,y:geometry.y,class:`edge-label ${focused?'':'faint'}`,'text-anchor':'middle'},label));
+  }
+  graph.append(edges);
+  const mobile = $('mobile-nodes');
+  mobile.replaceChildren();
+  for(const [id,x,y,caption] of view.nodes){
+    const type = TYPES[id];
+    const selected = id === selectedType;
+    const group = svgElement('g',{class:`node ${selected?'selected':adjacent.has(id)?'related':'faint'}`,transform:`translate(${x} ${y})`,role:'button',tabindex:0,'aria-label':`${type.name}：${caption}`,'aria-pressed':String(selected),'data-type':id});
+    group.append(svgElement('rect',{width:NODE_W,height:NODE_H,rx:11}));
+    group.append(svgElement('text',{x:15,y:20,class:'node-kind'},type.kind));
+    group.append(svgElement('text',{x:15,y:44,class:'node-title'},type.name));
+    group.append(svgElement('text',{x:15,y:67,class:'node-caption'},caption));
+    group.addEventListener('click',()=>chooseType(id,view.id));
+    group.addEventListener('keydown',event=>{
+      if(event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      chooseType(id,view.id,false,true);
+    });
+    graph.append(group);
+    const button = element('button','mobile-node mono',type.name);
+    button.dataset.type = id;
+    button.setAttribute('aria-pressed',String(selected));
+    button.append(element('span','',caption));
+    button.addEventListener('click',()=>chooseType(id,view.id,false,true));
+    mobile.append(button);
+  }
+}
+function detailSection(title,text,cls=''){
+  const section = element('section',`detail-section ${cls}`);
+  section.append(element('h4','',title),element('p','',text));
+  return section;
+}
+function renderInspector(){
+  const type = TYPES[selectedType];
+  const inspector = $('inspector');
+  inspector.replaceChildren();
+  const header = element('div','detail-header');
+  header.append(element('span','badge',type.kind),element('h3','',type.name),element('p','muted',type.role));
+  inspector.append(header,element('div','authority',type.authority));
+  const fields = element('section','detail-section');
+  fields.append(element('h4','','概念字段 / 携带事实'));
+  const list = element('ul');
+  for(const field of type.fields) list.append(element('li','',field));
+  fields.append(list);
+  inspector.append(fields,detailSection('解决什么实际问题',type.need),detailSection('必须承担的代价',type.cost),detailSection('反例 / 不成立的推断',type.counter,'warning'),detailSection('留给专家的问题',type.question));
+  const local = relations.filter(r=>r.from === selectedType || r.to === selectedType);
+  if(local.length){
+    const section = element('section','detail-section');
+    section.append(element('h4','','直接关系（含其他视图）'));
+    const links = element('div','related-links');
+    for(const relation of local){
+      const target = relation.from === selectedType?relation.to:relation.from;
+      const direction = relation.from === selectedType?'→':'←';
+      const button = element('button','',`${direction} ${TYPES[target].name} · ${relation.label}`);
+      button.title = KIND_LABELS[relation.kind];
+      button.addEventListener('click',()=>chooseType(target,TYPES[target].view));
+      links.append(button);
+    }
+    section.append(links);
+    inspector.append(section);
+  }
+  const source = element('section','detail-section');
+  source.append(element('h4','','候选设计依据'),element('p','source',`design.new-mem.md:${type.lines} · ${type.doc}`));
+  source.append(element('p','muted','位置为文本索引；不是已实现 API 的源码定位。'));
+  inspector.append(source);
+  if(type.reference){
+    const reference = element('section','detail-section');
+    reference.append(element('h4','','参考项目：需求证据'),element('p','',type.reference),element('p','source',type.ref),element('p','muted','说明需求真实存在，不证明本草稿机制已成立。'));
+    inspector.append(reference);
+  }
+}
+function renderWorkspace(){
+  const view = VIEWS.find(v=>v.id === currentView);
+  renderViewTabs();
+  $('graph-title').textContent = view.title;
+  $('graph-description').textContent = view.description;
+  $('graph-count').textContent = `${view.nodes.length} 个锚点 · 仅突出直接关联`;
+  renderGraph(view);
+  renderInspector();
+}
+function selectCase(id,focus=false){
+  currentCase = id;
+  currentStep = 0;
+  renderCaseTabs();
+  renderStep();
+  if(focus) $(`case-tab-${id}`).focus({preventScroll:true});
+}
+function renderCaseTabs(){
+  const tabs = $('case-tabs');
+  tabs.replaceChildren();
+  for(const scenario of CASES){
+    const button = element('button','case-tab',scenario.label);
+    button.id = `case-tab-${scenario.id}`;
+    button.setAttribute('role','tab');
+    button.setAttribute('aria-selected',String(currentCase === scenario.id));
+    button.setAttribute('aria-controls','case-panel');
+    button.tabIndex = currentCase === scenario.id ? 0 : -1;
+    button.addEventListener('click',()=>selectCase(scenario.id,true));
+    button.addEventListener('keydown',event=>{
+      if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
+      event.preventDefault();
+      const index = CASES.findIndex(s=>s.id === scenario.id);
+      const next = event.key === 'Home'?0:event.key === 'End'?CASES.length-1:(index+(event.key === 'ArrowRight'?1:-1)+CASES.length)%CASES.length;
+      selectCase(CASES[next].id,true);
+    });
+    tabs.append(button);
+  }
+  $('case-panel').setAttribute('aria-labelledby',`case-tab-${currentCase}`);
+}
+function renderStep(){
+  const scenario = CASES.find(s=>s.id === currentCase);
+  const step = scenario.steps[currentStep];
+  $('step-kicker').textContent = `概念反例 · ${currentStep+1} / ${scenario.steps.length}`;
+  $('step-title').textContent = step.title;
+  $('step-event').textContent = step.event;
+  const facts = $('step-facts');
+  facts.replaceChildren();
+  for(const [label,text,cls] of [['改变的事实',step.change,''],['仍保留什么',step.keep,'keep'],['尚缺什么证据',step.missing,'']]){
+    const row = element('div');
+    row.append(element('dt','',label),element('dd',cls,text));
+    facts.append(row);
+  }
+  const visual = $('case-visual');
+  visual.replaceChildren(element('div','demo-disclaimer','概念示意 · 不构成实现或验证证据'));
+  if(step.blocks){
+    visual.append(element('div','demo-title','示例：A–D 是四个 guest block，不是建议默认配置'));
+    const row = element('div','block-row');
+    for(const [index,plugged] of step.blocks.entries()){
+      const block = element('div',`block ${plugged?'plugged':''}`,String.fromCharCode(65+index));
+      block.append(element('span','',plugged?'已插入':'未插入'));
+      row.append(block);
+    }
+    visual.append(row,element('div','chunk-bar',step.chunk));
+  }
+  const states = element('div','state-grid');
+  for(const [label,value,tone] of step.states){
+    const tile = element('div',`state-tile ${tone}`);
+    tile.append(element('div','state-label',label),element('div','state-value',value));
+    states.append(tile);
+  }
+  visual.append(states,element('p','demo-note',step.note));
+  $('previous').disabled = currentStep === 0;
+  $('next').disabled = currentStep === scenario.steps.length-1;
+  const dots = $('step-dots');
+  dots.replaceChildren();
+  for(const [index,item] of scenario.steps.entries()){
+    const button = element('button','step-dot',String(index+1));
+    button.setAttribute('aria-label',`第 ${index+1} 步：${item.title}`);
+    if(index === currentStep) button.setAttribute('aria-current','step');
+    button.addEventListener('click',()=>{currentStep=index;renderStep();$('step-dots').children[index].focus({preventScroll:true});});
+    dots.append(button);
+  }
+  $('case-source').textContent = `草稿依据：${scenario.source}。场景切换与步进不自动改变关系视图。`;
+  $('case-announcement').textContent = `${scenario.label}，第 ${currentStep+1} 步，共 ${scenario.steps.length} 步：${step.title}`;
+}
+function renderEvidence(){
+  for(const item of EVIDENCE){
+    const card = element('article','panel evidence-card');
+    card.append(element('h3','',item.title),element('p','yes',item.proves),element('p','not',`不能推出：${item.not}`));
+    $('evidence-list').append(card);
+  }
+}
+function updateNotesStatus(){
+  const filled = TOPICS.some(topic=>(notes.get(topic.id)||'').trim());
+  $('export-notes').disabled = !filled;
+  $('notes-status').textContent = filled?'备注尚未导出；刷新或关闭会丢失。':'尚未填写备注。';
+}
+function renderTopics(){
+  for(const [index,topic] of TOPICS.entries()){
+    const card = element('article','panel topic-card');
+    const heading = element('div','topic-heading');
+    const title = element('div');
+    title.append(element('h3','',topic.title),element('p','topic-question',topic.question));
+    heading.append(element('div','topic-number',String(index+1).padStart(2,'0')),title);
+    card.append(heading);
+    const body = element('div','topic-body');
+    for(const [label,text] of [['支持理由',topic.support],['反例压力',topic.counter]]){
+      const column = element('div');
+      column.append(element('div','topic-label',label),element('p','',text));
+      body.append(column);
+    }
+    card.append(body,element('p','topic-cost',`代价 / 未证实：${topic.cost}`));
+    const label = element('label','','你的反例、判断与理由（不自动评分）');
+    label.htmlFor = `note-${topic.id}`;
+    const textarea = element('textarea');
+    textarea.id = `note-${topic.id}`;
+    textarea.placeholder = '可以支持，也可以否决。请写出你据以判断的场景与代价。';
+    textarea.addEventListener('input',()=>{notes.set(topic.id,textarea.value);updateNotesStatus();});
+    card.append(label,textarea);
+    const source = element('p','source',topic.source);
+    source.style.marginTop = '9px';
+    const button = element('button','locate','查看关键关系');
+    button.style.marginTop = '8px';
+    button.addEventListener('click',()=>chooseType(topic.focus,topic.view,true));
+    card.append(source,button);
+    $('topics').append(card);
+  }
+}
+function exportNotes(){
+  const sections = ['新内存设施 · 设计评审备注','依据：design.new-mem.md，第五轮工作稿','这是人工意见，不是实施许可或设计验证；无自动评分。',''];
+  for(const [index,topic] of TOPICS.entries()){
+    sections.push(`${index+1}. ${topic.title}`,topic.question,`草稿：${topic.source}`,notes.get(topic.id)?.trim()||'（未填写）','');
+  }
+  const blob = new Blob(['\uFEFF',sections.join('\n')],{type:'text/plain;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const link = element('a');
+  link.href = url;
+  link.download = 'new-memory-review-notes.txt';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  $('notes-status').textContent = '已生成本机文本；继续修改后请再次导出。备注未上传或自动保存。';
+}
+function renderRounds(){
+  for(const round of ROUNDS){
+    const article = element('article','round');
+    article.append(element('div','eyebrow',`ROUND ${round.number}`),element('h3','',round.title));
+    for(const [label,key] of [['原假设','assumption'],['反例','counter'],['修改','change'],['剩余风险','risk']]){
+      const paragraph = element('p');
+      paragraph.append(element('b','',`${label}：`),document.createTextNode(round[key]));
+      article.append(paragraph);
+    }
+    $('rounds').append(article);
+  }
+}
+function updateThemeLabel(){
+  const manual = document.documentElement.dataset.theme;
+  const dark = manual?manual === 'dark':matchMedia('(prefers-color-scheme:dark)').matches;
+  $('theme').textContent = manual?`主题：${dark?'深色':'浅色'}`:`主题：跟随系统（${dark?'深':'浅'}）`;
+  $('theme').setAttribute('aria-label',`当前${dark?'深色':'浅色'}主题，切换为${dark?'浅色':'深色'}`);
+}
+$('theme').addEventListener('click',()=>{
+  const manual = document.documentElement.dataset.theme;
+  const dark = manual?manual === 'dark':matchMedia('(prefers-color-scheme:dark)').matches;
+  document.documentElement.dataset.theme = dark?'light':'dark';
+  updateThemeLabel();
+});
+matchMedia('(prefers-color-scheme:dark)').addEventListener('change',updateThemeLabel);
+$('previous').addEventListener('click',()=>{if(currentStep>0){currentStep--;renderStep();}});
+$('next').addEventListener('click',()=>{
+  const scenario = CASES.find(s=>s.id === currentCase);
+  if(currentStep<scenario.steps.length-1){currentStep++;renderStep();}
+});
+$('reset').addEventListener('click',()=>{currentStep=0;renderStep();});
+$('locate').addEventListener('click',()=>{
+  const scenario = CASES.find(s=>s.id === currentCase);
+  chooseType(scenario.focus,scenario.view,true);
+});
+$('export-notes').addEventListener('click',exportNotes);
+for(const button of document.querySelectorAll('[data-jump-view]')) button.addEventListener('click',()=>{
+  const view = VIEWS.find(v=>v.id === button.dataset.jumpView);
+  chooseType(view.default,view.id,true);
+});
+renderWorkspace();
+renderEvidence();
+renderCaseTabs();
+renderStep();
+renderTopics();
+renderRounds();
+updateThemeLabel();
+</script>
+</body>
+</html>

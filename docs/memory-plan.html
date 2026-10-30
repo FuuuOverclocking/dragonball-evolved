@@ -1,0 +1,1288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>内存设施与抽象 · 本阶段计划</title>
+<style>
+:root{
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif;
+  --mono:"JetBrains Mono","SFMono-Regular","Cascadia Code",Menlo,Consolas,"Noto Sans Mono CJK SC",monospace;
+  --bg:#f6f7f9;--card:#fff;--text:#1f2328;--muted:#5d6672;--line:#dde2e8;--soft:#f0f2f5;--code:#f3f4f6;
+  --blue:#2459d6;--blue-bg:#edf3ff;--purple:#7339d6;--purple-bg:#f4effe;--orange:#c2490c;--orange-bg:#fff3ea;
+  --green:#15803d;--green-bg:#ebfaf1;--red:#c62828;--red-bg:#fdeeee;--amber:#9a6700;--amber-bg:#fff7e0;
+  --shadow:0 1px 2px rgba(15,23,42,.04),0 4px 14px rgba(15,23,42,.05);
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0f1115;--card:#171a21;--text:#e6e8eb;--muted:#9aa4b2;--line:#2b313c;--soft:#1e222a;--code:#1e222a;
+  --blue:#7ea6ff;--blue-bg:#162238;--purple:#b99bff;--purple-bg:#211a33;--orange:#ff9d63;--orange-bg:#2a1c13;
+  --green:#5fd394;--green-bg:#11261a;--red:#ff8080;--red-bg:#2d1616;--amber:#f0c350;--amber-bg:#2a2410;--shadow:none}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:16px}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.7 var(--sans)}
+a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
+h1{font-size:28px;line-height:1.3;margin:6px 0 8px}
+h2{font-size:21px;line-height:1.4;margin:0 0 10px;display:flex;align-items:center;gap:10px}
+h2 .no{font:600 13px var(--mono);color:var(--muted);background:var(--soft);padding:1px 9px;border-radius:6px}
+h3{font-size:16px;margin:22px 0 8px}
+h4{font-size:15px;margin:0 0 6px}
+p{margin:6px 0}
+ul,ol{margin:6px 0;padding-left:20px}
+code{font-family:var(--mono);font-size:.86em;background:var(--code);padding:1px 5px;border-radius:4px}
+pre{margin:10px 0;background:var(--code);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow:auto;font:12.5px/1.6 var(--mono)}
+pre code{background:none;padding:0;font-size:inherit;overflow-wrap:normal}
+code{overflow-wrap:anywhere}
+main{min-width:0}
+.layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:28px;max-width:1240px;margin:0 auto;padding:24px 20px 60px}
+.layout>*{min-width:0}
+.toc{position:sticky;top:18px;align-self:start;font-size:13.5px;max-height:calc(100vh - 36px);overflow:auto}
+.toc .brand{font-weight:600;padding:0 10px 8px}
+.toc a{display:block;padding:4px 10px;border-radius:6px;color:var(--muted);border-left:2px solid transparent}
+.toc a:hover{background:var(--soft);color:var(--text);text-decoration:none}
+.toc a.active{color:var(--blue);background:var(--blue-bg);border-left-color:var(--blue)}
+main>section,.hero{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px 26px;margin-bottom:20px;box-shadow:var(--shadow)}
+@media (max-width:980px){.layout{grid-template-columns:minmax(0,1fr)}.toc{position:static;max-height:none;display:flex;flex-wrap:wrap;gap:2px}.toc .brand{width:100%}}
+@media (max-width:600px){.layout{padding:16px 12px 40px;gap:16px}main>section,.hero{padding:18px 16px}h1{font-size:24px}h2{font-size:19px}dl.gloss{grid-template-columns:1fr}dl.gloss dt:not(:first-child){margin-top:8px}.own,.seq{overflow-x:auto}.own svg{min-width:760px}.seq-head,.seq-row{min-width:660px}.controls select{max-width:100%}}
+.tldr{margin:2px 0 16px;padding:10px 14px;border-radius:8px;background:var(--blue-bg);border-left:4px solid var(--blue)}
+.tldr>b:first-child{color:var(--blue)}
+.muted{color:var(--muted)}.small{font-size:13px}
+.ref{font:11.5px var(--mono);color:var(--muted);margin-left:6px}
+.chip{display:inline-block;padding:0 8px;border-radius:999px;font-size:12px;line-height:20px;font-weight:500;white-space:nowrap}
+.c-plan{color:var(--blue);background:var(--blue-bg)}.c-dev{color:var(--purple);background:var(--purple-bg)}.c-run{color:var(--orange);background:var(--orange-bg)}
+.c-ok{color:var(--green);background:var(--green-bg)}.c-no{color:var(--muted);background:var(--soft)}.c-bad{color:var(--red);background:var(--red-bg)}.c-warn{color:var(--amber);background:var(--amber-bg)}
+.badge{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;background:var(--red);color:#fff;font:600 12px var(--sans);flex:none}
+.grid2,.grid3{display:grid;gap:14px;margin:12px 0}
+.grid2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid3{grid-template-columns:repeat(3,minmax(0,1fr))}
+@media (max-width:780px){.grid2,.grid3{grid-template-columns:1fr}}
+.card{border:1px solid var(--line);border-radius:10px;padding:13px 15px;background:var(--card)}
+.card.top-blue{border-top:3px solid var(--blue)}.card.top-purple{border-top:3px solid var(--purple)}.card.top-gray{border-top:3px solid var(--muted)}.card.top-green{border-top:3px solid var(--green)}
+.callout{border-radius:8px;padding:10px 14px;margin:12px 0;border-left:4px solid}
+.callout.warn{background:var(--amber-bg);border-color:var(--amber)}.callout.bad{background:var(--red-bg);border-color:var(--red)}.callout.ok{background:var(--green-bg);border-color:var(--green)}
+.tablewrap{overflow-x:auto;margin:10px 0}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-weight:600;color:var(--muted);font-size:12.5px;background:var(--soft);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+details{border:1px solid var(--line);border-radius:8px;padding:0 14px;margin:10px 0}
+details>summary{cursor:pointer;padding:9px 0;font-weight:500;list-style:none}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"";display:inline-block;width:0;height:0;margin-right:8px;border-left:6px solid var(--muted);border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform .15s}
+details[open]>summary::before{transform:rotate(90deg)}
+details[open]{padding-bottom:10px}
+.btn{font:inherit;font-size:14px;padding:6px 14px;border-radius:8px;border:1px solid var(--blue);background:var(--blue);color:#fff;cursor:pointer}
+.btn.ghost{background:var(--card);color:var(--blue)}.btn:disabled{opacity:.4;cursor:default}
+.hero .eyebrow{font:600 12px var(--mono);letter-spacing:.06em;color:var(--muted)}
+.hero .num{font:700 20px var(--mono);color:var(--blue)}
+.hero .hint{font-size:13px;color:var(--muted);margin-top:10px}
+dl.gloss{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;font-size:13.5px;margin:6px 0}
+dl.gloss dt{font-weight:600}dl.gloss dd{margin:0;color:var(--muted)}
+footer{font-size:12.5px;color:var(--muted);text-align:center;padding:10px}
+.flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:8px 0 14px}
+.flow h5{margin:0 0 8px;font-size:12.5px;color:var(--muted);font-weight:600}
+.ent{position:relative;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:12px;font-size:12.5px;background:var(--card)}
+.ent code{font-size:12px}
+.ent.bad{border-color:var(--red);background:var(--red-bg)}
+.ent.good{border-color:var(--green);background:var(--green-bg)}
+.ent .badges{position:absolute;top:-10px;right:-8px;display:flex;gap:3px}
+.ent .d{color:var(--muted);margin-top:3px}
+@media (max-width:780px){.flow{grid-template-columns:1fr}}
+ol.breaks{list-style:none;padding:0;display:grid;gap:8px}
+ol.breaks li{display:flex;gap:10px;align-items:flex-start;padding:9px 12px;border-radius:8px;background:var(--red-bg);font-size:14px}
+ul.goods{list-style:none;padding:0;display:grid;gap:6px}
+ul.goods li{padding:8px 12px;border-radius:8px;background:var(--green-bg);font-size:14px}
+ul.goods li::before{content:"+ ";color:var(--green);font-weight:700}
+.owners{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:8px 0 14px}
+.owner{border-radius:12px;padding:12px 16px;border:1px dashed var(--line)}
+.owner.machine{background:var(--blue-bg);border-color:var(--blue)}
+.owner.device{background:var(--purple-bg);border-color:var(--purple)}
+.owner .items{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+.pill{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:4px 10px;font-size:13px}
+.tiers{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:8px 0}
+.tier{border-radius:10px;padding:10px 14px;font-size:14px}
+.tier.plan{background:var(--blue-bg)}.tier.dev{background:var(--purple-bg)}.tier.run{background:var(--orange-bg)}
+@media (max-width:780px){.owners,.tiers{grid-template-columns:1fr}}
+table.matrix td:first-child{white-space:nowrap}
+tr.later td{opacity:.75}
+.calc{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--soft);margin:8px 0 14px}
+.controls{display:flex;flex-wrap:wrap;gap:12px 22px;margin-bottom:12px}
+.controls label{font-size:12.5px;color:var(--muted);display:flex;flex-direction:column;gap:3px}
+.controls select{font:inherit;font-size:14px;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--text)}
+.bar{display:flex;height:66px;border-radius:8px;overflow:hidden;border:1px solid var(--line);background:var(--card)}
+.seg{display:flex;flex-direction:column;justify-content:center;padding:0 6px;font-size:11.5px;line-height:1.3;color:#fff;overflow:hidden;white-space:nowrap;border-right:1px solid rgba(255,255,255,.55);min-width:0}
+.seg:last-child{border-right:0}
+.seg small{opacity:.85;font-size:10.5px}
+.seg.ram{background:#3b72e0}.seg.hole{background:#7b8794}.seg.mem{background:#16a34a}.seg.pmem{background:#8b3fd9}
+.seg.free{background:#bfe8cf;color:#14532d}.seg.err{background:#d93636}
+.seg.unused,.seg.beyond{background:repeating-linear-gradient(45deg,#e3e7ec,#e3e7ec 6px,#f1f3f6 6px,#f1f3f6 12px);color:#5d6672}
+.seg.win{flex-direction:row;padding:0;box-shadow:inset 0 0 0 2px #16a34a}
+.seg.win>.seg{height:100%}
+.axis{display:flex;justify-content:space-between;gap:8px;font:11px var(--mono);color:var(--muted);margin:4px 2px 10px}
+.swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}
+.checks{list-style:none;padding:0;margin:4px 0;display:grid;gap:4px;font-size:13.5px}
+.checks li::before{content:"OK";color:var(--green);font:600 10px var(--mono);margin-right:6px}
+.checks li.bad{color:var(--red)}.checks li.bad::before{content:"!";color:var(--red)}
+#gpa .calc>.grid2{grid-template-columns:minmax(0,1fr)}
+#c-table{min-width:680px}
+#c-table td,#c-table th{font-size:12.5px;padding:5px 8px}
+#c-table td.mono{font-family:var(--mono);white-space:nowrap}
+.e820{list-style:none;padding:0;margin:4px 0;font:12px/1.8 var(--mono)}
+.layers{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:8px 0 14px}
+.layers .card p{font-size:13px;margin:4px 0}
+@media (max-width:780px){.layers{grid-template-columns:1fr}}
+.own{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--soft)}
+.own svg{width:100%;height:auto;display:block}
+.own .box{fill:var(--card);stroke:var(--line);stroke-width:1.3}
+.own .box.k{fill:var(--blue-bg);stroke:#3b72e0}
+.own .box.r{fill:var(--green-bg);stroke:#16a34a}
+.own .box.bad{fill:var(--red-bg);stroke:#d93636}
+.own .box.note{fill:none;stroke:#8b949e;stroke-dasharray:5 4}
+.own text{fill:var(--text);font:13px var(--sans)}
+.own text.t{font-weight:600}
+.own text.sub{fill:var(--muted);font-size:11.5px}
+.own text.lbl{fill:var(--muted);font:11px var(--mono)}
+.own .e{fill:none;stroke:#8b949e;stroke-width:1.6}
+.own .e.k{stroke:#3b72e0}.own .e.g{stroke:#16a34a}.own .e.bad{stroke:#d93636;stroke-dasharray:6 4}
+.toggle{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:8px}
+.toggle button{font:inherit;font-size:13px;border:0;background:var(--card);color:var(--muted);padding:5px 16px;cursor:pointer}
+.toggle button.active{background:var(--blue);color:#fff}
+.own-cap{font-size:13px;margin:8px 2px 0}
+.order3{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:8px;align-items:stretch;margin:8px 0}
+.order3 .o{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--card)}
+.order3 .o p{font-size:13.5px}
+.order3 .n{font:700 18px var(--mono);color:var(--blue)}
+.order3 .sep{display:flex;align-items:center;color:var(--muted);font-size:20px}
+@media (max-width:780px){.order3{grid-template-columns:1fr}.order3 .sep{justify-content:center;transform:rotate(90deg)}}
+td.rec{background:var(--green-bg)}
+.scen-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 8px}
+.scen-tabs button{font:inherit;font-size:13.5px;border:1px solid var(--line);background:var(--card);color:var(--text);padding:3px 12px;border-radius:999px;cursor:pointer}
+.scen-tabs button.active{background:var(--blue);border-color:var(--blue);color:#fff}
+.effects{font:12.5px var(--mono);color:var(--muted);margin:0 0 8px}
+.seq{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}
+.seq-head,.seq-row{display:grid;grid-template-columns:repeat(5,minmax(0,1fr))}
+.seq-head div{font-size:12px;font-weight:600;color:var(--muted);text-align:center;padding:7px 4px;background:var(--soft);border-bottom:1px solid var(--line)}
+.seq-row{min-height:40px;transition:opacity .2s}
+.seq-row .lane{grid-row:1;background:linear-gradient(var(--line),var(--line)) center/1px 100% no-repeat}
+.seq-row .act{grid-row:1;z-index:1;align-self:center;position:relative;margin-top:5px;margin-bottom:5px;padding:3px 8px;border-radius:6px;font-size:12px;line-height:1.35;text-align:center;border:1px solid #3b72e0;background:var(--blue-bg);cursor:pointer}
+.seq-row .act .sn{display:inline-block;min-width:16px;margin-right:4px;font:600 11px var(--mono);color:var(--muted)}
+.seq-row .act.right::after{content:"";position:absolute;right:-8px;top:50%;transform:translateY(-50%);border-left:7px solid #3b72e0;border-top:4px solid transparent;border-bottom:4px solid transparent}
+.seq-row .act.left::before{content:"";position:absolute;left:-8px;top:50%;transform:translateY(-50%);border-right:7px solid #3b72e0;border-top:4px solid transparent;border-bottom:4px solid transparent}
+.seq-row .act.self{border-style:dashed}
+.seq-row.past .act{background:var(--soft);border-color:var(--line)}
+.seq-row.past .act.right::after{border-left-color:var(--muted)}
+.seq-row.past .act.left::before{border-right-color:var(--muted)}
+.seq-row.current .act{box-shadow:0 0 0 3px rgba(59,114,224,.28);font-weight:600}
+.seq-row.future{opacity:.22}
+.seq-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+.seq-detail{border-left:4px solid var(--blue);background:var(--blue-bg);padding:10px 14px;border-radius:6px;min-height:76px;font-size:14px}
+.seq-detail .note{color:var(--muted);font-size:13px;margin-top:4px}
+.stack{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;margin:8px 0 12px}
+.ly{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:start;border-radius:10px;padding:12px 14px}
+.ly>*{min-width:0}
+.ly.plan{background:var(--blue-bg)}.ly.backing{background:var(--orange-bg)}.ly.policy{background:var(--soft)}
+.ly pre{margin:0 0 6px;background:var(--card)}
+@media (max-width:780px){.ly{grid-template-columns:minmax(0,1fr)}}
+.funnel{display:flex;flex-wrap:wrap;gap:14px;align-items:stretch;margin:8px 0}
+.funnel div{flex:1 1 110px;text-align:center;border:1px solid var(--line);border-radius:8px;padding:8px 6px;background:var(--card);font-weight:600;font-size:13.5px;position:relative}
+.funnel div small{display:block;font-weight:400;color:var(--muted);font-size:12px}
+.funnel div+div::before{content:"→";position:absolute;left:-13px;top:50%;transform:translateY(-50%);color:var(--muted);font-weight:400}
+.flowcard{border-radius:12px;padding:12px 16px;border:1px solid var(--line)}
+.flowcard.bad{background:var(--red-bg);border-color:#d93636}.flowcard.good{background:var(--green-bg);border-color:#16a34a}
+ol.code-steps{margin:6px 0;padding-left:22px;font-size:13.5px}
+ol.code-steps li{margin:4px 0}
+ol.code-steps li span{display:block;color:var(--muted);font-size:12.5px}
+.verdict{font-size:13.5px;font-weight:600;margin-top:8px}
+.imgbar{display:flex;align-items:center;gap:10px;margin:6px 0;font-size:13px}
+.imgbar .name{width:120px;flex:none;color:var(--muted)}
+.imgbar .track{flex:1;height:22px;border-radius:5px;overflow:hidden;display:flex;border:1px solid var(--line);background:var(--card)}
+.imgbar .note{width:230px;flex:none;font-size:12.5px;color:var(--muted)}
+.t-dense{background:#3b72e0}.t-plug{background:#16a34a}
+.t-hole{background:repeating-linear-gradient(45deg,transparent,transparent 5px,rgba(127,127,127,.18) 5px,rgba(127,127,127,.18) 10px)}
+.t-skip{background:repeating-linear-gradient(-45deg,#d5dae0,#d5dae0 4px,transparent 4px,transparent 8px)}
+@media (max-width:780px){.imgbar{flex-wrap:wrap}.imgbar .note{width:100%}}
+.order{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px 12px;align-items:center;margin:8px 0 18px;font-size:13.5px}
+.order .who{font-weight:600;color:var(--muted)}
+.order .chain{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.order .st{border:1px solid var(--line);border-radius:7px;padding:1px 9px;background:var(--card)}
+.order .st.new{border-color:var(--orange);background:var(--orange-bg)}
+.order i,.tabs i{font-style:normal;color:var(--muted)}
+.timeline{position:relative;margin:6px 0 0 40px;padding-left:22px;border-left:2px solid var(--line)}
+.tl{position:relative;margin-bottom:20px}
+.tl::before{content:attr(data-step);position:absolute;left:-64px;top:0;width:52px;height:24px;border-radius:12px;background:var(--blue);color:#fff;font:600 12px/24px var(--mono);text-align:center}
+.tl.opt::before{background:var(--muted)}
+.tl.later::before{background:var(--soft);color:var(--muted);border:1px solid var(--line)}
+.tl h4{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:15.5px}
+.tl-cols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:8px}
+.tl-cols .card{padding:10px 12px}
+.tl-cols h5{margin:0 0 4px;font-size:12px;color:var(--muted)}
+.tl-cols ul{margin:0;padding-left:18px;font-size:13px}
+@media (max-width:780px){.tl-cols{grid-template-columns:1fr}}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}
+.tabs button{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--text);padding:3px 12px;border-radius:7px;cursor:pointer}
+.tabs button.active{background:var(--blue);border-color:var(--blue);color:#fff}
+table.refs td{font-size:12.5px}
+table.refs td:first-child{white-space:nowrap;font-weight:600}
+ol.drift li{margin:6px 0}
+.decision{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:12px}
+.decision h4 .q{display:inline-block;color:var(--muted);font:600 12px var(--mono);margin-right:8px}
+.opt{display:flex;gap:10px;align-items:flex-start;padding:7px 10px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+.opt:hover{background:var(--soft)}
+.opt.selected{border-color:var(--blue);background:var(--blue-bg)}
+.opt input[type=radio]{margin-top:6px;flex:none}
+.opt>span{min-width:0;flex:1;overflow-wrap:anywhere}
+.opt .why{display:block;font-size:12.5px;color:var(--muted)}
+.opt input[type=text]{display:block;font:inherit;font-size:13px;margin-top:4px;width:100%;max-width:420px;padding:3px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--text)}
+label.extra{display:block;font-size:13px;color:var(--muted);margin:8px 0}
+#decide-extra,#decide-out{display:block;width:100%;margin-top:4px;font:13px/1.6 var(--mono);padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);resize:vertical}
+@media (max-width:600px){.seq{overflow-x:auto}}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc" aria-label="目录">
+  <div class="brand">内存阶段计划</div>
+  <a href="#top">摘要</a>
+  <a href="#glossary">术语</a>
+  <a href="#now">1 现状与断裂点</a>
+  <a href="#regions">2 区域模型</a>
+  <a href="#gpa">3 GPA 地址空间</a>
+  <a href="#runtime">4 运行期变化</a>
+  <a href="#virtio-mem">5 virtio-mem 时序</a>
+  <a href="#backend">6 后端三层</a>
+  <a href="#snapshot">7 快照</a>
+  <a href="#roadmap">8 路线图</a>
+  <a href="#types">9 类型路径</a>
+  <a href="#refs">10 源码参照</a>
+  <a href="#drift">11 文档偏差</a>
+  <a href="#decide">12 待你确认</a>
+</nav>
+<main>
+<header class="hero" id="top">
+  <div class="eyebrow">DRAGONBALL-EVOLVED · 下一阶段</div>
+  <h1>内存设施与抽象：本阶段计划</h1>
+  <p class="muted">分支 <code>lifecycle-control</code>（3757132）· 状态 <span class="chip c-warn">待你确认</span> · 尚未改动任何代码</p>
+  <div class="grid3">
+    <div class="card top-blue"><div class="num">1</div><h4>先修所有权</h4><p class="small">快照不再持有 RAM。<code>GuestRam</code> 是唯一所有者，rebuild 按值接收它，所以两台 VM 共用一块 RAM 在类型上就不可能。</p></div>
+    <div class="card top-purple"><div class="num">2</div><h4>区域分种类，窗口进账本</h4><p class="small">启动 RAM、热插 RAM、设备窗口分开建模。设备内存窗口紧跟 RAM，grant 记入 plan，恢复时重放。</p></div>
+    <div class="card top-green"><div class="num">3</div><h4>用 virtio-mem 检验抽象</h4><p class="small">按 chunk 动态绑定 KVM slot。"先解绑 → 再确认 → 最后 unmap"由句柄类型保证。快照持久化放在最后。</p></div>
+  </div>
+  <p class="hint">读法：每节第一行是结论，图在前，细节默认折叠。第 3 节的地址图、第 4 节的所有权图、第 5 节的时序图都可以交互；第 12 节可以直接点选并生成回复。</p>
+</header>
+
+<section id="glossary">
+  <h2><span class="no">术语</span>先对齐几个词</h2>
+  <dl class="gloss">
+    <dt>GPA / HVA</dt><dd>guest 物理地址 / 宿主虚拟地址。</dd>
+    <dt>memslot</dt><dd>KVM 中"一段 GPA → 一段 HVA"的映射条目，按编号管理。已有 slot 只能删除或移动，不能改大小。</dd>
+    <dt>plan</dt><dd>启动前一次算好的布局（纯数据）。快照记录它，恢复时照搬，不重新计算。</dd>
+    <dt>grant / replay</dt><dd>grant 是从值类型账本分到的一段地址或一个 GSI，记在 plan 里；replay 是恢复时在新账本上逐个 reserve 记录过的 grant。</dd>
+    <dt>DMA 视图</dt><dd>设备读写 guest 内存用的 <code>GuestMemoryMmap</code> 值（目前是 <code>SharedGuestMemory</code>），由 <code>Activation</code> 按值交给设备。</dd>
+    <dt>block / chunk</dt><dd>block 是 virtio-mem 插拔的最小单位（默认 2 MiB）；chunk 是本计划新引入的 KVM slot 粒度（默认 128 MiB），一个 chunk 内有任一块已插就保持绑定。</dd>
+    <dt>discard</dt><dd>释放宿主页但保留映射：匿名内存用 <code>MADV_DONTNEED</code>，memfd 用 <code>MADV_REMOVE</code>（等同打洞）。</dd>
+  </dl>
+</section>
+
+<section id="now">
+  <h2><span class="no">1</span>现状与最先断裂的地方</h2>
+  <p class="tldr"><b>结论：</b>账本、所有权结构、"按值交付内存视图"都能沿用。最先断裂的是下图六处，红色编号与下面的列表一一对应。</p>
+  <div class="flow">
+    <div>
+      <h5>spec / API →</h5>
+      <div class="ent bad"><span class="badges"><span class="badge">6</span></span><code>MemoryBacking::{Anonymous, Shared}</code><div class="d">二值枚举</div></div>
+      <div class="ent"><code>memory_mib</code><div class="d">启动 RAM 大小</div></div>
+    </div>
+    <div>
+      <h5>plan（纯）→</h5>
+      <div class="ent bad"><span class="badges"><span class="badge">1</span></span><code>MemoryPlan { backing, regions }</code><div class="d">regions 既是 e820 RAM，又是全部映射</div></div>
+      <div class="ent bad"><span class="badges"><span class="badge">2</span></span><code>ResourceBook { virtio_mmio, legacy_gsi }</code><div class="d">4 GiB 以上没有设备内存池</div></div>
+    </div>
+    <div>
+      <h5>machine（副作用）→</h5>
+      <div class="ent bad"><span class="badges"><span class="badge">3</span></span><code>KvmVm::new(ctx, memory)</code><div class="d">一次绑定全部区域，slot 池用完即弃</div></div>
+      <div class="ent bad"><span class="badges"><span class="badge">5</span></span><code>MmioTransport</code><div class="d"><code>DeviceDesc.config</code> 不可变</div></div>
+      <div class="ent good"><code>Activation.mem</code><div class="d">按值交给设备，可沿用</div></div>
+    </div>
+    <div>
+      <h5>快照</h5>
+      <div class="ent bad"><span class="badges"><span class="badge">4</span></span><code>MachineSnapshot.memory: Arc&lt;GuestMemoryMmap&gt;</code><div class="d">与源机器共用 RAM</div></div>
+      <div class="ent bad"><span class="badges"><span class="badge">4</span></span><code>describe()</code><div class="d">从 <code>FileOffset</code> 是否存在反推后端</div></div>
+    </div>
+  </div>
+  <ol class="breaks">
+    <li><span class="badge">1</span><div><b>区段一身二用。</b><code>pvh::boot_data(&amp;plan.memory.regions)</code> 会把任何新加的区段写成 e820 RAM，而规范要求 virtio-mem 区不出现在 e820 中。<span class="ref">mem/description.tex:29-30</span></div></li>
+    <li><span class="badge">2</span><div><b>没有设备内存窗口。</b>4 GiB 以上没有窗口，也没有对应的池；phys-bits 校验只看 RAM 末端，memslot 校验只数 RAM 段数。<span class="ref">spec.rs:127-144</span></div></li>
+    <li><span class="badge">3</span><div><b>slot 不能在运行期增删。</b>slot 池是 <code>KvmVm::new</code> 里的局部变量；KVM 也不允许修改已有 slot 的大小或 HVA，只能删掉重建。运行期产生的 slot 没有所有者，<code>set_user_memory_region</code> 的 SAFETY 论证也覆盖不到它们。<span class="ref">vm.rs:60-63 · kvm_main.c:2101-2104</span></div></li>
+    <li><span class="badge">4</span><div><b>快照共享 RAM。</b>源机器还活着也能 rebuild，结果两台 VM 共用一块 RAM；<code>describe()</code> 靠 <code>FileOffset</code> 有无反推后端，后端一多就推不出来；测试把快照当作访问 guest RAM 的后门。<span class="ref">memory.rs:60-77 · tests/snapshot.rs:344、458</span></div></li>
+    <li><span class="badge">5</span><div><b>transport 跟不上。</b>配置空间不可变；ConfigGeneration（0x0fc）恒为 0；SHM 寄存器（0xac–0xbc）对不存在的区域返回 0，规范要求返回 −1 / ~0。<span class="ref">mmio.rs:75-97 · transport-mmio.tex:223-236</span></div></li>
+    <li><span class="badge">6</span><div><b>后端是二值枚举。</b>直接往里加 hugepage、文件、预分配、NUMA，就会变成一堆标志位的组合。</div></li>
+  </ol>
+  <h3>够用、可以沿用的部分</h3>
+  <ul class="goods">
+    <li><b>值类型账本</b>：再加一个设备内存池即可。grant 记在设备 plan 里，恢复时 <code>replay</code> 重放，与 virtio-mmio grant 同一种做法。</li>
+    <li><b><code>KvmVm</code> 拥有内存，<code>KvmVcpu</code> 持有 <code>Arc&lt;KvmVm&gt;</code></b>：映射比所有能访问它的 fd 活得久，这个结构可以推广到运行期绑定。</li>
+    <li><b>设备经 <code>Activation</code> 按值拿到视图，并有自己的控制 channel</b>：已经具备"按值下发新视图 + oneshot 确认"的形状。</li>
+    <li><b>vCPU 线程不直接读写 guest 内存</b>：所有访问都经过 KVM，内存变化不需要通知 vCPU 或总线。</li>
+  </ul>
+</section>
+
+<section id="regions">
+  <h2><span class="no">2</span>区域模型：有哪些种类，哪些属于 plan</h2>
+  <p class="tldr"><b>结论：</b>先按"谁拥有映射"分成两类，再按"谁能改变它"决定记在哪里。</p>
+  <div class="owners">
+    <div class="owner machine">
+      <h4>机器拥有的 RAM → <code>GuestRam</code></h4>
+      <div class="items"><span class="pill">启动 RAM</span><span class="pill">virtio-mem 区</span><span class="pill">ACPI DIMM <span class="muted">（A5 之后）</span></span></div>
+      <p class="small">内容就是 guest 状态：快照要转储，热升级要交接。</p>
+    </div>
+    <div class="owner device">
+      <h4>设备拥有的窗口 → 设备自己</h4>
+      <div class="items"><span class="pill">virtio-pmem（文件）</span><span class="pill">virtio-fs DAX 窗口</span></div>
+      <p class="small">内容在外部文件里：设备在 attach 时自己重建映射，不进内存镜像。</p>
+    </div>
+  </div>
+  <div class="tiers">
+    <div class="tier plan"><span class="chip c-plan">plan · guest ABI</span><p>guest 已经观察到、没有 guest 配合就不能改的。快照记录，恢复照搬。</p><p class="small muted">区间、种类；virtio-mem 的 addr / region_size / block_size（规范：只在系统复位时可变）</p></div>
+    <div class="tier dev"><span class="chip c-dev">设备快照 · 协议状态</span><p>guest 经设备协议在运行期改变的。</p><p class="small muted">virtio-mem 的已插块 bitmap、requested_size、usable_region_size。设备复位不得改变块状态，所以它们放在会话之外。</p></div>
+    <div class="tier run"><span class="chip c-run">只在运行期 · 宿主资源</span><p>宿主侧的资源，恢复时重新获得。</p><p class="small muted">slot 号、HVA、fd、哪些页已经 discard</p></div>
+  </div>
+  <div class="tablewrap">
+  <table class="matrix">
+    <thead><tr><th>区域</th><th>所有者</th><th>plan 记录</th><th>运行期 / 设备快照</th><th>KVM slot</th><th>e820</th><th>设备 DMA 视图</th><th>内存镜像</th></tr></thead>
+    <tbody>
+      <tr><td><b>启动 RAM</b></td><td><span class="chip c-plan">机器</span></td><td>区间</td><td class="muted">—</td><td>每段 1 个，静态</td><td><span class="chip c-ok">RAM</span></td><td><span class="chip c-ok">是</span></td><td>全量（memfd 可稀疏）</td></tr>
+      <tr><td><b>virtio-mem 区</b></td><td><span class="chip c-plan">机器</span></td><td>区间、block、chunk</td><td><span class="chip c-dev">bitmap · requested · usable</span></td><td>每个 chunk 1 个，<b>按需绑定</b></td><td><span class="chip c-no">否</span></td><td><span class="chip c-ok">整个区域</span></td><td>只存已插的块</td></tr>
+      <tr class="later"><td><b>ACPI DIMM</b> <span class="chip c-warn">A5 后</span></td><td><span class="chip c-plan">机器</span></td><td>插入时产生新的 plan 值</td><td class="muted">—</td><td>每条 1 个</td><td><span class="chip c-no">否（ACPI）</span></td><td><span class="chip c-warn">是，需要传播</span></td><td>全量</td></tr>
+      <tr><td><b>virtio-pmem</b></td><td><span class="chip c-dev">设备</span></td><td>窗口、路径、只读</td><td class="muted">—</td><td>1 个；只读时加 <code>KVM_MEM_READONLY</code></td><td><span class="chip c-no">否</span></td><td><span class="chip c-no">否</span></td><td>不存，文件即内容</td></tr>
+      <tr><td><b>virtio-fs DAX</b></td><td><span class="chip c-dev">设备</span></td><td>窗口大小</td><td><span class="chip c-dev">子映射表</span></td><td>1 个覆盖整个窗口</td><td><span class="chip c-no">否</span></td><td><span class="chip c-no">否</span></td><td>不存</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout warn">
+    <b>为什么设备窗口不进 DMA 视图（第一版）</b>
+    <p class="small">只读 pmem 的映射如果在视图里，guest 只要让 virtio-blk 往那里写，整个 VMM 就会 SIGSEGV，违反"局部故障就地隔离"。代价是 guest 对 DAX 页做 O_DIRECT 会得到 I/O 错误。firecracker 和 cloud-hypervisor 同样不放；QEMU 则把它们全部纳入地址空间。</p>
+  </div>
+</section>
+
+<section id="gpa">
+  <h2><span class="no">3</span>GPA 地址空间：窗口放在哪，怎样记账</h2>
+  <p class="tldr"><b>结论：</b>设备内存窗口 = <code>[align_up(max(RAM 末端, 4 GiB), 1 GiB), 起点 + min(1 TiB, 物理上限 − 起点))</code>。窗口本身记入 <code>MemoryPlan</code>，每个设备的 grant 记入设备 plan，恢复时 <code>replay</code> 重放。</p>
+  <div class="calc">
+    <div class="controls">
+      <label>启动 RAM（memory_mib）<select id="c-ram"></select></label>
+      <label>virtio-mem 区大小<select id="c-mem"></select></label>
+      <label>virtio-pmem 文件大小<select id="c-pmem"></select></label>
+      <label>guest 物理地址位宽<select id="c-bits"></select></label>
+    </div>
+    <div class="bar" id="c-bar"></div>
+    <div class="axis"><span>0x0</span><span>示意图，不按比例；鼠标停在色块上可看地址</span><span id="c-axis-end"></span></div>
+    <div class="grid2">
+      <div>
+        <h4>区段（与 plan 的计算方式一致）</h4>
+        <div class="tablewrap"><table id="c-table"><thead><tr><th>区段</th><th>起始</th><th>结束（不含）</th><th>大小</th><th>说明</th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div>
+        <h4>纯校验</h4>
+        <ul class="checks" id="c-checks"></ul>
+        <h4 style="margin-top:12px">e820（PVH memmap）</h4>
+        <ul class="e820" id="c-e820"></ul>
+        <p class="small muted">virtio-mem 区和 pmem 窗口都不在 e820 中：guest 只经 virtio 配置空间得知它们。</p>
+      </div>
+    </div>
+  </div>
+  <div class="grid3">
+    <div class="card"><h4>账本</h4><p class="small"><code>ResourceBook</code> 增加 <code>device_memory: AddressPool</code>；<code>resource_book()</code> 改为接收 <code>&amp;MemoryPlan</code>。窗口与 RAM 由同一个纯函数给出，二者不相交由构造保证。</p></div>
+    <div class="card"><h4>对齐</h4><ul class="small"><li>窗口起点、virtio-mem 区：1 GiB</li><li>chunk 128 MiB，block 2 MiB</li><li>pmem / DAX 窗口：2 MiB</li></ul></div>
+    <div class="card"><h4>纯校验（plan 阶段）</h4><ul class="small"><li>全部 grant 末端 ≤ 2<sup>phys_bits</sup></li><li>memslot 预算 = RAM 段数 + Σ chunk 数 + 窗口类设备数 ≤ 32764</li></ul></div>
+  </div>
+  <details><summary>为什么紧跟 RAM，而且不超过 1 TiB</summary>
+    <ul class="small">
+      <li>PVH 直接进入 vmlinux 时没有 <code>KASLR_FLAG</code>（只有 bzImage 解压器会设置它，<span class="ref">boot/compressed/kaslr.c:855</span>），guest 的可热插上限只是 <code>MAX_PHYSMEM_BITS</code>。</li>
+      <li>如果以后支持 A2（bzImage），内存 KASLR 会把上限压到 <code>(ceil(RAM / 1 TiB) + padding) TiB</code>（<span class="ref">mm/kaslr.c:109-110</span>）。kangaroo 的 padding 是 1 TiB；超出的部分 guest 只告警并弃用（这个 6.6 内核回移了 <code>physmem_end</code>）。</li>
+      <li>紧跟 RAM 且不超过 1 TiB，在两种启动方式下都安全。窗口记录在 plan 中，以后改了布局函数也不影响旧快照。</li>
+    </ul>
+  </details>
+  <details><summary>三个参考实现怎么放</summary>
+    <div class="tablewrap"><table>
+      <thead><tr><th></th><th>窗口位置</th><th>记账方式</th></tr></thead>
+      <tbody>
+        <tr><td>firecracker</td><td>固定 [512 GiB, 1 TiB)（<code>past_mmio64_memory</code>）；virtio-mem 128 MiB 对齐，pmem 2 MiB</td><td>整个 <code>ResourceAllocator</code> 序列化进快照</td></tr>
+        <tr><td>cloud-hypervisor</td><td>RAM 之后按 128 MiB 对齐，再留 256 MiB 间隔，一直延伸到物理地址空间顶端</td><td>pmem 地址记为 <code>Resource::MmioAddressRange</code>，恢复时重用</td></tr>
+        <tr><td>QEMU</td><td><code>ROUND_UP(above_4g_end, 1 GiB)</code>；大小 = maxmem − ram + 1 GiB × 插槽数</td><td>选出的地址写回设备属性（<code>addr</code> / <code>memaddr</code>）</td></tr>
+        <tr><td><b>本计划</b></td><td>紧跟 RAM、1 GiB 对齐、≤ 1 TiB</td><td>窗口记入 <code>MemoryPlan</code>，grant 记入设备 plan，<code>replay</code> 重放</td></tr>
+      </tbody>
+    </table></div>
+  </details>
+</section>
+
+<section id="runtime">
+  <h2><span class="no">4</span>运行期变化：分两层处理</h2>
+  <p class="tldr"><b>结论：</b>(a) KVM 绑定用 RAII 句柄表达，本阶段实现；(b) 设备 DMA 视图按值下发、oneshot 确认，等第一个改变视图的消费者出现再实现。vCPU 与总线不涉及。</p>
+  <div class="layers">
+    <div class="card top-blue"><span class="chip c-ok">本阶段实现</span><h4 style="margin-top:6px">(a) KVM 绑定</h4><p><b>谁：</b>拥有该区域的设备（virtio-mem 自己切换 chunk）</p><p><b>何时：</b>chunk 从"没有已插块"变成"有"，或反过来</p><p><b>保证：</b>只有删除 slot 成功，才能拿回映射</p></div>
+    <div class="card top-purple"><span class="chip c-warn">以后实现</span><h4 style="margin-top:6px">(b) 设备 DMA 视图</h4><p><b>谁：</b>每个持有视图的设备，以及 transport</p><p><b>何时：</b>区域增删（ACPI DIMM、pmem 热插、vhost-user / VFIO）</p><p><b>保证：</b>ack 就是"确认无人访问"</p></div>
+    <div class="card top-gray"><span class="chip c-no">不涉及</span><h4 style="margin-top:6px">vCPU 与总线</h4><p>vCPU 线程不直接读写 guest 内存。guest 访问已解绑的 GPA → MMIO 退出 → 总线未命中，读 0、写忽略，VMM 照常运行。</p><p class="muted">对比：firecracker 用 <code>PROT_NONE</code> 保护未插的 slot，VMM 自己误触就会 SIGSEGV。</p></div>
+  </div>
+
+  <h3>谁持有映射</h3>
+  <div class="own">
+    <div class="toggle"><button type="button" data-own="now">现在</button><button type="button" data-own="plan" class="active">计划</button></div>
+    <svg viewBox="0 0 920 384" role="img" aria-label="映射的持有关系">
+      <defs>
+        <marker id="ah-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3b72e0"/></marker>
+        <marker id="ah-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#16a34a"/></marker>
+        <marker id="ah-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d93636"/></marker>
+      </defs>
+      <g id="own-plan">
+        <rect class="box" x="16" y="24" width="224" height="46" rx="8"/><text class="t" x="30" y="44">Machine</text><text class="sub" x="30" y="61">Idle 时由 Vm 拥有</text>
+        <rect class="box" x="16" y="94" width="224" height="46" rx="8"/><text class="t" x="30" y="114">KvmVcpu × N</text><text class="sub" x="30" y="131">含踢出用的复制 fd</text>
+        <rect class="box" x="16" y="164" width="224" height="46" rx="8"/><text class="t" x="30" y="184">Binding × 在用的 chunk 数</text><text class="sub" x="30" y="201">由 virtio-mem 设备任务持有</text>
+        <rect class="box" x="16" y="300" width="224" height="46" rx="8"/><text class="t" x="30" y="320">MachineSnapshot</text><text class="sub" x="30" y="337">纯数据，不持有内存</text>
+        <rect class="box k" x="300" y="20" width="260" height="210" rx="10"/><text class="t" x="316" y="44">KvmVm（Arc 共享）</text>
+        <rect class="box" x="316" y="58" width="228" height="46" rx="7"/><text class="t" x="330" y="78">fd: VmFd</text><text class="sub" x="330" y="95">先声明，先关闭</text>
+        <rect class="box" x="316" y="116" width="228" height="46" rx="7"/><text class="t" x="330" y="136">ram: GuestRam</text><text class="sub" x="330" y="153">唯一所有者，不实现 Clone</text>
+        <text class="sub" x="316" y="190">teardown：vCPU、设备都停下后</text>
+        <text class="sub" x="316" y="208">try_unwrap → 关闭 fd → 交还 GuestRam</text>
+        <rect class="box r" x="650" y="30" width="250" height="40" rx="7"/><text x="664" y="55">Arc&lt;区域&gt; 低端 RAM</text>
+        <rect class="box r" x="650" y="90" width="250" height="40" rx="7"/><text x="664" y="115">Arc&lt;区域&gt; 高端 RAM</text>
+        <rect class="box r" x="650" y="150" width="250" height="40" rx="7"/><text x="664" y="175">Arc&lt;区域&gt; virtio-mem 区</text>
+        <rect class="box" x="650" y="300" width="250" height="46" rx="8"/><text class="t" x="664" y="320">设备视图 GuestMemory</text><text class="sub" x="664" y="337">transport、设备会话</text>
+        <rect class="box note" x="300" y="300" width="260" height="46" rx="8"/><text class="t" x="314" y="320">munmap = 最后一个 Arc 被 drop</text><text class="sub" x="314" y="337">vm-memory 的 MmapRegion 负责</text>
+        <path class="e k" d="M240,47 H298" marker-end="url(#ah-k)"/>
+        <path class="e k" d="M240,117 H298" marker-end="url(#ah-k)"/>
+        <path class="e k" d="M240,187 H298" marker-end="url(#ah-k)"/>
+        <path class="e g" d="M544,139 L648,50" marker-end="url(#ah-g)"/>
+        <path class="e g" d="M544,139 L648,110" marker-end="url(#ah-g)"/>
+        <path class="e g" d="M544,139 L648,170" marker-end="url(#ah-g)"/>
+        <path class="e g" d="M128,210 V262 H610 V178 H648" marker-end="url(#ah-g)"/><text class="lbl" x="320" y="256">Binding 还持有它绑定的那块映射</text>
+        <path class="e g" d="M900,323 H912 V50 H902" marker-end="url(#ah-g)"/>
+        <path class="e g" d="M912,110 H902" marker-end="url(#ah-g)"/>
+        <path class="e g" d="M912,170 H902" marker-end="url(#ah-g)"/>
+        <text class="lbl" x="664" y="286">视图持有每个区域的 Arc</text>
+        <text class="lbl" x="16" y="376">箭头 = 持有一份 Arc 引用；蓝色指向 VM，绿色指向内存映射</text>
+      </g>
+      <g id="own-now" style="display:none">
+        <rect class="box" x="16" y="24" width="224" height="46" rx="8"/><text class="t" x="30" y="44">Machine</text><text class="sub" x="30" y="61">Idle 时由 Vm 拥有</text>
+        <rect class="box" x="16" y="94" width="224" height="46" rx="8"/><text class="t" x="30" y="114">KvmVcpu × N</text><text class="sub" x="30" y="131">含踢出用的复制 fd</text>
+        <rect class="box" x="16" y="164" width="224" height="46" rx="8"/><text class="t" x="30" y="184">MmioTransport.memory</text><text class="sub" x="30" y="201">vCPU 线程上校验队列</text>
+        <rect class="box" x="16" y="234" width="224" height="46" rx="8"/><text class="t" x="30" y="254">Activation / Active.mem</text><text class="sub" x="30" y="271">设备会话</text>
+        <rect class="box bad" x="16" y="304" width="224" height="46" rx="8"/><text class="t" x="30" y="324">MachineSnapshot.memory</text><text class="sub" x="30" y="341">与源机器共用同一块 RAM</text>
+        <rect class="box k" x="300" y="20" width="260" height="150" rx="10"/><text class="t" x="316" y="44">KvmVm（Arc 共享）</text>
+        <rect class="box" x="316" y="58" width="228" height="40" rx="7"/><text class="t" x="330" y="83">fd: VmFd</text>
+        <rect class="box" x="316" y="108" width="228" height="46" rx="7"/><text class="t" x="330" y="128">memory:</text><text class="sub" x="330" y="145">Arc&lt;GuestMemoryMmap&gt;</text>
+        <rect class="box r" x="650" y="90" width="250" height="90" rx="8"/><text class="t" x="664" y="116">GuestMemoryMmap</text><text class="sub" x="664" y="136">整体一个 Arc：低端 RAM + 高端 RAM</text><text class="sub" x="664" y="156">后端由 describe() 从 FileOffset 反推</text>
+        <rect class="box bad" x="650" y="280" width="250" height="70" rx="8"/><text class="t" x="664" y="302">rebuild 可在源机器存活时进行</text><text class="sub" x="664" y="321">→ 两台 VM 共用一块 RAM</text><text class="sub" x="664" y="339">测试也把它当作访问 RAM 的后门</text>
+        <path class="e k" d="M240,47 H298" marker-end="url(#ah-k)"/>
+        <path class="e k" d="M240,117 H298" marker-end="url(#ah-k)"/>
+        <path class="e g" d="M544,131 H648" marker-end="url(#ah-g)"/>
+        <path class="e g" d="M240,187 H600 V150 H648" marker-end="url(#ah-g)"/>
+        <path class="e g" d="M240,257 H612 V160 H648" marker-end="url(#ah-g)"/>
+        <path class="e bad" d="M240,327 H624 V170 H648" marker-end="url(#ah-bad)"/>
+        <text class="lbl" x="16" y="376">箭头 = 持有一份 Arc 引用；红色虚线是问题所在</text>
+      </g>
+    </svg>
+    <p class="own-cap" id="own-cap"></p>
+  </div>
+
+  <h3>"先解绑 → 再确认 → 最后 unmap"由什么保证</h3>
+  <div class="order3">
+    <div class="o"><div class="n">①</div><h4>先解绑</h4><p><code>Binding::unbind(self)</code> 只在删除 slot 的 ioctl 成功后才返回映射；失败就把句柄原样还回去。</p><p class="small muted">KVM 在 ioctl 返回前已执行 <code>synchronize_srcu_expedited</code>（kvm_main.c:1673）。Drop 时删除失败：泄漏映射，绝不 unmap。</p></div>
+    <div class="sep">→</div>
+    <div class="o"><div class="n">②</div><h4>再确认无人访问</h4><p>VMM 内的访问者都通过视图值访问；新视图下发后，各自回 ack，就表示已放弃旧视图。</p><p class="small muted">外部访问者（以后）：vhost-user 对 <code>REM_MEM_REG</code> 的应答、VFIO unmap 的返回。</p></div>
+    <div class="sep">→</div>
+    <div class="o"><div class="n">③</div><h4>最后 unmap</h4><p>munmap 发生在最后一个 <code>Arc</code> 被 drop 时（vm-memory 的 <code>MmapRegion</code>）。</p><p class="small muted">任何还可能访问的一方都持有 <code>Arc</code>，所以不会过早 unmap。</p></div>
+  </div>
+  <pre data-src="src-binding"><code></code></pre>
+  <p class="small muted">slot 号由 <code>Machine</code> 持有的值类型 <code>IdPool&lt;MemSlot&gt;</code> 分配，在 attach 时按 plan 给每个设备预留一段（单一所有者，不需要锁）；slot 号仍不进 plan，也不进快照。绑定由设备自己持有、不经 vmm-main，可避免"设备等 vmm-main 回复，而 vmm-main 在 Busy(pause) 中等这个设备 quiesce"的死锁。</p>
+
+  <h3>视图怎样传给设备：两种方案</h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th></th><th>GuestMemoryAtomic（cloud-hypervisor）</th><th>按值下发 + oneshot ack（建议）</th></tr></thead>
+    <tbody>
+      <tr><td>形态</td><td>共享可变单元（ArcSwap）；读者每次 <code>.memory()</code> 取一份快照</td><td class="rec">设备在自己的循环里收到新视图，替换后回复 ack</td></tr>
+      <tr><td>"确认无人访问"</td><td>无法等待：guard 可被持有任意久，块设备整个会话都持有 <code>Active.mem</code></td><td class="rec">ack 就是确认点</td></tr>
+      <tr><td>与现有代码</td><td>引入第二种风格，也是一个隐藏的共享可变单元</td><td class="rec">与 <code>Activation</code>、协作 quiesce 同一个形状</td></tr>
+      <tr><td>成本</td><td>不需要接线；每次访问多一次原子加载</td><td>每个持有视图的设备处理一条消息；卡住的设备会拖慢屏障，需要超时策略</td></tr>
+      <tr><td>内存安全</td><td>由 Arc 保证</td><td>由 Arc 保证</td></tr>
+    </tbody>
+  </table></div>
+  <details><summary>(b) 落地时：删除一块区域的完整顺序，以及怎样扩展到 vhost-user / VFIO</summary>
+    <ol class="small">
+      <li>guest 弹出该区域（ACPI 协议）。</li>
+      <li>下发不含该区域的新视图，等全部设备 ack；transport 在自己的 <code>Mutex</code> 里同步替换。</li>
+      <li><code>unbind</code>：删除 KVM slot。</li>
+      <li>释放 <code>Arc</code>；最后一个持有者 drop 时 munmap。</li>
+      <li>释放 GPA grant，之后这段地址才能再分配。</li>
+    </ol>
+    <p class="small">扩展到 vhost-user / VFIO 需要两类事件，都按值发送、带 ack，注册时先回放当前状态（参考 cloud-hypervisor 的 <code>ExternalDmaMapping</code>、QEMU 的 <code>RamDiscardListener</code>）：</p>
+    <ul class="small">
+      <li><b>映射变化</b>：新视图加上差异，对应 vhost-user 的 <code>ADD/REM_MEM_REG</code>、VFIO 的 map / unmap。</li>
+      <li><b>区域内的填充变化</b>：virtio-mem 插拔产生的 Populated / Discarded 范围；VFIO 只应钉住已插的块。</li>
+    </ul>
+  </details>
+</section>
+
+<section id="virtio-mem">
+  <h2><span class="no">5</span>virtio-mem：插拔时序</h2>
+  <p class="tldr"><b>结论：</b>纯核 <code>handle()</code> 返回新状态和<b>有序的</b>副作用列表，外壳按顺序执行。插入时先 Bind 再 ACK；拔出时先 Unbind，再 discard，最后 ACK。</p>
+  <div class="scen-tabs" id="scen-tabs"></div>
+  <p class="effects" id="scen-effects"></p>
+  <div class="seq" id="seq"></div>
+  <div class="seq-controls">
+    <button type="button" class="btn ghost" id="seq-prev">← 上一步</button>
+    <button type="button" class="btn" id="seq-next">下一步 →</button>
+    <button type="button" class="btn ghost" id="seq-all">全部显示</button>
+    <span class="small muted" id="seq-pos"></span>
+  </div>
+  <div class="seq-detail" id="seq-detail"></div>
+  <div class="callout bad"><b>对照：cloud-hypervisor 的顺序是反的</b><p class="small">拔出时先 discard、后做 DMA unmap；插入时先改 bitmap 再 map，中途失败也不回滚（virtio-devices/src/mem.rs:518-556）。本计划用纯核的副作用列表固定顺序，并在单测里断言。</p></div>
+  <details><summary>设备层面的几个要点</summary>
+    <ul class="small">
+      <li><b>要求 guest 协商 <code>VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE</code></b>：协商后 guest 不得访问未插的块，才能把空 chunk 从 KVM 解绑。kangaroo-6.6 的驱动支持它（virtio_mem.c:3443-3448）；firecracker 同样强制要求。</li>
+      <li><b>块状态放在会话之外</b>：规范要求设备复位不得改变块的插拔状态（mem/description.tex:174），所以 bitmap 属于设备任务本身，而不属于某一次激活。</li>
+      <li><b>插拔状态只存一份</b>：按块记在 <code>MemState</code> 里，chunk 是否绑定由它推出。firecracker 按 slot 和按块各存一份，恢复时也不核对两者。</li>
+      <li><b>未插的 chunk 仍保持映射（只是 discard 过）</b>：guest 违反协议的 DMA 只会重新分配宿主页（上限是区域大小），不会让 VMM 崩溃。</li>
+      <li><b>放在 io 线程</b>：ioctl 和 madvise 可能耗时毫秒级，不能阻塞 vmm-main（D5）。</li>
+      <li><b>transport 要改</b>：配置空间改为由设备发布、transport 读取；实现 ConfigGeneration（0x0fc）和配置变更中断。</li>
+    </ul>
+  </details>
+</section>
+
+<section id="backend">
+  <h2><span class="no">6</span>后端：分三层，避免一堆标志位</h2>
+  <p class="tldr"><b>结论：</b>按"谁能观察到它"分三层；只有一个建映射的入口，只有一个 <code>discard</code>。virtio-mem 用现有两种后端就够了，类型拆分等 hugetlb 落地时再做。</p>
+  <div class="stack">
+    <div class="ly plan"><div><span class="chip c-plan">guest 能观察到</span><h4 style="margin-top:6px">plan</h4></div><div class="small">区间、种类、virtio-mem 的 block / chunk。属于 guest ABI，快照记录，恢复照搬。</div></div>
+    <div class="ly backing"><div><span class="chip c-run">宿主：页从哪来</span><h4 style="margin-top:6px">Backing</h4></div><div><pre data-src="src-backing"><code></code></pre><p class="small">没有非法状态：匿名私有映射配大页就是 <code>MAP_HUGETLB</code>；<code>File</code> 的页大小由所在文件系统决定。是否有 fd（vhost-user 和交接需要）、用哪种 discard、对齐要求，都由纯函数从它推出。</p></div></div>
+    <div class="ly policy"><div><span class="chip c-no">宿主：怎样准备页</span><h4 style="margin-top:6px">MemoryPolicy</h4></div><div><pre data-src="src-policy"><code></code></pre><p class="small">不是 guest ABI，恢复时可以另选。</p></div></div>
+  </div>
+  <h3>唯一的建映射入口</h3>
+  <div class="funnel">
+    <div>预留对齐的 VA<small>2 MiB / 1 GiB</small></div>
+    <div>mmap<small>MAP_FIXED 映射 backing</small></div>
+    <div>madvise<small>THP、DONTDUMP</small></div>
+    <div>mbind<small>NUMA 绑定</small></div>
+    <div>populate<small>预分配，放 blocking 线程</small></div>
+  </div>
+  <p class="small muted">先 mbind 再预分配，是 QEMU <code>host_memory_backend_memory_complete</code> 采用的顺序；预留 VA 再 <code>MAP_FIXED</code> 参考 firecracker 的 <code>RawGuestRegionMmap</code>。大块预分配不放在 vmm-main，不扩大 D5 的例外。</p>
+  <h3>唯一的 <code>discard(range)</code></h3>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Backing</th><th>做法</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>匿名（私有）</td><td><code>MADV_DONTNEED</code></td><td>再访问得到零页</td></tr>
+      <tr><td>memfd / 文件（共享）</td><td><code>MADV_REMOVE</code>（等同打洞）</td><td>会发出 <code>UFFD_EVENT_REMOVE</code>（firecracker 的选择）。现有的 <code>SHRINK | GROW | SEAL</code> 封印不阻止打洞，只有写封印会（shmem.c:3741）</td></tr>
+      <tr><td>hugetlb</td><td>只释放整页</td><td>边缘不足一页的部分不释放</td></tr>
+    </tbody>
+  </table></div>
+  <p class="small muted">cloud-hypervisor 的 virtio-mem 和 balloon 各写了一套 discard，两者已经不一致；firecracker 只有一个 <code>discard_range</code>。</p>
+</section>
+
+<section id="snapshot">
+  <h2><span class="no">7</span>快照：先修所有权，区域模型先于持久化</h2>
+  <p class="tldr"><b>结论：</b>本阶段第一步就让快照不再持有 RAM。持久化放在最后，因为内存镜像只是区域模型的一个投影。</p>
+  <div class="grid2">
+    <div class="flowcard bad">
+      <h4>现在</h4>
+      <ol class="code-steps">
+        <li><code>machine.pause().await</code></li>
+        <li><code>let snap = capture(&amp;machine)</code><span>snap.memory 是与机器共用的 Arc</span></li>
+        <li><code>machine.teardown().await</code><span>RAM 由 snap 撑住</span></li>
+        <li><code>rebuild(snap, ctx)</code></li>
+      </ol>
+      <p class="verdict" style="color:var(--red)">第 3 步并非必需：源机器还在运行时也能 rebuild，结果两台 VM 共用一块 RAM。</p>
+    </div>
+    <div class="flowcard good">
+      <h4>计划（M0）</h4>
+      <ol class="code-steps">
+        <li><code>machine.pause().await</code></li>
+        <li><code>let snap = capture(&amp;machine)</code><span>纯数据，不含内存</span></li>
+        <li><code>let ram = machine.teardown().await?</code><span>VM fd 和全部 vCPU fd 关闭后才交还</span></li>
+        <li><code>rebuild(snap, ram, ctx)</code><span>按值消费 GuestRam</span></li>
+      </ol>
+      <p class="verdict" style="color:var(--green)">没有 GuestRam 就无法 rebuild；同一块 GuestRam 不可能被用两次。</p>
+    </div>
+  </div>
+  <h3>内存镜像 = 区域模型的投影</h3>
+  <div class="imgbar"><span class="name">启动 RAM</span><span class="track"><span class="t-dense" style="flex:1"></span></span><span class="note">全量；memfd 用 SEEK_DATA 跳过空洞</span></div>
+  <div class="imgbar"><span class="name">virtio-mem 区</span><span class="track"><span class="t-plug" style="flex:2"></span><span class="t-hole" style="flex:1"></span><span class="t-plug" style="flex:1"></span><span class="t-hole" style="flex:3"></span><span class="t-plug" style="flex:1"></span><span class="t-hole" style="flex:4"></span></span><span class="note">只存已插的块（由设备快照里的 bitmap 决定）</span></div>
+  <div class="imgbar"><span class="name">pmem / DAX</span><span class="track"><span class="t-skip" style="flex:1"></span></span><span class="note">不进镜像：文件即内容，或由设备重建</span></div>
+  <p class="small muted">如果先定镜像格式，就会把"所有区域都是稠密 RAM"固化进去，所以持久化排在区域模型和 virtio-mem 之后。</p>
+  <div class="grid3">
+    <div class="card"><h4>持久化（M5）</h4><ul class="small"><li><code>MachineSnapshot</code> 加版本头与 CRC（firecracker：bitcode + CRC64，只认同一主版本）</li><li>一个稀疏镜像文件，manifest 显式记录每段的文件偏移（firecracker、cloud-hypervisor 都由区段顺序隐含偏移，镜像没有头和版本）</li><li>恢复先做 Copy；<code>MAP_PRIVATE</code> 写时复制和 uffd 以后再加</li></ul></div>
+    <div class="card"><h4>热升级（E10）</h4><p class="small">memfd 后端时，<code>GuestRam::into_fds(self)</code> 交出所有权，借 API 已有的 fd 传递机制发出去；新进程用 <code>GuestRam::adopt</code> 接收，全程零拷贝。cloud-hypervisor 的本地迁移就是逐个 slot 发送 memfd。</p></div>
+    <div class="card"><h4>dirty tracking（最后）</h4><p class="small">KVM 侧：只改已有 slot 的 flags（kvm_main.c:2108-2109 允许）。VMM 侧：视图的 bitmap 类型参数从 <code>()</code> 换成 <code>Option&lt;AtomicBitmap&gt;</code>。slot 号不持久化，所以脏页按 GPA 区间记录。</p></div>
+  </div>
+</section>
+
+<section id="roadmap">
+  <h2><span class="no">8</span>路线图：每一步都可运行、可验证</h2>
+  <p class="tldr"><b>结论：</b>骨架与你的顺序一致（区域模型 → 消费者 → 持久化），有三处调整：所有权修正提前（M0）、运行期 slot 机制单独成步（M2）、消费者选 virtio-mem。</p>
+  <div class="order">
+    <span class="who">你的顺序</span>
+    <span class="chain"><span class="st">区域模型 + 设备窗口</span><i>→</i><span class="st">最小真实消费者</span><i>→</i><span class="st">快照持久化</span></span>
+    <span class="who">本计划</span>
+    <span class="chain"><span class="st new">M0 所有权</span><i>→</i><span class="st">M1 区域模型</span><i>→</i><span class="st new">M2 slot 机制</span><i>→</i><span class="st">M3 virtio-mem</span><i>→</i><span class="st">M4 pmem（可选）</span><i>→</i><span class="st">M5 持久化</span></span>
+  </div>
+  <div class="timeline">
+    <div class="tl" data-step="M0">
+      <h4>所有权与视图拆分 <span class="chip c-run">调整：提前</span></h4>
+      <p class="small muted">改动小，修掉一个已知隐患，删掉 <code>describe()</code>，也给后面的绑定和持久化确定了所有者类型。M0 和 M1 互不依赖，如果你想先做纯数据部分，两者可以对调。</p>
+      <div class="tl-cols">
+        <div class="card"><h5>内容</h5><ul><li><code>GuestRam</code>（唯一所有者）和视图类型；两处 <code>SharedGuestMemory</code> 合并为一个</li><li><code>KvmVm { fd, ram }</code> 与 <code>into_ram</code>；<code>teardown</code> 交还 RAM</li><li>快照去掉 memory 字段，<code>rebuild</code> 按值接收 RAM；删除 <code>describe()</code></li></ul></div>
+        <div class="card"><h5>验证</h5><ul><li>两种后端的 round-trip 改为 teardown → rebuild</li><li>"内存比 VM 与 vCPU 活得久"</li><li>vCPU 还没退出时，teardown 交不出 RAM</li></ul></div>
+        <div class="card"><h5>可运行性</h5><ul><li>功能不变</li><li>测试改用 <code>Machine::memory()</code> 访问 guest RAM</li></ul></div>
+      </div>
+    </div>
+    <div class="tl" data-step="M1">
+      <h4>区域模型与设备内存窗口 <span class="chip c-plan">纯数据</span></h4>
+      <div class="tl-cols">
+        <div class="card"><h5>内容</h5><ul><li><code>MemoryPlan { backing, ram, device_window }</code>、<code>layout::device_window</code></li><li><code>ResourceBook.device_memory</code>；<code>replay</code> 覆盖内存类 grant</li><li>校验 phys-bits 与 slot 预算；e820 只取启动 RAM</li></ul></div>
+        <div class="card"><h5>验证（单测）</h5><ul><li>窗口位置与对齐（RAM ≤ 3 GiB / &gt; 3 GiB）</li><li>池耗尽；replay 拒绝越窗与重叠</li><li>e820 不含热插区；slot 预算</li></ul></div>
+        <div class="card"><h5>可运行性</h5><ul><li>还没有设备使用窗口，行为不变</li></ul></div>
+      </div>
+    </div>
+    <div class="tl" data-step="M2">
+      <h4>运行期 memslot 绑定 <span class="chip c-run">调整：从消费者中拆出</span></h4>
+      <p class="small muted">先用 mini guest 验证所有权顺序，再叠加 virtio-mem 的协议复杂度。</p>
+      <div class="tl-cols">
+        <div class="card"><h5>内容</h5><ul><li><code>Binding</code>、<code>KvmVm::bind</code></li><li><code>Machine</code> 持有值类型的 <code>IdPool&lt;MemSlot&gt;</code></li></ul></div>
+        <div class="card"><h5>验证（真实 KVM）</h5><ul><li>mini guest 循环读一个运行期区间（放在 4 GiB 以下，32 位 guest 才能访问）：绑定前读到 0 且 VMM 不退出 → 绑定后读到标记 → 解绑后再读到 0</li><li>用 <code>Weak</code> 证明映射在解绑后才释放</li><li>注入非法 slot，验证泄漏路径</li></ul></div>
+        <div class="card"><h5>可运行性</h5><ul><li>只新增 API</li></ul></div>
+      </div>
+    </div>
+    <div class="tl" data-step="M3">
+      <h4>virtio-mem：第一个真实消费者</h4>
+      <p class="small muted">选它而不是 pmem：运行期 slot 变化、部分填充区域的快照、运行期 API、按后端 discard，这几处都是抽象最可能断的地方，virtio-mem 全部覆盖。pmem 只检验静态窗口，M1 的单测已经覆盖大半。</p>
+      <div class="tl-cols">
+        <div class="card"><h5>内容</h5><ul><li>纯核 <code>MemState</code> / <code>handle()</code></li><li>设备任务（io 线程、协作 quiesce）；<code>machine/mem.rs</code> 纵切</li><li>transport：可变配置、ConfigGeneration、配置中断</li><li>按 chunk 绑定，按后端 discard；API；<code>DeviceSnapshot::Mem</code></li></ul></div>
+        <div class="card"><h5>验证</h5><ul><li>纯核单测：对齐、超出 requested、副作用顺序、设备复位不改块状态</li><li>设备测试扮演 guest 驱动；KVM 测试观察 chunk 绑定</li><li>同进程 round-trip 保留已插块</li><li>真实 Linux（kangaroo-6.6）：调大后 MemTotal 增加；调小（<code>memhp_default_state=online_movable</code>）后减少、宿主 RSS 回落</li></ul></div>
+        <div class="card"><h5>可运行性</h5><ul><li>不配置 virtio-mem 时与之前一致</li></ul></div>
+      </div>
+    </div>
+    <div class="tl opt" data-step="M4">
+      <h4>virtio-pmem <span class="chip c-no">可选，第二个消费者</span></h4>
+      <div class="tl-cols">
+        <div class="card"><h5>内容</h5><ul><li>设备拥有的文件映射（<code>MAP_SHARED</code>；只读时加 <code>KVM_MEM_READONLY</code>）</li><li>io 线程上处理 flush；不进 DMA 视图；快照只记配置</li></ul></div>
+        <div class="card"><h5>验证</h5><ul><li>guest 中 <code>mount -o dax</code>，读到宿主写入的标记</li><li>guest 写只读 pmem 被丢弃，VMM 不退出</li></ul></div>
+        <div class="card"><h5>可运行性</h5><ul><li>新增一种设备</li></ul></div>
+      </div>
+    </div>
+    <div class="tl" data-step="M5">
+      <h4>快照持久化</h4>
+      <div class="tl-cols">
+        <div class="card"><h5>内容</h5><ul><li>带版本与 CRC 的序列化</li><li>稀疏镜像 + manifest；Copy 恢复</li><li><code>HandoverState</code> 交接 memfd</li></ul></div>
+        <div class="card"><h5>验证</h5><ul><li>跨进程恢复 mini guest 与 virtio-mem 插拔状态</li><li>快照损坏或版本不符时拒绝恢复</li><li>交接 memfd 后，新进程继续运行</li></ul></div>
+        <div class="card"><h5>可运行性</h5><ul><li>新增能力</li></ul></div>
+      </div>
+    </div>
+    <div class="tl later" data-step="之后">
+      <h4>以后再做</h4>
+      <p class="small">hugetlb / 预分配 / NUMA（同时拆分后端类型）· dirty tracking · 视图传播与 listener（A5 的 DIMM、G5 的 vhost-user / VFIO）· balloon（复用同一个 discard）</p>
+    </div>
+  </div>
+</section>
+
+<section id="types">
+  <h2><span class="no">9</span>代表性路径：spec → plan → machine 的类型</h2>
+  <p class="tldr"><b>结论：</b>以启动 RAM + virtio-mem 为例，点击下面的阶段切换代码。</p>
+  <div class="tabs" id="type-tabs"></div>
+  <pre id="type-code"><code></code></pre>
+  <p class="small muted" id="type-note"></p>
+</section>
+
+<section id="refs">
+  <h2><span class="no">10</span>源码参照</h2>
+  <p class="tldr"><b>结论：</b>按主题列出三个参考实现中对应的文件与类型。路径相对于 <code>.references/&lt;项目&gt;/</code>；firecracker 的路径再相对于 <code>src/vmm/src/</code>。</p>
+  <div class="tablewrap"><table class="refs">
+    <thead><tr><th>主题</th><th>firecracker</th><th>cloud-hypervisor</th><th>QEMU</th></tr></thead>
+    <tbody>
+      <tr><td>区域类型</td><td><code>vstate/memory.rs</code>：<code>GuestRegionType{Dram,Hotpluggable}</code>、<code>GuestRegionMmapExt{slot_from,slot_size,plugged}</code>、<code>RawGuestRegionMmap</code></td><td><code>vmm/src/memory_manager.rs</code>：<code>MemoryManager</code>、<code>MemoryZone</code>、<code>VirtioMemZone</code>、<code>GuestRamMapping</code>；<code>vm-device/src/lib.rs</code>：<code>UserspaceMapping</code></td><td><code>include/system/memory.h</code>：<code>MemoryRegion</code>、<code>FlatView</code></td></tr>
+      <tr><td>GPA 窗口</td><td><code>arch/x86_64/layout.rs</code>：<code>MMIO64_MEM_START</code>；<code>vstate/resources.rs</code>：<code>ResourceAllocator.past_mmio64_memory</code>；<code>builder.rs</code>：<code>allocate_virtio_mem_address</code></td><td><code>memory_manager.rs</code>：<code>start_of_device_area</code>、<code>HOTPLUG_RAM_ALIGN_SIZE</code>；<code>device_manager.rs</code>：<code>create_mmio_allocators</code></td><td><code>hw/i386/pc.c</code>：<code>pc_get_device_memory_range</code>；<code>hw/mem/memory-device.c</code>：<code>memory_device_get_free_addr</code></td></tr>
+      <tr><td>slot 管理</td><td><code>vstate/vm.rs</code>：<code>next_kvm_slot</code>；<code>memory.rs</code>：<code>update_slot</code>（698-740：先可访问再加入 KVM，先移出 KVM 再保护）</td><td><code>vm-allocator/src/memory_slot.rs</code>：<code>MemorySlotAllocator</code>；<code>create_userspace_mapping</code> / <code>remove_userspace_mapping</code></td><td><code>accel/kvm/kvm-all.c</code>：<code>KVMSlot</code>、<code>kvm_set_phys_mem</code>、<code>kvm_region_commit</code></td></tr>
+      <tr><td>变化传播</td><td>无：映射是静态的，激活时克隆一份</td><td><code>GuestMemoryAtomic</code> + <code>DeviceManager::update_memory</code> 扇出</td><td>RCU <code>FlatView</code> + <code>MemoryListener</code>；<code>include/system/ram-discard-manager.h</code></td></tr>
+      <tr><td>virtio-mem</td><td><code>devices/virtio/mem/{device,request,persist}.rs</code>：<code>VirtioMem</code>；<code>vmm_config/memory_hotplug.rs</code>：<code>MemoryHotplugConfig</code></td><td><code>virtio-devices/src/mem.rs</code>：<code>Mem</code>、<code>BlocksState</code>、<code>VirtioMemMappingSource</code>、<code>MemState</code></td><td><code>hw/virtio/virtio-mem.c</code>：<code>virtio_mem_set_block_state</code>、<code>dynamic-memslots</code></td></tr>
+      <tr><td>virtio-pmem</td><td><code>devices/virtio/pmem/device.rs</code>：<code>PmemMmap</code>、<code>KvmMemSlot</code>（drop 顺序）、<code>GuestPmemRegion</code></td><td><code>device_manager.rs</code>：<code>make_virtio_pmem_device</code>；<code>virtio-devices/src/pmem.rs</code></td><td><code>hw/virtio/virtio-pmem.c</code></td></tr>
+      <tr><td>后端</td><td><code>vmm_config/machine_config.rs</code>：<code>HugePageConfig</code>；<code>memory.rs</code>：<code>memory_region_from_range</code>、<code>discard_range</code>、<code>MemfdBacking</code></td><td><code>vmm/src/vm_config.rs</code>：<code>MemoryConfig</code>、<code>MemoryZoneConfig</code>；<code>create_ram_region(_raw)</code>；<code>vmm/src/prefault.rs</code></td><td><code>include/system/hostmem.h</code>：<code>HostMemoryBackend</code>；<code>backends/hostmem.c</code>：<code>host_memory_backend_memory_complete</code></td></tr>
+      <tr><td>快照与交接</td><td><code>memory.rs</code>：<code>GuestMemoryState</code>、<code>dump</code> / <code>dump_dirty</code>；<code>persist.rs</code>：<code>GuestRegionUffdMapping</code>；<code>snapshot/mod.rs</code>：版本 + CRC</td><td><code>MemoryManagerSnapshotData</code>、<code>memory_range_table</code>、三种恢复模式；<code>vmm/src/{uffd,sparse,pagemap}.rs</code>；<code>vm-migration/src/protocol.rs</code>：<code>MemoryRangeTable</code>；<code>vm.rs</code>：<code>send_memory_fds</code></td><td class="muted">未调研</td></tr>
+      <tr><td>vhost-user</td><td><code>devices/virtio/vhost_user.rs</code>：<code>update_mem_table</code>（只在激活时发一次）</td><td><code>virtio-devices/src/vhost_user/vu_common_ctrl.rs</code>：<code>update_mem_table</code> / <code>add_memory_region</code></td><td><code>hw/virtio/vhost.c</code>：<code>vhost_commit</code>；<code>hw/virtio/vhost-user.c</code>：<code>vhost_user_add_remove_regions</code></td></tr>
+    </tbody>
+  </table></div>
+  <details><summary>我亲自核对过的依据</summary>
+    <ul class="small">
+      <li><code>kangaroo-6.6/virt/kvm/kvm_main.c</code>：1673、2075-2116 行（删除 slot 时的 SRCU 同步；已有 slot 不能改大小或 HVA）</li>
+      <li><code>include/linux/kvm_host.h:696-697</code> 与 <code>arch/x86/include/asm/kvm_host.h:57</code>：x86 的用户 slot 上限是 32767 − 3 = 32764</li>
+      <li><code>arch/x86/mm/kaslr.c:97-110</code>、<code>arch/x86/boot/compressed/kaslr.c:855</code>：内存 KASLR 只在 bzImage 启动时生效</li>
+      <li><code>mm/memory_hotplug.c:1863-1880</code>：可热插的地址范围；<code>mm/shmem.c:3741</code>：只有写封印会阻止打洞</li>
+      <li><code>drivers/virtio/virtio_mem.c:3443-3448</code>：驱动支持 <code>UNPLUGGED_INACCESSIBLE</code></li>
+      <li><code>specs/virtio-1.4</code>：<code>mem/description.tex</code>、<code>pmem/description.tex</code>、<code>transport-mmio.tex:218-236</code></li>
+      <li>kangaroo-6.6 的 <code>.config</code>：<code>VIRTIO_MEM</code>、<code>VIRTIO_PMEM</code>、<code>VIRTIO_BALLOON</code>、<code>MEMORY_HOTPLUG/HOTREMOVE</code>、<code>ZONE_DEVICE</code>、<code>FS_DAX</code>、<code>FUSE_DAX</code> 均为 y</li>
+      <li>firecracker <code>memory.rs:698-740</code>（<code>update_slot</code> 的顺序）、<code>mem/device.rs:712-724</code>（强制要求 <code>UNPLUGGED_INACCESSIBLE</code>）；cloud-hypervisor <code>mem.rs:518-556</code>（discard 先于 DMA unmap）</li>
+    </ul>
+  </details>
+</section>
+
+<section id="drift">
+  <h2><span class="no">11</span>design.md 与代码的不一致</h2>
+  <p class="tldr"><b>结论：</b>一共六处，实施各步骤时顺手修正文档。</p>
+  <ol class="small drift">
+    <li><code>devices/virtio/mod.rs:19-23</code> 的注释预设"运行期增长要用 <code>GuestMemoryAtomic</code>"，与本计划的方向相反。</li>
+    <li><code>SharedGuestMemory</code> 在 <code>machine/memory.rs:20</code> 和 <code>devices/virtio/mod.rs:23</code> 各定义了一次，而 §6.7 只列出一个。</li>
+    <li>§6.7 把 <code>describe()</code> 描述为"实际映射出的 plan"，但它只在"恰好两种后端、且每段都是 RAM"时成立；<code>MemoryPlan.backing</code> 与 <code>plan.spec.memory_backing</code> 重复。</li>
+    <li>§6.6 和 B1 说 memslot "从 <code>IdPool&lt;MemSlot&gt;</code> 分配"，实际上这个池只是 <code>KvmVm::new</code> 里的局部变量，构建完就丢弃了。</li>
+    <li>§8.4 没有说明 transport 不实现 SHM 寄存器和 ConfigGeneration 寄存器。</li>
+    <li>附录 A 仍以 <code>/fuu.code/kernel-5.10/.config</code> 为准，但冒烟测试用的已是 kangaroo-6.6，而且没有列出内存设备所需的内核选项。</li>
+  </ol>
+</section>
+
+<section id="decide">
+  <h2><span class="no">12</span>待你确认</h2>
+  <p class="tldr"><b>结论：</b>推荐项已经预选。按你的想法改完后点"生成回复"，把文字粘回对话即可。</p>
+  <div id="decide-form"></div>
+  <label class="extra">其他意见（可选）<textarea id="decide-extra" rows="3" placeholder="例如：M0 与 M1 对调；chunk 默认改为 1 GiB……"></textarea></label>
+  <div class="seq-controls">
+    <button type="button" class="btn" id="decide-gen">生成回复</button>
+    <button type="button" class="btn ghost" id="decide-copy">复制</button>
+    <span class="small muted" id="decide-status"></span>
+  </div>
+  <textarea id="decide-out" rows="9" readonly aria-label="生成的回复"></textarea>
+  <p class="small muted">确认后，我会在 <code>lifecycle-control</code> 之上新建分支，从路线图的第一步开始实现，每一步一个可独立验证的提交。</p>
+</section>
+
+
+<footer>生成于 2026-10-26 · 基于 <code>lifecycle-control</code> @ 3757132 · 依据 <code>.references/</code> 下的 firecracker、cloud-hypervisor、QEMU、kangaroo-6.6 源码与 virtio 1.4 规范 · 本页不改动任何代码</footer>
+</main>
+</div>
+<script type="text/plain" id="src-binding">
+pub struct Binding {
+    vm: Arc<KvmVm>,                 // 删除 slot 需要 VM fd
+    slot: MemSlot,
+    range: GpaRange,
+    mapping: Arc<GuestRegionMmap>,  // KVM 可能访问期间，映射一直活着
+}
+
+impl KvmVm {
+    /// range 必须落在本 VM 自己的 GuestRam 内：设备绑不了别处的内存。
+    pub fn bind(self: &Arc<Self>, slot: MemSlot, range: GpaRange) -> Result<Binding>;
+}
+
+impl Binding {
+    /// 删除 slot 成功才交还映射；失败则原样还回句柄（仍处于绑定状态）。
+    pub fn unbind(self) -> Result<Arc<GuestRegionMmap>, (Self, anyhow::Error)>;
+}
+
+impl Drop for Binding {
+    // 尽力删除 slot；删除失败就泄漏映射，绝不 unmap KVM 仍能访问的内存。
+}
+</script>
+<script type="text/plain" id="src-backing">
+pub enum Backing {
+    Anonymous(Pages),  // 私有、无 fd；Huge 即 MAP_HUGETLB
+    Memfd(Pages),      // 共享、有 fd；Huge 即 MFD_HUGETLB
+    File(PathBuf),     // 共享、有 fd；页大小由文件系统决定
+}
+
+pub enum Pages {
+    Base { thp: bool },  // THP 只对基础页有意义
+    Huge(HugePageSize),  // 2 MiB / 1 GiB
+}
+</script>
+<script type="text/plain" id="src-policy">
+pub struct MemoryPolicy {
+    pub prealloc: bool,
+    pub numa: Option<HostNodes>,  // mbind 到宿主节点集合
+}
+</script>
+<script type="text/plain" id="src-api">
+// 名称待定
+pub struct SetMemoryHotplug(pub MemoryHotplugConfig);  // .machine.memory_hotplug，启动前
+pub struct MemoryHotplugConfig {
+    pub size_mib: u32,
+    pub block_size_mib: Option<u32>,
+    pub chunk_size_mib: Option<u32>,
+}
+pub struct ResizeMemory(pub HotplugSizeMib);           // 运行期，只改 requested_size
+</script>
+<script type="text/plain" id="src-spec">
+pub struct MachineSpec {
+    pub memory_mib: u32,
+    pub memory_backing: MemoryBacking,
+    pub devices: Vec<DeviceSpec>,
+    // …
+}
+pub enum DeviceSpec { Block(BlockSpec), Mem(MemSpec) }
+pub struct MemSpec { pub id: String, pub size: u64, pub block_size: u64, pub chunk_size: u64 }
+</script>
+<script type="text/plain" id="src-plan">
+pub struct MemoryPlan {
+    pub backing: MemoryBacking,
+    pub ram: Vec<GpaRange>,        // 启动 RAM：只有它进 e820
+    pub device_window: GpaRange,   // 记录下来，replay 按它重放
+}
+pub enum DevicePlan { Block(BlockPlan), Mem(MemPlan) }
+pub struct MemPlan {
+    pub id: String,
+    pub transport: VirtioMmioGrant,
+    pub region: GpaRange,          // 从 device_memory 池分配
+    pub block_size: u64,
+    pub chunk_size: u64,
+}
+pub struct ResourceBook {
+    pub virtio_mmio: AddressPool,
+    pub legacy_gsi: IdPool<Gsi>,
+    pub device_memory: AddressPool,
+}
+pub fn guest_ram(plan: &MachinePlan) -> Vec<RamRange>;  // RamRange { range, kind: Boot | Hotplug(id) }
+</script>
+<script type="text/plain" id="src-core">
+// devices/virtio/mem.rs：纯核，无 fd、无 KVM
+pub struct MemState {
+    pub requested: u64,
+    pub usable: u64,
+    pub plugged: BlockBitmap,      // plugged_size 由它推出
+}
+pub enum MemRequest { Plug(BlockRange), Unplug(BlockRange), UnplugAll, State(BlockRange) }
+pub enum MemEffect { Bind(Chunk), Unbind(Chunk), Discard(GpaRange) }
+
+pub fn handle(geometry: &MemGeometry, state: &MemState, request: MemRequest)
+    -> (MemState, MemResponse, Vec<MemEffect>);
+</script>
+<script type="text/plain" id="src-machine">
+pub struct GuestRam {                       // 不实现 Clone
+    layout: Vec<RamRange>,
+    backing: Backing,
+    regions: Vec<Arc<GuestRegionMmap>>,
+}
+pub type GuestMemory = Arc<GuestMemoryMmap>;  // 视图；以后 bitmap 换成 Option<AtomicBitmap>
+
+pub struct KvmVm { fd: VmFd, ram: GuestRam }  // new() 只绑定 Boot 区段
+pub struct Binding { vm: Arc<KvmVm>, slot: MemSlot, range: GpaRange, mapping: Arc<GuestRegionMmap> }
+pub enum AttachedDevice { Block(AttachedBlock), Mem(AttachedMem) }
+
+// virtio-mem 设备任务（io 线程）持有：
+//   MemState、每个 chunk 一个 Option<Binding>、用于 discard 的区域句柄
+</script>
+<script type="text/plain" id="src-snapshot">
+pub enum DeviceSnapshot { Block(BlockSnapshot), Mem(MemSnapshot) }
+pub struct MemSnapshot {
+    pub id: String,
+    pub transport: MmioTransportSnapshot,
+    pub queue: Option<QueueState>,
+    pub state: MemState,
+}
+pub struct MachineSnapshot {               // 不再有 memory 字段
+    pub plan: MachinePlan,
+    pub vm: VmKvmState,
+    pub vcpus: Vec<VcpuSnapshot>,
+    pub platform: PlatformSnapshot,
+    pub devices: Vec<DeviceSnapshot>,
+}
+impl Machine { pub async fn teardown(self) -> Result<GuestRam>; }
+pub fn rebuild(snapshot: MachineSnapshot, ram: GuestRam, context: &KvmContext) -> Result<Machine>;
+</script>
+<script>
+"use strict";
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+// 第 3 节：地址空间计算器，规则与 plan 的纯函数一致
+(function addressSpace() {
+  const KiB = 1024, MiB = 1024 * KiB, GiB = 1024 * MiB, TiB = 1024 * GiB;
+  const MMIO32_START = 3 * GiB, MMIO32_END = 4 * GiB, HIMEM_START = MiB;
+  const SYSTEM_MEM_START = 0x9fc00, SYSTEM_MEM_END = 0xe0000;
+  const CHUNK = 128 * MiB, MEM_ALIGN = GiB, PMEM_ALIGN = 2 * MiB;
+  const WINDOW_ALIGN = GiB, WINDOW_MAX = TiB, MAX_SLOTS = 32764;
+  const COLORS = { ram: "#3b72e0", hole: "#7b8794", mem: "#16a34a", pmem: "#8b3fd9", free: "#bfe8cf", err: "#d93636", unused: "#d5dae0", beyond: "#d5dae0", win: "transparent" };
+  const alignUp = (value, align) => Math.ceil(value / align) * align;
+  const hex = n => {
+    const digits = n.toString(16);
+    const groups = [];
+    for (let end = digits.length; end > 0; end -= 4) groups.unshift(digits.slice(Math.max(0, end - 4), end));
+    return "0x" + groups.join("_");
+  };
+  const size = n => {
+    for (const [unit, scale] of [["TiB", TiB], ["GiB", GiB], ["MiB", MiB], ["KiB", KiB]]) {
+      if (n >= scale) {
+        const v = n / scale;
+        return (Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")) + " " + unit;
+      }
+    }
+    return n + " B";
+  };
+  const choices = {
+    "c-ram": [[128, "128 MiB（缺省）"], [512, "512 MiB（冒烟测试）"], [2048, "2 GiB"], [3072, "3 GiB"], [4096, "4 GiB"], [16384, "16 GiB"], [262144, "256 GiB"], [1048576, "1 TiB"]],
+    "c-mem": [[0, "不配置"], [1024, "1 GiB"], [4096, "4 GiB"], [16384, "16 GiB"], [65536, "64 GiB"], [2097152, "2 TiB（超出窗口）"]],
+    "c-pmem": [[0, "不配置"], [2048, "2 GiB"], [8192, "8 GiB"]],
+    "c-bits": [[39, "39 位（部分 Intel 客户端）"], [43, "43 位"], [46, "46 位"], [48, "48 位（常见 AMD）"]],
+  };
+  const defaults = { "c-ram": 4096, "c-mem": 4096, "c-pmem": 2048, "c-bits": 48 };
+
+  function plan(ramMiB, memMiB, pmemMiB, bits) {
+    const ramSize = ramMiB * MiB;
+    const ram = ramSize <= MMIO32_START
+      ? [[0, ramSize]]
+      : [[0, MMIO32_START], [MMIO32_END, MMIO32_END + ramSize - MMIO32_START]];
+    const ramEnd = ram[ram.length - 1][1];
+    const limit = 2 ** bits;
+    const winStart = alignUp(Math.max(ramEnd, MMIO32_END), WINDOW_ALIGN);
+    const winEnd = Math.max(winStart, Math.min(winStart + WINDOW_MAX, limit));
+    const grants = [];
+    let cursor = winStart;
+    if (memMiB > 0) {
+      const len = alignUp(memMiB * MiB, CHUNK);
+      const start = alignUp(cursor, MEM_ALIGN);
+      grants.push({ kind: "mem", start, end: start + len, slots: len / CHUNK });
+      cursor = start + len;
+    }
+    if (pmemMiB > 0) {
+      const len = alignUp(pmemMiB * MiB, PMEM_ALIGN);
+      const start = alignUp(cursor, PMEM_ALIGN);
+      grants.push({ kind: "pmem", start, end: start + len, slots: 1 });
+    }
+    const slots = ram.length + grants.reduce((n, g) => n + g.slots, 0);
+    return { ram, ramEnd, limit, bits, winStart, winEnd, grants, slots };
+  }
+
+  function segments(p) {
+    const low = p.ram[0][1];
+    const list = [{ cls: "ram", name: "低端 RAM", start: 0, end: low, weight: 3, note: "e820 RAM（启动 RAM 第 1 段）" }];
+    if (low < MMIO32_START) list.push({ cls: "unused", name: "未用", start: low, end: MMIO32_START, weight: 1, note: "不在 e820，也没有映射" });
+    list.push({ cls: "hole", name: "32 位 MMIO 空洞", start: MMIO32_START, end: MMIO32_END, weight: 2.2, note: "virtio-mmio 窗口 16 MiB（每个设备一个 4 KiB grant）、IOAPIC、LAPIC、TSS" });
+    if (p.ram.length > 1) list.push({ cls: "ram", name: "高端 RAM", start: MMIO32_END, end: p.ramEnd, weight: 3, note: "e820 RAM（启动 RAM 第 2 段）" });
+    const afterRam = Math.max(p.ramEnd, MMIO32_END);
+    if (p.winStart > afterRam) list.push({ cls: "unused", name: "对齐间隙", start: afterRam, end: p.winStart, weight: 0.8, note: "窗口起点按 1 GiB 对齐" });
+    if (p.winEnd <= p.winStart) {
+      list.push({ cls: "err", name: "没有窗口", start: p.winStart, end: p.winStart, weight: 4, note: "物理地址位宽不足：plan 阶段报错" });
+      return list;
+    }
+    const span = p.winEnd - p.winStart;
+    const inner = [];
+    let cursor = p.winStart;
+    for (const g of p.grants) {
+      const over = g.end > p.winEnd;
+      const name = g.kind === "mem" ? "virtio-mem 区" : "virtio-pmem 窗口";
+      const note = g.kind === "mem"
+        ? `grant → MemPlan.region；${g.slots} 个 chunk，即 ${g.slots} 个可按需绑定的 slot；不在 e820`
+        : "grant → PmemPlan.window；设备拥有的文件映射；2 MiB 对齐";
+      const shown = Math.max(Math.min(g.end, p.winEnd) - g.start, 0);
+      inner.push({ cls: over ? "err" : g.kind, name, start: g.start, end: g.end, weight: Math.max(shown / span, 0.18) * 10, note: over ? "超出窗口：plan 阶段报错（池耗尽）" : note });
+      cursor = Math.max(cursor, g.end);
+    }
+    if (cursor < p.winEnd) inner.push({ cls: "free", name: "窗口空闲", start: cursor, end: p.winEnd, weight: Math.max((p.winEnd - cursor) / span, 0.2) * 10, note: "device_memory 池中可继续分配的部分" });
+    list.push({ cls: "win", name: "设备内存窗口", start: p.winStart, end: p.winEnd, weight: 6, inner, note: "记入 MemoryPlan.device_window" });
+    if (p.winEnd < p.limit) list.push({ cls: "beyond", name: "窗口之外", start: p.winEnd, end: p.limit, weight: 0.9, note: "不分配" });
+    return list;
+  }
+
+  function render() {
+    const value = id => Number(document.getElementById(id).value);
+    const p = plan(value("c-ram"), value("c-mem"), value("c-pmem"), value("c-bits"));
+    const list = segments(p);
+    const bar = $("#c-bar");
+    const tbody = $("#c-table tbody");
+    bar.replaceChildren();
+    tbody.replaceChildren();
+    const addSeg = (parent, s) => {
+      const node = el("div", "seg " + s.cls);
+      node.style.flex = `${s.weight} 1 0`;
+      node.title = `${s.name}\n${hex(s.start)} – ${hex(s.end)}（${size(s.end - s.start)}）\n${s.note}`;
+      if (s.inner) {
+        s.inner.forEach(child => addSeg(node, child));
+      } else {
+        node.append(el("b", "", s.name), el("small", "", size(s.end - s.start)));
+      }
+      parent.append(node);
+    };
+    const addRow = (s, child) => {
+      const tr = el("tr");
+      const name = el("td");
+      const swatch = el("span", "swatch");
+      swatch.style.background = COLORS[s.cls];
+      if (s.cls === "win") swatch.style.boxShadow = "inset 0 0 0 2px #16a34a";
+      name.append(swatch, document.createTextNode((child ? "└ " : "") + s.name));
+      const start = el("td", "mono", hex(s.start));
+      const end = el("td", "mono", hex(s.end));
+      const len = el("td", "mono", size(s.end - s.start));
+      const note = el("td", "muted", s.note);
+      tr.append(name, start, end, len, note);
+      tbody.append(tr);
+    };
+    for (const s of list) {
+      addSeg(bar, s);
+      addRow(s, false);
+      (s.inner || []).forEach(child => addRow(child, true));
+    }
+    const memSlots = p.grants.filter(g => g.kind === "mem").reduce((n, g) => n + g.slots, 0);
+    const pmemSlots = p.grants.filter(g => g.kind === "pmem").length;
+    const checks = [
+      [p.ramEnd <= p.limit, `RAM 末端 ${hex(p.ramEnd)} ≤ 2^${p.bits}（现有校验）`],
+      [p.winEnd > p.winStart, `窗口 ${hex(p.winStart)} – ${hex(p.winEnd)}：${size(Math.max(p.winEnd - p.winStart, 0)) || "0"}，起点 1 GiB 对齐，≤ 1 TiB`],
+      ...p.grants.map(g => [g.end <= p.winEnd, `${g.kind === "mem" ? "virtio-mem 区" : "pmem 窗口"}${g.end <= p.winEnd ? "落在窗口内" : "超出窗口：地址池耗尽，plan 将拒绝该配置"}`]),
+      [p.slots <= MAX_SLOTS, `memslot 预算 ${p.slots} / ${MAX_SLOTS}（RAM ${p.ram.length} 段 + virtio-mem ${memSlots} 个 chunk + pmem ${pmemSlots}）`],
+    ];
+    $("#c-checks").replaceChildren(...checks.map(([ok, text]) => el("li", ok ? "" : "bad", text)));
+    const e820 = [[0, SYSTEM_MEM_START, "RAM"], [SYSTEM_MEM_START, SYSTEM_MEM_END, "reserved"]];
+    for (const [start, end] of p.ram) {
+      const from = Math.max(start, HIMEM_START);
+      if (from < end) e820.push([from, end, "RAM"]);
+    }
+    $("#c-e820").replaceChildren(...e820.map(([s, e, t]) => el("li", "", `${hex(s)} – ${hex(e)}  ${t}`)));
+    $("#c-axis-end").textContent = `2^${p.bits} = ${hex(p.limit)}`;
+  }
+
+  for (const [id, list] of Object.entries(choices)) {
+    const select = document.getElementById(id);
+    for (const [value, label] of list) {
+      const option = el("option", "", label);
+      option.value = String(value);
+      option.selected = value === defaults[id];
+      select.append(option);
+    }
+    select.addEventListener("change", render);
+  }
+  render();
+})();
+// 代码块：源码放在 type="text/plain" 的脚本块里，免去手工转义尖括号
+for (const pre of $$("pre[data-src]")) {
+  const source = document.getElementById(pre.dataset.src);
+  if (source) pre.querySelector("code").textContent = source.textContent.replace(/^\n+|\s+$/g, "");
+}
+
+// 第 4 节：所有权图在"现在 / 计划"之间切换
+(function ownership() {
+  const captions = {
+    now: "现在：所有持有者都指向同一个 Arc<GuestMemoryMmap>。快照也是持有者之一，所以源机器还活着时也能 rebuild。",
+    plan: "计划：映射的唯一所有者是 KvmVm 里的 GuestRam；Binding 和设备视图只持有各区域的 Arc；快照不持有内存，teardown 之后才交还 GuestRam。",
+  };
+  const show = which => {
+    $$("[data-own]").forEach(button => button.classList.toggle("active", button.dataset.own === which));
+    $("#own-now").style.display = which === "now" ? "" : "none";
+    $("#own-plan").style.display = which === "plan" ? "" : "none";
+    $("#own-cap").textContent = captions[which];
+  };
+  $$("[data-own]").forEach(button => button.addEventListener("click", () => show(button.dataset.own)));
+  show("plan");
+})();
+// 第 5 节：virtio-mem 时序步进器。每步为 [起点泳道, 终点泳道, 箭头标签, 说明, 补充]
+(function sequence() {
+  const LANES = ["客户端 / vmm-main", "virtio-mem 设备任务", "KVM", "宿主映射", "guest 驱动"];
+  const SCENARIOS = [
+    { name: "插入", effects: "纯核输出：effects = [Bind(k)]（chunk k 原本没有已插块）", steps: [
+      [4, 1, "PLUG(addr, n)", "guest 驱动经 virtqueue 发出 PLUG 请求。", "请求本身位于普通 RAM，设备用激活时拿到的视图读取。"],
+      [1, 1, "handle() 校验", "纯核 handle()：块对齐、范围在 usable_region_size 内、插入后不超过 requested_size、范围内全部未插 → effects = [Bind(k)]。", "任何一条不满足 → 回 ERROR / NACK，状态不变。纯函数，单测覆盖。"],
+      [1, 2, "Bind(k)：创建 slot", "执行 Bind(k)：Binding::bind(slot_k, chunk k) → KVM_SET_USER_MEMORY_REGION 创建 slot。slot 号在 attach 时已按 plan 预留。", "失败 → 回 ERROR，状态不变（事务性）。"],
+      [1, 1, "提交新状态", "提交新的 MemState：bitmap 置位；plugged_size 由 bitmap 推出。", "其他设备的 DMA 视图不用更新：整个区域从启动起就在视图里。"],
+      [1, 4, "ACK + 中断", "写 used ring、触发中断，回 ACK。", "ACK 之前 slot 已经存在，guest 一开始使用就能访问。"],
+      [4, 3, "首次访问才分配页", "guest 上线这些内存块并开始使用；宿主页在首次访问时才分配。", "区域以 MAP_NORESERVE 映射，没碰过的页不占宿主内存。"],
+    ]},
+    { name: "拔出（chunk 拔空）", effects: "纯核输出：effects = [Unbind(k), Discard(range)]（拔完后 chunk k 不再有已插块）", steps: [
+      [4, 4, "下线、迁走页面", "guest 先把这些块下线，并把上面的页迁走。", "协议要求：请求拔出时，这些块已经不再使用。"],
+      [4, 1, "UNPLUG(addr, n)", "guest 驱动发出 UNPLUG 请求。", ""],
+      [1, 1, "handle() 校验", "纯核 handle()：范围内全部已插 → effects = [Unbind(k), Discard(range)]。", "以后接 VFIO 时，列表最前面再加 Notify(Discarded)，并等外部 ack。"],
+      [1, 2, "Unbind(k)：删除 slot", "binding.unbind()：删除 slot。KVM 在 ioctl 返回前完成 SRCU 同步，之后才拿回映射句柄。", "删除失败 → 句柄原样还回，回 ERROR；内存保持映射和绑定。"],
+      [1, 3, "discard(range)", "按后端 discard：匿名内存用 MADV_DONTNEED，memfd 用 MADV_REMOVE。", "先解绑再 discard：避免 guest 在两步之间经 KVM 把刚释放的页又分配回来。"],
+      [1, 1, "提交新状态", "提交新的 MemState：bitmap 清位。", ""],
+      [1, 4, "ACK + 中断", "回 ACK。", "此后 guest 再访问 chunk k → MMIO 退出 → 总线未命中，读 0、写忽略，VMM 照常运行。"],
+    ]},
+    { name: "拔出（chunk 仍有已插块）", effects: "纯核输出：effects = [Discard(range)]（chunk k 保持绑定）", steps: [
+      [4, 1, "UNPLUG(addr, n)", "guest（已下线这些块）发出 UNPLUG 请求。", ""],
+      [1, 1, "handle() 校验", "纯核 handle()：拔完后 chunk k 仍有已插块 → effects = [Discard(range)]，不解绑。", ""],
+      [1, 3, "discard(range)", "只释放这几个块的宿主页，chunk 的 slot 保持不变。", "guest 若违反协议再访问这些块，会重新分配宿主页，但上限是一个 chunk（默认 128 MiB）。"],
+      [1, 1, "提交新状态", "提交新的 MemState。", ""],
+      [1, 4, "ACK + 中断", "回 ACK。", ""],
+    ]},
+    { name: "调整 requested_size", effects: "运行期 API 只改配置、不直接插拔；插拔由 guest 发起", steps: [
+      [0, 0, "ResizeMemory(n MiB)", "客户端经 API 请求把热插内存调整到 n MiB（名称待定）。", "只在 Running 时接受。"],
+      [0, 1, "Resize(requested)", "vmm-main 经设备控制 channel 下发新的 requested_size，等待 oneshot 回复。", "与协作 quiesce 同一个形状：设备在自己的循环里用 &mut 处理。"],
+      [1, 1, "发布新配置", "设备更新 requested_size / usable_region_size，发布新配置，并把 ConfigGeneration 加一。", "transport 改为读取设备发布的配置（现在 DeviceDesc.config 不可变）。"],
+      [1, 4, "配置变更中断", "设备触发配置变更中断。", ""],
+      [1, 0, "回复 Ok", "设备回复；vmm-main 回复客户端 Ok。", "不等待 guest 完成插拔；进度可以通过查询接口看到。"],
+      [4, 1, "PLUG / UNPLUG …", "guest 读到新配置，按差值发起 PLUG / UNPLUG，见前三个场景。", ""],
+    ]},
+  ];
+  let scenario = 0, position = 0, showAll = false;
+  const tabs = $("#scen-tabs");
+  SCENARIOS.forEach((s, index) => {
+    const button = el("button", "", s.name);
+    button.type = "button";
+    button.addEventListener("click", () => { scenario = index; position = 0; showAll = false; render(); });
+    tabs.append(button);
+  });
+  $("#seq-prev").addEventListener("click", () => { showAll = false; position = Math.max(0, position - 1); render(); });
+  $("#seq-next").addEventListener("click", () => { showAll = false; position = Math.min(SCENARIOS[scenario].steps.length - 1, position + 1); render(); });
+  $("#seq-all").addEventListener("click", () => { showAll = !showAll; render(); });
+
+  function render() {
+    const s = SCENARIOS[scenario];
+    $$("button", tabs).forEach((button, index) => button.classList.toggle("active", index === scenario));
+    $("#scen-effects").textContent = s.effects;
+    const seq = $("#seq");
+    seq.replaceChildren();
+    const head = el("div", "seq-head");
+    LANES.forEach(name => head.append(el("div", "", name)));
+    seq.append(head);
+    s.steps.forEach(([from, to, label], index) => {
+      const state = showAll ? "" : index < position ? "past" : index === position ? "current" : "future";
+      const row = el("div", "seq-row " + state);
+      LANES.forEach((_, column) => {
+        const lane = el("div", "lane");
+        lane.style.gridColumn = String(column + 1);
+        row.append(lane);
+      });
+      const first = Math.min(from, to), last = Math.max(from, to), span = last - first + 1;
+      const act = el("div", "act " + (from === to ? "self" : to > from ? "right" : "left"));
+      act.style.gridColumn = `${first + 1} / ${last + 2}`;
+      const inset = from === to ? "6%" : `calc(50% / ${span})`;
+      act.style.marginLeft = inset;
+      act.style.marginRight = inset;
+      act.append(el("span", "sn", String(index + 1)), document.createTextNode(label));
+      act.addEventListener("click", () => { showAll = false; position = index; render(); });
+      row.append(act);
+      seq.append(row);
+    });
+    const [, , , text, note] = s.steps[position];
+    const detail = $("#seq-detail");
+    detail.replaceChildren(el("b", "", `第 ${position + 1} 步　`), document.createTextNode(text));
+    if (note) detail.append(el("div", "note", note));
+    $("#seq-pos").textContent = showAll ? "已全部显示，点任一步可单独查看" : `${position + 1} / ${s.steps.length}`;
+    $("#seq-prev").disabled = position === 0;
+    $("#seq-next").disabled = position === s.steps.length - 1;
+    $("#seq-all").textContent = showAll ? "逐步显示" : "全部显示";
+  }
+  render();
+})();
+// 第 9 节：类型路径标签页
+(function typePath() {
+  const STAGES = [
+    ["API", "src-api", "启动前的配置与运行期操作；名称待定。"],
+    ["spec", "src-spec", "纯数据；按 kind 增加 DeviceSpec::Mem。"],
+    ["plan", "src-plan", "纯数据；快照记录，恢复时 replay，不重新计算。"],
+    ["纯核", "src-core", "devices/virtio/mem.rs：没有 fd 和 KVM，单测直接断言副作用的顺序。"],
+    ["machine", "src-machine", "副作用外壳：映射、绑定、设备任务。"],
+    ["快照", "src-snapshot", "快照不再有 memory 字段；RAM 经 teardown 交还，再按值交给 rebuild。"],
+  ];
+  const tabs = $("#type-tabs");
+  const show = index => {
+    const [, source, note] = STAGES[index];
+    $$("button", tabs).forEach((button, i) => button.classList.toggle("active", i === index));
+    $("#type-code code").textContent = document.getElementById(source).textContent.replace(/^\n+|\s+$/g, "");
+    $("#type-note").textContent = note;
+  };
+  STAGES.forEach(([name], index) => {
+    if (index > 0) tabs.append(el("i", "", "→"));
+    const button = el("button", "", name);
+    button.type = "button";
+    button.addEventListener("click", () => show(index));
+    tabs.append(button);
+  });
+  show(2);
+})();
+// 第 12 节：可点选的决定，生成可粘回对话的回复
+(function decisions() {
+  const DECISIONS = [
+    { id: "consumer", q: "第一个真实消费者", options: [
+      { label: "virtio-mem", rec: true, why: "覆盖运行期 slot 变化、部分填充区域的快照、运行期 API、按后端 discard" },
+      { label: "virtio-pmem", why: "实现更小，但只检验静态窗口" },
+    ]},
+    { id: "granularity", q: "virtio-mem 的 KVM 绑定粒度", options: [
+      { label: "按 chunk 动态绑定（firecracker 的做法）", rec: true, why: "强制 UNPLUGGED_INACCESSIBLE；guest 碰不到未插的内存；本阶段就能验证运行期 slot 机制" },
+      { label: "整个区域一个 slot（cloud-hypervisor 的做法）", why: "实现最简单；但 guest 可以访问未插的内存，可能占满整个区域大小的宿主内存" },
+    ]},
+    { id: "window", q: "设备内存窗口", options: [
+      { label: "紧跟 RAM、1 GiB 对齐、≤ 1 TiB、窗口记入 plan", rec: true, why: "布局紧凑；PVH 和将来的 bzImage 启动方式下都安全" },
+      { label: "固定窗口（如 firecracker 的 [512 GiB, 1 TiB)）", why: "与 RAM 大小无关；但要求物理地址位宽 ≥ 40" },
+    ]},
+    { id: "m0", q: "M0（所有权修正）的位置", options: [
+      { label: "放在最前", rec: true, why: "改动小、修掉已知隐患，后续步骤直接基于新的所有者类型" },
+      { label: "排在 M1（纯数据）之后", why: "先做纯数据部分；两者互不依赖" },
+    ]},
+    { id: "backends", q: "hugetlb / 预分配 / NUMA", options: [
+      { label: "本阶段只做设计，实现放到 M5 之后", rec: true, why: "virtio-mem 用现有两种后端就够了" },
+      { label: "本阶段也实现", why: "工作量增加，并要同时扩展 API 的 MemoryBacking" },
+    ]},
+    { id: "naming", q: "API 命名", options: [
+      { label: "SetMemoryHotplug(MemoryHotplugConfig) + ResizeMemory(…)", rec: true, why: "操作用动词命名，配置用名词命名" },
+      { label: "我另定名字", custom: true },
+    ]},
+  ];
+  const host = $("#decide-form");
+  const mark = () => $$(".opt", host).forEach(row => row.classList.toggle("selected", row.querySelector("input[type=radio]").checked));
+  DECISIONS.forEach((decision, index) => {
+    const box = el("div", "decision");
+    const title = el("h4");
+    title.append(el("span", "q", String(index + 1)), document.createTextNode(decision.q));
+    box.append(title);
+    decision.options.forEach((option, optionIndex) => {
+      const row = el("label", "opt");
+      const radio = el("input");
+      radio.type = "radio";
+      radio.name = decision.id;
+      radio.value = String(optionIndex);
+      radio.checked = Boolean(option.rec);
+      const body = el("span");
+      body.append(document.createTextNode(option.label + " "));
+      if (option.rec) body.append(el("span", "chip c-ok", "推荐"));
+      if (option.why) body.append(el("span", "why", option.why));
+      if (option.custom) {
+        const input = el("input");
+        input.type = "text";
+        input.id = decision.id + "-custom";
+        input.placeholder = "写下你想要的名字";
+        input.addEventListener("focus", () => { radio.checked = true; mark(); });
+        body.append(input);
+      }
+      row.append(radio, body);
+      box.append(row);
+    });
+    host.append(box);
+  });
+  host.addEventListener("change", mark);
+  mark();
+
+  const status = $("#decide-status");
+  const output = $("#decide-out");
+  const generate = () => {
+    const lines = ["关于内存阶段计划，我的确认如下："];
+    DECISIONS.forEach((decision, index) => {
+      const checked = host.querySelector(`input[name="${decision.id}"]:checked`);
+      const option = decision.options[Number(checked.value)];
+      const text = option.custom ? ($("#" + decision.id + "-custom").value.trim() || "（未填写）") : option.label;
+      lines.push(`${index + 1}. ${decision.q}：${text}`);
+    });
+    const extra = $("#decide-extra").value.trim();
+    if (extra) lines.push("其他意见：" + extra);
+    output.value = lines.join("\n");
+    status.textContent = "已生成，复制后粘回对话即可";
+  };
+  $("#decide-gen").addEventListener("click", generate);
+  $("#decide-copy").addEventListener("click", async () => {
+    if (!output.value) generate();
+    try {
+      await navigator.clipboard.writeText(output.value);
+      status.textContent = "已复制";
+    } catch {
+      output.focus();
+      output.select();
+      status.textContent = document.execCommand && document.execCommand("copy") ? "已复制" : "请手动复制文本框中的内容";
+    }
+  });
+})();
+
+// 目录：高亮当前阅读的小节
+(function toc() {
+  if (!("IntersectionObserver" in window)) return;
+  const links = new Map($$(".toc a").map(link => [link.getAttribute("href").slice(1), link]));
+  const observer = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      links.forEach(link => link.classList.remove("active"));
+      links.get(entry.target.id)?.classList.add("active");
+    }
+  }, { rootMargin: "-30% 0px -60% 0px" });
+  $$("main > section[id], main > header[id]").forEach(node => observer.observe(node));
+})();
+</script>
+</body>
+</html>
