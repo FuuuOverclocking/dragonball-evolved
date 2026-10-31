@@ -19,7 +19,8 @@ pub use self::build::{BuildError, build};
 pub use self::plan::{MachinePlan, PlanError};
 pub use self::platform::PlatformError;
 pub use self::state::{
-    Machine, PauseError, PausedMachine, QuiescedBlock, QuiescedDevice, ResumeError, TeardownError,
+    FailedMachine, Machine, PauseError, PausedMachine, QuiescedBlock, QuiescedDevice, ResumeError,
+    TeardownError,
 };
 pub use self::vcpu::{ConfigureVcpuError, SetupStep, SpawnVcpuError, VcpuError};
 use crate::devices::runtime::DeviceExits;

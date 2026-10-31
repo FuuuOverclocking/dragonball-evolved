@@ -7,8 +7,8 @@
 //!
 //! A lifecycle operation (Start's first resume, Pause, Resume) owns the
 //! machine as a local future until it finishes on its own; nothing here
-//! cancels one. Generic over the running machine `R` and the paused machine
-//! `P`, so the decisions are tested without KVM.
+//! cancels one. Generic over running `R`, paused `P` and teardown-only failed
+//! `F` owners, so the decisions are tested without KVM.
 
 use std::error::Error;
 use std::future::Future;
@@ -96,20 +96,20 @@ pub(super) struct Live<M> {
 }
 
 /// The machine's lifecycle, as the main loop holds it.
-pub(super) enum Controller<R, P> {
+pub(super) enum Controller<R, P, F> {
     /// No machine yet; the configuration accumulates.
     NotStarted(MachineSpec),
     Running(Live<R>),
     Paused(Live<P>),
     /// An operation owns the machine until it finishes on its own.
-    Busy(Busy<R, P>),
+    Busy(Busy<R, P, F>),
 }
 
 /// The lifecycle operation in flight.
-pub(super) enum Busy<R, P> {
+pub(super) enum Busy<R, P, F> {
     Starting(Starting<R>),
-    Pausing(Transition<R, P, PauseError>),
-    Resuming(Transition<P, R, ResumeError>),
+    Pausing(Transition<P, F, PauseError>),
+    Resuming(Transition<R, F, ResumeError>),
 }
 
 /// Start's first resume of a machine just built.
@@ -124,8 +124,8 @@ pub(super) struct Starting<R> {
     pub(super) operation: Operation<Result<R, StartError>>,
 }
 
-/// Pause or Resume: the machine moving from `F` to `T` inside its own future.
-pub(super) struct Transition<F, T, E> {
+/// Pause or Resume: success yields `T`, CPU failure yields teardown-only `F`.
+pub(super) struct Transition<T, F, E> {
     reply: Reply<ApiResult<()>>,
     /// Listened to while the machine moves.
     pub(super) events: MachineEvents,
@@ -152,14 +152,16 @@ pub(super) enum Exit {
     VcpuFailed { index: u8, error: String },
     /// A failed Start could not tear down its machine; already rendered.
     StartTeardown(String),
-    /// A vCPU transition failed without reporting an exit; already rendered.
+    /// A CPU timed out, panicked or could not be joined; already rendered.
     TransitionFailed(String),
+    /// An exited CPU's fallback, overridden by its real reset/fault event.
+    TransitionExited(String),
 }
 
 /// What the loop does after an input.
-pub(super) enum Next<R, P> {
+pub(super) enum Next<R, P, F> {
     /// Go on serving.
-    Stay(Controller<R, P>),
+    Stay(Controller<R, P, F>),
     /// Build a machine for the spec and start it; answer once it has started.
     Start(MachineSpec, Reply<ApiResult<()>>),
     /// Hand the running machine to a pause.
@@ -168,16 +170,19 @@ pub(super) enum Next<R, P> {
     Resume(Live<P>, Reply<ApiResult<()>>),
     /// Stop taking requests, let the operation in flight finish, tear down
     /// what is left, and end the vmm thread.
-    Exit(Controller<R, P>, Exit),
+    Exit(Controller<R, P, F>, Exit),
+    /// Close admission and tear down a failed transition's sole owner.
+    Terminate(Live<F>, Exit),
 }
 
 /// What is left to tear down once no operation holds the machine.
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Settled<R, P> {
+pub(super) enum Settled<R, P, F> {
     Nothing,
     Running(R),
     Paused(P),
+    Failed(F),
 }
 
 /// A request, grouped by how the lifecycle treats it.
@@ -226,7 +231,7 @@ impl From<VmmRequest> for Request {
     }
 }
 
-impl<R, P> Controller<R, P> {
+impl<R, P, F> Controller<R, P, F> {
     /// What `GetInstanceInfo` reports: while an operation runs, the state it
     /// started from.
     fn state(&self) -> VmState {
@@ -277,12 +282,12 @@ impl<R> Starting<R> {
     }
 }
 
-impl<F, T, E: Error> Transition<F, T, E> {
-    /// Hands the machine to `transition`, keeping its events for the loop.
-    pub(super) fn new(
-        from: Live<F>,
+impl<T, F, E: Error> Transition<T, F, E> {
+    /// Consumes an independent source type, keeping its events for the loop.
+    pub(super) fn new<S>(
+        from: Live<S>,
         reply: Reply<ApiResult<()>>,
-        transition: impl FnOnce(F) -> Operation<Result<T, (F, E)>>,
+        transition: impl FnOnce(S) -> Operation<Result<T, (F, E)>>,
     ) -> Self {
         Self {
             reply,
@@ -291,12 +296,8 @@ impl<F, T, E: Error> Transition<F, T, E> {
         }
     }
 
-    /// Answers the request. Hands the machine back with its events: moved, or
-    /// where it was if the transition failed.
-    ///
-    /// The returned machine's type is authoritative. An exited vCPU reports
-    /// why (reset or failure) through the events; a timeout is fatal rather
-    /// than trusting a vCPU that no longer answers control requests.
+    /// Answers the request and transfers ownership with the event streams.
+    /// Failure never restores the source state; its owner is teardown-only.
     fn finish(self, result: Result<T, (F, E)>) -> Result<Live<T>, Live<F>> {
         let Self { reply, events, .. } = self;
         match result {
@@ -313,22 +314,22 @@ impl<F, T, E: Error> Transition<F, T, E> {
     }
 }
 
-pub(super) fn on_inbound<R, P>(
-    controller: Controller<R, P>,
+pub(super) fn on_inbound<R, P, F>(
+    controller: Controller<R, P, F>,
     inbound: Inbound,
     instance: Instance<'_>,
-) -> Next<R, P> {
+) -> Next<R, P, F> {
     match inbound {
         Inbound::Request(request) => on_request(controller, request, instance),
         Inbound::Detached => on_detached(controller),
     }
 }
 
-pub(super) fn on_request<R, P>(
-    controller: Controller<R, P>,
+pub(super) fn on_request<R, P, F>(
+    controller: Controller<R, P, F>,
     request: VmmRequest,
     instance: Instance<'_>,
-) -> Next<R, P> {
+) -> Next<R, P, F> {
     match Request::from(request) {
         Request::GetInstanceInfo(reply) => {
             reply.send(instance.info(controller.state()));
@@ -387,21 +388,21 @@ pub(super) fn on_request<R, P>(
     }
 }
 
-fn accept<R, P>(controller: Controller<R, P>, reply: Reply<ApiResult<()>>) -> Next<R, P> {
+fn accept<R, P, F>(controller: Controller<R, P, F>, reply: Reply<ApiResult<()>>) -> Next<R, P, F> {
     reply.send(Ok(()));
     Next::Stay(controller)
 }
 
-fn refuse<R, P>(
-    controller: Controller<R, P>,
+fn refuse<R, P, F>(
+    controller: Controller<R, P, F>,
     reply: Reply<ApiResult<()>>,
     rejection: Rejection,
-) -> Next<R, P> {
+) -> Next<R, P, F> {
     reply.send(Err(api_error(&rejection)));
     Next::Stay(controller)
 }
 
-pub(super) fn on_detached<R, P>(controller: Controller<R, P>) -> Next<R, P> {
+pub(super) fn on_detached<R, P, F>(controller: Controller<R, P, F>) -> Next<R, P, F> {
     match controller {
         // Nobody is left to configure or start it.
         not_started @ Controller::NotStarted(_) => Next::Exit(not_started, Exit::Detached),
@@ -427,7 +428,7 @@ fn warn_detached() {
 
 /// The same whatever the state: an operation in flight still finishes, on
 /// the way out.
-pub(super) fn on_event<R, P>(controller: Controller<R, P>, event: Event) -> Next<R, P> {
+pub(super) fn on_event<R, P, F>(controller: Controller<R, P, F>, event: Event) -> Next<R, P, F> {
     match event {
         Event::Machine(MachineEvent::GuestReset) => {
             info_unlimited!("the guest reset; stopping the VMM");
@@ -451,11 +452,11 @@ pub(super) fn on_event<R, P>(controller: Controller<R, P>, event: Event) -> Next
 /// Hands a machine just built to its first resume, or answers why it could
 /// not be built. Nothing of a failed build is left, so the same spec can be
 /// fixed and started again.
-pub(super) fn on_built<R, P>(
+pub(super) fn on_built<R, P, F>(
     spec: MachineSpec,
     reply: Reply<ApiResult<()>>,
     built: Result<(Operation<Result<R, StartError>>, MachineEvents), StartError>,
-) -> Controller<R, P> {
+) -> Controller<R, P, F> {
     match built {
         Ok((operation, events)) => Controller::Busy(Busy::Starting(Starting::new(
             spec, reply, events, operation,
@@ -468,7 +469,10 @@ pub(super) fn on_built<R, P>(
     }
 }
 
-pub(super) fn on_started<R, P>(starting: Starting<R>, result: Result<R, StartError>) -> Next<R, P> {
+pub(super) fn on_started<R, P, F>(
+    starting: Starting<R>,
+    result: Result<R, StartError>,
+) -> Next<R, P, F> {
     let detached = starting.detached;
     let teardown = match &result {
         Err(error @ StartError::Teardown(_)) => Some(render_chain(error)),
@@ -486,48 +490,40 @@ pub(super) fn on_started<R, P>(starting: Starting<R>, result: Result<R, StartErr
     }
 }
 
-pub(super) fn on_paused<R, P>(
-    pausing: Transition<R, P, PauseError>,
-    result: Result<P, (R, PauseError)>,
-) -> Next<R, P> {
+pub(super) fn on_paused<R, P, F>(
+    pausing: Transition<P, F, PauseError>,
+    result: Result<P, (F, PauseError)>,
+) -> Next<R, P, F> {
     let failure = result
         .as_ref()
         .err()
-        .and_then(|(_, error)| transition_failure(error, &error.0));
-    let state = match pausing.finish(result) {
-        Ok(paused) => Controller::Paused(paused),
-        Err(running) => Controller::Running(running),
-    };
-    match failure {
-        Some(exit) => Next::Exit(state, exit),
-        None => Next::Stay(state),
+        .map(|(_, error)| transition_failure(error, &error.0));
+    match pausing.finish(result) {
+        Ok(paused) => Next::Stay(Controller::Paused(paused)),
+        Err(failed) => Next::Terminate(failed, failure.expect("failed CPU transition")),
     }
 }
 
-pub(super) fn on_resumed<R, P>(
-    resuming: Transition<P, R, ResumeError>,
-    result: Result<R, (P, ResumeError)>,
-) -> Next<R, P> {
+pub(super) fn on_resumed<R, P, F>(
+    resuming: Transition<R, F, ResumeError>,
+    result: Result<R, (F, ResumeError)>,
+) -> Next<R, P, F> {
     let failure = result
         .as_ref()
         .err()
-        .and_then(|(_, error)| transition_failure(error, &error.0));
-    let state = match resuming.finish(result) {
-        Ok(running) => Controller::Running(running),
-        Err(paused) => Controller::Paused(paused),
-    };
-    match failure {
-        Some(exit) => Next::Exit(state, exit),
-        None => Next::Stay(state),
+        .map(|(_, error)| transition_failure(error, &error.0));
+    match resuming.finish(result) {
+        Ok(running) => Next::Stay(Controller::Running(running)),
+        Err(failed) => Next::Terminate(failed, failure.expect("failed CPU transition")),
     }
 }
 
-fn transition_failure(error: &dyn Error, vcpu: &VcpuError) -> Option<Exit> {
+pub(super) fn transition_failure(error: &dyn Error, vcpu: &VcpuError) -> Exit {
     match vcpu {
         // Its event distinguishes a normal guest reset from an internal fault.
-        VcpuError::Exited(_) => None,
+        VcpuError::Exited(_) => Exit::TransitionExited(render_chain(error)),
         VcpuError::TimedOut(_) | VcpuError::Panicked(_) | VcpuError::Join { .. } => {
-            Some(Exit::TransitionFailed(render_chain(error)))
+            Exit::TransitionFailed(render_chain(error))
         }
     }
 }
@@ -536,7 +532,7 @@ fn transition_failure(error: &dyn Error, vcpu: &VcpuError) -> Option<Exit> {
 /// request, then hands back the machine left to tear down. The VMM is
 /// stopping, so a Start that fails is not offered again.
 #[cfg(test)]
-pub(super) async fn settle<R, P>(controller: Controller<R, P>) -> Settled<R, P> {
+pub(super) async fn settle<R, P, F>(controller: Controller<R, P, F>) -> Settled<R, P, F> {
     match controller {
         Controller::NotStarted(_) => Settled::Nothing,
         Controller::Running(running) => Settled::Running(running.machine),
@@ -552,14 +548,14 @@ pub(super) async fn settle<R, P>(controller: Controller<R, P>) -> Settled<R, P> 
             let result = (&mut pausing.operation).await;
             match pausing.finish(result) {
                 Ok(paused) => Settled::Paused(paused.machine),
-                Err(running) => Settled::Running(running.machine),
+                Err(failed) => Settled::Failed(failed.machine),
             }
         }
         Controller::Busy(Busy::Resuming(mut resuming)) => {
             let result = (&mut resuming.operation).await;
             match resuming.finish(result) {
                 Ok(running) => Settled::Running(running.machine),
-                Err(paused) => Settled::Paused(paused.machine),
+                Err(failed) => Settled::Failed(failed.machine),
             }
         }
     }
@@ -576,7 +572,9 @@ pub(super) fn exit_status(exit: Exit, teardown: Result<(), TeardownError>) -> Vm
         Exit::VcpuFailed { index, error } => {
             VmmExitStatus::Error(render_chain(&ExitError::VcpuFailed { index, error }))
         }
-        Exit::StartTeardown(error) | Exit::TransitionFailed(error) => VmmExitStatus::Error(error),
+        Exit::StartTeardown(error)
+        | Exit::TransitionFailed(error)
+        | Exit::TransitionExited(error) => VmmExitStatus::Error(error),
     }
 }
 
@@ -607,7 +605,11 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     struct Paused(u32);
 
-    type Fake = Controller<Running, Paused>;
+    /// A failed owner cannot masquerade as either usable machine state.
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakeFailed(u32);
+
+    type Fake = Controller<Running, Paused, FakeFailed>;
     type Answer = oneshot::Receiver<ApiResult<()>>;
 
     const INSTANCE: Instance<'static> = Instance {
@@ -671,7 +673,7 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     fn mock_pause() -> (
-        oneshot::Sender<Result<Paused, (Running, PauseError)>>,
+        oneshot::Sender<Result<Paused, (FakeFailed, PauseError)>>,
         Answer,
         Fake,
     ) {
@@ -683,7 +685,7 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     fn mock_resume() -> (
-        oneshot::Sender<Result<Running, (Paused, ResumeError)>>,
+        oneshot::Sender<Result<Running, (FakeFailed, ResumeError)>>,
         Answer,
         Fake,
     ) {
@@ -693,14 +695,21 @@ mod tests {
         (finish, answer, Controller::Busy(Busy::Resuming(resuming)))
     }
 
-    fn stay(next: Next<Running, Paused>) -> Fake {
+    fn stay(next: Next<Running, Paused, FakeFailed>) -> Fake {
         match next {
             Next::Stay(controller) => controller,
             _ => panic!("expected to stay"),
         }
     }
 
-    fn exit(next: Next<Running, Paused>) -> (Fake, Exit) {
+    fn terminate(next: Next<Running, Paused, FakeFailed>) -> (Live<FakeFailed>, Exit) {
+        match next {
+            Next::Terminate(failed, exit) => (failed, exit),
+            _ => panic!("expected teardown-only ownership"),
+        }
+    }
+
+    fn exit(next: Next<Running, Paused, FakeFailed>) -> (Fake, Exit) {
         match next {
             Next::Exit(controller, exit) => (controller, exit),
             _ => panic!("expected to exit"),
@@ -1013,9 +1022,9 @@ mod tests {
         let (finish, pause_answer, pausing) = mock_pause();
         let (controller, why) = exit(on_event(pausing, Event::Machine(MachineEvent::GuestReset)));
         // The vCPU that reset has exited, so the pause fails.
-        let failed = (Running(1), PauseError(VcpuError::Exited(0)));
+        let failed = (FakeFailed(1), PauseError(VcpuError::Exited(0)));
         finish.send(Err(failed)).unwrap_or_else(|_| panic!());
-        assert_eq!(settle(controller).await, Settled::Running(Running(1)));
+        assert_eq!(settle(controller).await, Settled::Failed(FakeFailed(1)));
         assert_eq!(
             pause_answer.try_recv(),
             Ok(Err(ApiError::msg("pause the vCPUs: vCPU 0 has exited")))
@@ -1024,21 +1033,18 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_transition_answers_and_keeps_the_machine_where_it_came_back() {
+    fn a_failed_transition_answers_and_transfers_only_teardown_ownership() {
         let (_, pause_answer, pausing) = mock_pause();
         let Controller::Busy(Busy::Pausing(pausing)) = pausing else {
             unreachable!()
         };
-        let failed = (Running(2), PauseError(VcpuError::TimedOut(1)));
-        let (controller, why) = exit(on_paused(pausing, Err(failed)));
+        let failed = (FakeFailed(2), PauseError(VcpuError::TimedOut(1)));
+        let (failed, why) = terminate(on_paused(pausing, Err(failed)));
         assert_eq!(
             exit_status(why, Ok(())),
             VmmExitStatus::Error("pause the vCPUs: vCPU 1 did not answer in time".into())
         );
-        let Controller::Running(running) = controller else {
-            panic!("a failed pause did not come back running");
-        };
-        assert_eq!(running.machine, Running(2));
+        assert_eq!(failed.machine, FakeFailed(2));
         assert_eq!(
             pause_answer.try_recv(),
             Ok(Err(ApiError::msg(
@@ -1050,15 +1056,10 @@ mod tests {
         let Controller::Busy(Busy::Resuming(resuming)) = resuming else {
             unreachable!()
         };
-        let failed = (Paused(2), ResumeError(VcpuError::Exited(0)));
-        let controller = stay(on_resumed(resuming, Err(failed)));
-        assert!(matches!(
-            controller,
-            Controller::Paused(Live {
-                machine: Paused(2),
-                ..
-            })
-        ));
+        let failed = (FakeFailed(2), ResumeError(VcpuError::Exited(0)));
+        let (failed, why) = terminate(on_resumed(resuming, Err(failed)));
+        assert_eq!(failed.machine, FakeFailed(2));
+        assert!(matches!(why, Exit::TransitionExited(_)));
         assert_eq!(
             resume_answer.try_recv(),
             Ok(Err(ApiError::msg("resume the vCPUs: vCPU 0 has exited")))

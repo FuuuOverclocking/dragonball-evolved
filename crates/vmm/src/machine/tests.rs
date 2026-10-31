@@ -390,6 +390,29 @@ async fn pause_and_resume_round_trip_the_typestate_on_kvm() {
 }
 
 #[tokio::test(flavor = "local")]
+async fn failed_pause_hands_its_resources_only_to_teardown_on_kvm() {
+    let Some(context) = kvm() else { return };
+    // No exception handler: UD2 triple-faults, exiting KVM and closing ACKs.
+    let kernel = TempFile::new(&elf::image(&[0x0f, 0x0b], true));
+    let (paused, mut events, _) = build(&context, &spec(&kernel, None, vec![]));
+    let layout = paused.plan().memory().clone();
+    let view = std::sync::Arc::downgrade(paused.memory());
+    let running = paused.resume().await.map_err(|(_, error)| error).unwrap();
+    assert_eq!(next_event(&mut events).await, MachineEvent::GuestReset);
+    let (failed, error) = running.pause().await.expect_err("the CPU exited");
+    assert!(matches!(error.0, VcpuError::Exited(0)));
+    let memory = failed.teardown().await.unwrap();
+    assert_eq!(memory.layout(), &layout);
+    assert!(std::sync::Arc::ptr_eq(
+        &view.upgrade().unwrap(),
+        memory.view()
+    ));
+    closed(&mut events).await;
+    drop(memory);
+    assert!(view.upgrade().is_none(), "failed owner retained guest RAM");
+}
+
+#[tokio::test(flavor = "local")]
 async fn teardown_works_from_both_states_on_kvm() {
     let Some(context) = kvm() else { return };
     let kernel = TempFile::new(&elf::image(&LOOP, true));

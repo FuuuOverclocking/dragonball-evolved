@@ -243,8 +243,8 @@ impl Vcpus {
     }
 
     /// Asks every vCPU to pause, and waits at most `within` for all of them.
-    /// A vCPU that does not answer in time still has its `Pause` queued and
-    /// its kick delivered.
+    /// Only an acknowledgement proves the pause barrier was reached; a queued
+    /// command and its kick alone do not prove that the vCPU is parked.
     pub(super) async fn pause(&mut self, within: Duration) -> Result<(), VcpuError> {
         self.request(VcpuCommand::Pause, within).await
     }
@@ -287,18 +287,34 @@ impl Vcpus {
                 (handle.index, answer)
             })
             .collect();
-        let mut first = None;
-        for (index, answer) in answers {
-            let error = match time::timeout_at(deadline, answer).await {
-                Ok(Ok(())) => continue,
-                // The thread has ended, dropping the reply slot with its commands.
-                Ok(Err(_)) => VcpuError::Exited(index),
-                Err(_) => VcpuError::TimedOut(index),
-            };
-            first.get_or_insert(error);
-        }
-        first.map_or(Ok(()), Err)
+        wait_for_replies(answers, deadline).await
     }
+}
+
+/// Waits for the whole cohort under one deadline. An unanswered CPU is fatal
+/// even when another CPU has already exited (possibly because of a reset).
+async fn wait_for_replies(
+    answers: Vec<(u8, oneshot::Receiver<()>)>,
+    deadline: Instant,
+) -> Result<(), VcpuError> {
+    let mut failure = None;
+    for (index, answer) in answers {
+        let error = match time::timeout_at(deadline, answer).await {
+            Ok(Ok(())) => continue,
+            // The thread has ended, dropping the reply slot with its commands.
+            Ok(Err(_)) => VcpuError::Exited(index),
+            Err(_) => VcpuError::TimedOut(index),
+        };
+        if failure.is_none()
+            || matches!(
+                (&failure, &error),
+                (Some(VcpuError::Exited(_)), VcpuError::TimedOut(_))
+            )
+        {
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 /// vmm-main's side of one vCPU thread. Dropping it asks the thread to stop,
@@ -683,6 +699,46 @@ mod tests {
         fn write(&self, _offset: u64, _data: &[u8]) {
             panic!("unexpected MMIO write");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_closed_and_unanswered_replies_prioritize_timeout() {
+        for closed_first in [true, false] {
+            let (closed, exited) = oneshot::channel();
+            drop(closed);
+            let (held, unanswered) = oneshot::channel();
+            let answers = if closed_first {
+                vec![(0, exited), (1, unanswered)]
+            } else {
+                vec![(1, unanswered), (0, exited)]
+            };
+            let result = time::timeout(
+                Duration::from_secs(1),
+                wait_for_replies(answers, Instant::now() + Duration::from_millis(10)),
+            )
+            .await
+            .expect("reply wait exceeded its shared deadline");
+            assert!(matches!(result, Err(VcpuError::TimedOut(1))));
+            drop(held);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_reply_must_acknowledge_before_the_barrier_completes() {
+        use std::future::{Future, poll_fn};
+        use std::pin::pin;
+        use std::task::Poll;
+
+        let (first, first_answer) = oneshot::channel();
+        let (held, held_answer) = oneshot::channel();
+        first.send(()).unwrap();
+        let mut waiting = pin!(wait_for_replies(
+            vec![(0, first_answer), (1, held_answer)],
+            Instant::now() + TIMEOUT,
+        ));
+        assert!(poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
+        held.send(()).unwrap();
+        time::timeout(TIMEOUT, waiting).await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -258,7 +258,7 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
    - 局部故障语义：已退出的设备记为 Exited，pause 照常完成，capture 拒绝。
 4. **PVH 构建**：读文件（副作用）→ 生成启动数据（纯）→ 写入。
 5. **类型态**：
-   - `Machine::pause(self) -> Result<PausedMachine, (Machine, Error)>`；
+   - `Machine::pause(self) -> Result<PausedMachine, (FailedMachine, Error)>`，失败只能拆除；
    - `PausedMachine::resume(self)`；
    - 两种状态都能 teardown；
    - 把 capture 放在 `PausedMachine` 上，留到 P5。
@@ -410,7 +410,7 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
     - 新增确定性批次上限和聚合磁盘越界测试；去掉批次上限/聚合范围检查后对应测试失败，恢复修复后通过。
     - 全量 fmt、clippy、API feature matrix、schema、KVM 测试通过；block 集成测试 25 项。
     - RAM 归还前置修复另提交为 `060d04d`；两组修复合并检查共 349 项测试通过。
-  - [x] **P5b 设备 plan 与机器接线**：
+  - [x] **P5b 设备 plan 与机器接线**（`8a6ecec`）：
     - plan 按设备 ID 键控，单独记录根盘优先的探测顺序；MMIO/GSI grant 分配与 replay 校验，cmdline 从基础文本和记录资源派生。
     - `machine::block::AttachedBlock` 持有 transport、worker、resample 句柄；`assemble_parked` 共用已配置 vCPU 后的设备装配路径；暂停记录逐盘类型化状态。
     - 补齐 replay 的宿主 vCPU/xAPIC 上限检查；回归测试先在旧实现失败，修复后通过。
@@ -418,7 +418,10 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
     - 主会话实际 CLI 验证：Linux 7.3 从 `rootfs-drained.ext4` 只读启动，连续三次输出完整 `DBE_LINUX_OK rootfs` 并正常退出；另跑通根盘/initramfs 冒烟测试。原始 rootfs/initramfs 的强制重启未排空 TTY 问题在制品中修正，原制品保留。
     - 根盘 REST/串口验证日志证明 Pause/Resume 后仍可读 `/dev/vda` 的 512 字节，位于 `/work/dbe-kernel/p5b-root-control.{stdout,api.log}`。
     - 失败注入覆盖的遗留：注册与任务生成之间的装配失败、卡住 worker 的可重试 RAM 清理，随 P5c 的失败所有权处理补上。
-  - [ ] **P5c 快照与失败资源保留**。
+  - [ ] **P5c 快照与失败资源保留**：
+    - [x] **P5c1 暂停证明**：CPU 转换失败返回只能拆除的 `FailedMachine`，不再返回未证明的 Running/Paused 状态；主循环直接移交失败资源给拆除流程。Timeout 优先于 Exited，仅 Exited 的失败可由真实 GuestReset 判为正常退出；编译失败测试、混合 ACK 和一次性资源移交测试通过。
+    - [ ] **P5c2 transport 状态恢复**（进行中）：纯数据快照、描述符/队列/状态校验、构造时绑定恢复会话、IRQ 状态恢复与显式补发分离。
+    - [ ] **P5c3 整机 capture/rebuild**：平台输入暂存、KVM 状态、逐设备状态、共享停泊装配和可重试失败清理。
 - [ ] P6 virtio-mem
 - [ ] P7 快照持久化
 

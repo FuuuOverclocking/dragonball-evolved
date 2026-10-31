@@ -16,21 +16,22 @@ use self::controller::{
 use crate::VmmExitStatus;
 use crate::error::render_chain;
 use crate::machine::{
-    Machine, MachineEvents, MachinePlan, PauseError, PausedMachine, ResumeError, build,
+    FailedMachine, Machine, MachineEvents, MachinePlan, PauseError, PausedMachine, ResumeError,
+    TeardownError, build,
 };
 use crate::process_ctx::ProcessCtx;
 use crate::spec::MachineSpec;
 use crate::vmm_server::{Inbound, VmmServer};
 
-type State = Controller<Machine, PausedMachine>;
+type State = Controller<Machine, PausedMachine, FailedMachine>;
 
 /// Completion variants carry exactly the machine type their operation returns.
 enum Input {
     Inbound(Inbound),
     Event(Event),
     Started(Result<Machine, StartError>),
-    Paused(Result<PausedMachine, (Machine, PauseError)>),
-    Resumed(Result<Machine, (PausedMachine, ResumeError)>),
+    Paused(Result<PausedMachine, (FailedMachine, PauseError)>),
+    Resumed(Result<Machine, (FailedMachine, ResumeError)>),
 }
 
 pub(crate) async fn run(server: VmmServer, ctx: &ProcessCtx) -> VmmExitStatus {
@@ -78,6 +79,16 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
             }
             Input::Inbound(_) | Input::Event(_) => {}
         }
+        // Start remains retryable after successful cleanup. If already exiting,
+        // however, a reset must not hide a CPU timeout/panic/join failure.
+        if let Input::Started(Err(StartError::Resume(error))) = &input
+            && stopping.is_some()
+        {
+            stopping = Some(prefer_exit(
+                stopping.take(),
+                controller::transition_failure(error, &error.0),
+            ));
+        }
         let next = match (controller, input) {
             (state, Input::Inbound(inbound)) => controller::on_inbound(state, inbound, instance),
             (state, Input::Event(event)) => controller::on_event(state, event),
@@ -114,6 +125,18 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
                     Box::pin(machine.resume())
                 })))
             }
+            Next::Terminate(Live { machine, events }, exit) => {
+                // A failed transition cannot enter any serving state.
+                // Close admission before polling its teardown, retaining events.
+                drop(server.take());
+                let exit = prefer_exit(stopping.take(), exit);
+                return poll_teardown(
+                    Box::pin(async move { machine.teardown().await.map(drop) }),
+                    events,
+                    exit,
+                )
+                .await;
+            }
             Next::Exit(state, exit) => {
                 // Dropping the receiver closes admission and drops queued replies.
                 server = None;
@@ -139,11 +162,11 @@ fn start(spec: MachineSpec, reply: Reply<ApiResult<()>>, ctx: &ProcessCtx) -> St
                 Box::pin(async move {
                     match paused.resume().await {
                         Ok(running) => Ok(running),
-                        Err((paused, error)) => {
+                        Err((failed, error)) => {
                             // A failed first resume is retryable, but only after
-                            // tearing down the machine it returned. Never cancel this.
+                            // tearing down its sole failure owner. Never cancel this.
                             warn_unlimited!("failed Start: {}", render_chain(&error));
-                            paused.teardown().await.map_err(StartError::Teardown)?;
+                            failed.teardown().await.map_err(StartError::Teardown)?;
                             Err(StartError::Resume(error))
                         }
                     }
@@ -216,9 +239,11 @@ fn prefer_exit(prior: Option<Exit>, next: Exit) -> Exit {
         (Some(prior @ Exit::StartTeardown(_)), _) => prior,
         (_, fatal @ Exit::VcpuFailed { .. }) => fatal,
         (Some(prior @ Exit::VcpuFailed { .. }), _) => prior,
-        (Some(reset @ Exit::GuestReset), Exit::TransitionFailed(_)) => reset,
-        (Some(Exit::TransitionFailed(_)), reset @ Exit::GuestReset) => reset,
         (_, failure @ Exit::TransitionFailed(_)) => failure,
+        (Some(prior @ Exit::TransitionFailed(_)), _) => prior,
+        (Some(reset @ Exit::GuestReset), Exit::TransitionExited(_)) => reset,
+        (Some(Exit::TransitionExited(_)), reset @ Exit::GuestReset) => reset,
+        (_, fallback @ Exit::TransitionExited(_)) => fallback,
         (Some(prior), _) => prior,
         (None, exit) => exit,
     }
@@ -233,9 +258,9 @@ fn machine_exit(event: crate::machine::MachineEvent) -> Exit {
     }
 }
 
-async fn teardown(state: State, mut exit: Exit) -> VmmExitStatus {
+async fn teardown(state: State, exit: Exit) -> VmmExitStatus {
     // Busy is settled by the serving loop, which keeps observing events.
-    let (mut operation, mut events): (controller::Operation<_>, _) = match state {
+    let (operation, events): (controller::Operation<_>, _) = match state {
         Controller::NotStarted(_) => return controller::exit_status(exit, Ok(())),
         Controller::Running(Live { machine, events }) => (
             Box::pin(async move { machine.teardown().await.map(drop) }),
@@ -247,6 +272,16 @@ async fn teardown(state: State, mut exit: Exit) -> VmmExitStatus {
         ),
         Controller::Busy(_) => unreachable!("teardown before the operation finished"),
     };
+    poll_teardown(operation, events, exit).await
+}
+
+/// Shared by live and failed owners; the operation and event streams survive
+/// every select round, including shutdown and the final-poll event drain.
+async fn poll_teardown(
+    mut operation: controller::Operation<Result<(), TeardownError>>,
+    mut events: MachineEvents,
+    mut exit: Exit,
+) -> VmmExitStatus {
     // Teardown is also never cancelled. Events retain their meaning until it
     // completes; a late vCPU failure must not disappear behind Shutdown.
     let result = loop {
@@ -283,6 +318,182 @@ mod tests {
     use crate::{KvmContext, test_guest as elf};
 
     #[tokio::test(flavor = "local")]
+    async fn cpu_failure_precedence_distinguishes_exited_from_fatal_errors() {
+        use crate::machine::VcpuError;
+
+        let join = tokio::spawn(async { panic!("join failure") })
+            .await
+            .unwrap_err();
+        for vcpu in [
+            VcpuError::Exited(0),
+            VcpuError::TimedOut(0),
+            VcpuError::Panicked(0),
+            VcpuError::Join {
+                index: 0,
+                source: join,
+            },
+        ] {
+            let exited = matches!(vcpu, VcpuError::Exited(_));
+            let error = ResumeError(vcpu);
+            let failure = controller::transition_failure(&error, &error.0);
+            for merged in [
+                prefer_exit(Some(Exit::GuestReset), failure.clone()),
+                prefer_exit(Some(failure.clone()), Exit::GuestReset),
+            ] {
+                assert_eq!(
+                    controller::exit_status(merged.clone(), Ok(())) == VmmExitStatus::Ok,
+                    exited
+                );
+                assert_eq!(
+                    controller::exit_status(merged, Err(TeardownError::VmHeld)),
+                    VmmExitStatus::Error(
+                        "tear down the machine: the VM is still held after teardown".into()
+                    ),
+                );
+            }
+            assert!(matches!(
+                controller::exit_status(prefer_exit(Some(Exit::Shutdown), failure), Ok(())),
+                VmmExitStatus::Error(_),
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn shutdown_and_events_preserve_a_failed_owner_through_cleanup() {
+        use std::cell::Cell;
+        use std::future::poll_fn;
+        use std::pin::pin;
+        use std::rc::Rc;
+        use std::task::Poll;
+
+        struct FakePaused(Rc<Cell<usize>>, Rc<Cell<usize>>);
+        struct FakeFailed(Rc<Cell<usize>>);
+        impl Drop for FakeFailed {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        type Fake = Controller<(), FakePaused, FakeFailed>;
+        let drops = Rc::new(Cell::new(0));
+        let commands = Rc::new(Cell::new(0));
+        let (sender, machine) = tokio::sync::mpsc::unbounded_channel();
+        let (mut runtime, devices) = crate::devices::runtime::DeviceRuntime::new();
+        let (device_exit, device_wait) = oneshot::channel();
+        let device = runtime
+            .spawn::<(), _, _, std::io::Error>(
+                "cleanup-local-failure",
+                crate::devices::runtime::Start::Running,
+                |_| async move {
+                    device_wait.await.unwrap();
+                    Err(std::io::Error::other("local fault"))
+                },
+            )
+            .unwrap();
+        let (request, answer) = api::lifecycle::Resume.into_vmm_request();
+        let api::VmmRequest::Resume(_, reply) = request else {
+            unreachable!()
+        };
+        let (ack, unanswered) = oneshot::channel::<()>();
+        let transition = Transition::new(
+            Live {
+                machine: FakePaused(drops.clone(), commands.clone()),
+                events: MachineEvents { machine, devices },
+            },
+            reply,
+            |FakePaused(drops, commands)| {
+                Box::pin(async move {
+                    commands.set(commands.get() + 1);
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(10), unanswered)
+                            .await
+                            .is_err()
+                    );
+                    Err((
+                        FakeFailed(drops),
+                        ResumeError(crate::machine::VcpuError::TimedOut(0)),
+                    ))
+                })
+            },
+        );
+        let state: Fake = Controller::Busy(Busy::Resuming(transition));
+        let (shutdown, shutdown_answer) = api::lifecycle::Shutdown.into_vmm_request();
+        let instance = Instance {
+            id: "fake",
+            version: "test",
+            update_logger: |_| Ok(()),
+        };
+        let Next::Exit(state, shutdown) = controller::on_request(state, shutdown, instance) else {
+            panic!()
+        };
+        assert_eq!(shutdown_answer.try_recv(), Ok(Ok(())));
+        let Next::Exit(state, reset) = controller::on_event(
+            state,
+            Event::Machine(crate::machine::MachineEvent::GuestReset),
+        ) else {
+            panic!()
+        };
+        let Controller::Busy(Busy::Resuming(mut resuming)) = state else {
+            panic!()
+        };
+        assert!(poll_fn(|cx| Poll::Ready(resuming.operation.as_mut().poll(cx).is_pending())).await);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(answer.try_recv(), Err(::oneshot::TryRecvError::Empty));
+        let result = (&mut resuming.operation).await;
+        drop(ack);
+        let next: controller::Next<(), FakePaused, FakeFailed> =
+            controller::on_resumed(resuming, result);
+        let Next::Terminate(
+            Live {
+                machine: failed,
+                events,
+            },
+            failure,
+        ) = next
+        else {
+            panic!("failed resume restored a paused wrapper")
+        };
+        assert_eq!(commands.get(), 1, "a compensating CPU command was issued");
+        assert!(answer.try_recv().unwrap().is_err());
+        let (release, cleanup_wait) = oneshot::channel();
+        let started = Rc::new(Cell::new(0));
+        let completed = Rc::new(Cell::new(0));
+        let operation = {
+            let started = started.clone();
+            let completed = completed.clone();
+            let sender = sender.clone();
+            Box::pin(async move {
+                started.set(started.get() + 1);
+                cleanup_wait.await.unwrap();
+                sender
+                    .send(crate::machine::MachineEvent::GuestReset)
+                    .unwrap();
+                drop(failed);
+                completed.set(completed.get() + 1);
+                Ok(())
+            })
+        };
+        let exit = prefer_exit(Some(prefer_exit(Some(shutdown), reset)), failure);
+        let mut cleanup = pin!(poll_teardown(operation, events, exit));
+        assert!(poll_fn(|cx| Poll::Ready(cleanup.as_mut().poll(cx).is_pending())).await);
+        device_exit.send(()).unwrap();
+        device.finished().await;
+        sender
+            .send(crate::machine::MachineEvent::GuestReset)
+            .unwrap();
+        assert!(poll_fn(|cx| Poll::Ready(cleanup.as_mut().poll(cx).is_pending())).await);
+        assert_eq!((started.get(), completed.get(), drops.get()), (1, 0, 0));
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), cleanup)
+                .await
+                .unwrap(),
+            VmmExitStatus::Error("resume the vCPUs: vCPU 0 did not answer in time".into())
+        );
+        assert_eq!((started.get(), completed.get(), drops.get()), (1, 1, 1));
+        runtime.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "local")]
     async fn events_queued_in_a_failed_starts_final_poll_are_not_lost() {
         if !Path::new("/dev/kvm").exists() {
             return;
@@ -293,13 +504,28 @@ mod tests {
             kvm_ctx: KvmContext::from_dev_path("/dev/kvm").unwrap(),
             update_logger: |_| Ok(()),
         };
-        for (event, expected) in [
-            (crate::machine::MachineEvent::GuestReset, VmmExitStatus::Ok),
+        for (event, error, expected) in [
+            (
+                crate::machine::MachineEvent::GuestReset,
+                StartError::Resume(ResumeError(crate::machine::VcpuError::Exited(0))),
+                VmmExitStatus::Ok,
+            ),
+            (
+                crate::machine::MachineEvent::GuestReset,
+                StartError::Resume(ResumeError(crate::machine::VcpuError::TimedOut(0))),
+                VmmExitStatus::Error("resume the vCPUs: vCPU 0 did not answer in time".into()),
+            ),
+            (
+                crate::machine::MachineEvent::GuestReset,
+                StartError::Teardown(TeardownError::VmHeld),
+                VmmExitStatus::Error("tear down the machine after a failed Start: the VM is still held after teardown".into()),
+            ),
             (
                 crate::machine::MachineEvent::VcpuFailed {
                     index: 0,
                     error: "injected fault".into(),
                 },
+                StartError::Resume(ResumeError(crate::machine::VcpuError::Exited(0))),
                 VmmExitStatus::Error("vCPU 0 failed: injected fault".into()),
             ),
         ] {
@@ -312,9 +538,7 @@ mod tests {
             };
             let operation = Box::pin(async move {
                 sender.send(event).unwrap();
-                Err(StartError::Resume(ResumeError(
-                    crate::machine::VcpuError::Exited(0),
-                )))
+                Err(error)
             });
             let state = State::Busy(Busy::Starting(controller::Starting::new(
                 MachineSpec::default(),

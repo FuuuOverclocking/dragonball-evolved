@@ -1,8 +1,8 @@
-//! A built machine, either running ([`Machine`]) or paused
-//! ([`PausedMachine`]).
+//! A built machine: running ([`Machine`]), paused ([`PausedMachine`]), or
+//! teardown-only after a CPU transition failure ([`FailedMachine`]).
 //!
-//! Transitions take the machine by value and hand it back in its new state,
-//! or in its old one beside the error. They are not meant to be cancelled:
+//! Transitions consume their source state. Only acknowledged CPU transitions
+//! produce a usable destination state. They are not meant to be cancelled:
 //! every wait inside them is bounded by a timeout, so they always finish.
 
 use std::collections::BTreeMap;
@@ -243,19 +243,14 @@ pub struct Machine {
 impl Machine {
     /// Pauses the vCPUs, then quiesces the devices.
     ///
-    /// Fails only if a vCPU has exited or does not acknowledge in time. The
-    /// machine then comes back running: every vCPU is sent `Resume`, which a
-    /// vCPU that has not yet seen its `Pause` sees right after it, and the
-    /// devices were never quiesced.
+    /// A CPU failure leaves its state unknown and returns teardown-only ownership.
+    /// No compensating command can prove a state without an acknowledgement.
     ///
     /// A device that has exited or does not answer does not fail the pause:
     /// it is recorded in [`PausedMachine::quiesced`] and the pause completes.
-    pub async fn pause(mut self) -> Result<PausedMachine, (Self, PauseError)> {
+    pub async fn pause(mut self) -> Result<PausedMachine, (FailedMachine, PauseError)> {
         if let Err(error) = self.parts.vcpus.pause(VCPU_TIMEOUT).await {
-            if let Err(again) = self.parts.vcpus.resume(VCPU_TIMEOUT).await {
-                warn_unlimited!("after a failed pause: {}", render_chain(&again));
-            }
-            return Err((self, PauseError(error)));
+            return Err((FailedMachine { parts: self.parts }, PauseError(error)));
         }
         let (quiesced, blocks) = self.parts.quiesce_devices().await;
         Ok(PausedMachine {
@@ -281,6 +276,41 @@ impl Machine {
 
     pub fn vcpu_count(&self) -> usize {
         self.parts.vcpus.len()
+    }
+}
+
+/// A machine with unproven CPU state after a failed transition.
+///
+/// It privately owns all resources and can only be torn down:
+///
+/// ```compile_fail,E0599
+/// async fn resume(machine: vmm::machine::FailedMachine) {
+///     let _ = machine.resume().await;
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// async fn pause(machine: vmm::machine::FailedMachine) {
+///     let _ = machine.pause().await;
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// fn needs_paused(_: vmm::machine::PausedMachine) {}
+/// fn failed(machine: vmm::machine::FailedMachine) {
+///     needs_paused(machine);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct FailedMachine {
+    parts: Box<Parts>,
+}
+
+impl FailedMachine {
+    /// Stops the CPUs and devices using the same teardown as a live machine.
+    /// Memory is returned only after successful cleanup; see [`PausedMachine::teardown`].
+    pub async fn teardown(self) -> Result<MemoryStore, TeardownError> {
+        self.parts.teardown().await
     }
 }
 
@@ -328,22 +358,16 @@ impl PausedMachine {
 
     /// Resumes the devices, then the vCPUs.
     ///
-    /// A device that has exited or does not answer is left as it is. Fails
-    /// only if a vCPU has exited or does not acknowledge in time; the machine
-    /// then comes back paused: the vCPUs are paused again, and the devices
-    /// quiesced again, with what they answered recorded anew. A vCPU that
-    /// does not acknowledge that pause either still has it queued and kicked,
-    /// so it runs no guest code past the exit it is handling.
-    pub async fn resume(mut self) -> Result<Machine, (Self, ResumeError)> {
-        self.parts.resume_devices().await;
-        if let Err(error) = self.parts.vcpus.resume(VCPU_TIMEOUT).await {
-            if let Err(again) = self.parts.vcpus.pause(VCPU_TIMEOUT).await {
-                warn_unlimited!("after a failed resume: {}", render_chain(&again));
-            }
-            (self.quiesced, self.blocks) = self.parts.quiesce_devices().await;
-            return Err((self, ResumeError(error)));
+    /// A device that has exited or does not answer is left as it is. A CPU
+    /// failure returns teardown-only ownership, never a restored paused state.
+    pub async fn resume(self) -> Result<Machine, (FailedMachine, ResumeError)> {
+        // Consume the paused proof before any resource is resumed.
+        let Self { mut parts, .. } = self;
+        parts.resume_devices().await;
+        if let Err(error) = parts.vcpus.resume(VCPU_TIMEOUT).await {
+            return Err((FailedMachine { parts }, ResumeError(error)));
         }
-        Ok(Machine { parts: self.parts })
+        Ok(Machine { parts })
     }
 
     /// What each device answered when the machine paused, in attach order.
