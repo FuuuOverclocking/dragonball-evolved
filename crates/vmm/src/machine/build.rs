@@ -1,6 +1,7 @@
 //! Building a machine from its plan: read the files, compute the boot data,
 //! write it, then assemble the vCPUs and the platform, all parked.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,8 +13,9 @@ use tokio::sync::mpsc;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryError};
 
 use super::MachineEvents;
+use super::block::{AttachBlockError, AttachedBlock};
 use super::boot::{self, BootDataError};
-use super::plan::MachinePlan;
+use super::plan::{MachinePlan, PlanError};
 use super::platform::{ConsoleBackend, Platform, PlatformError};
 use super::state::{Parts, PausedMachine};
 use super::vcpu::{self, Buses, ConfigureVcpuError, SpawnVcpuError, Vcpus};
@@ -24,7 +26,7 @@ use crate::kvm_context::KvmContext;
 use crate::memory::policy::HostPolicy;
 use crate::memory::store::{MaterializeError, MemoryStore};
 use crate::space::{Gpa, Pio};
-use crate::vm::{CreateVmError, KvmVcpuError, create_vm};
+use crate::vm::{Binding, CreateVmError, KvmVcpu, KvmVcpuError, KvmVm, MemSlots, create_vm};
 
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub enum BuildError {
@@ -68,8 +70,14 @@ pub enum BuildError {
     CreateVcpu(#[from] KvmVcpuError),
     /// configure the vCPUs
     ConfigureVcpu(#[from] ConfigureVcpuError),
+    /// validate the recorded machine plan on this host
+    Plan(#[from] PlanError),
+    /// attach a block device
+    Block(#[from] AttachBlockError),
     /// attach the platform devices
     Platform(#[from] PlatformError),
+    /// assemble the MMIO bus
+    MmioBus(#[from] BusError<Gpa>),
     /// assemble the PIO bus
     PioBus(#[from] BusError<Pio>),
     /// start the vCPUs
@@ -123,6 +131,7 @@ pub(super) fn build_with(
     if tokio::runtime::Handle::try_current().is_err() {
         return Err(BuildError::NoRuntime);
     }
+    plan.replay(context.capabilities())?;
     // Read: open the files first, so that a missing one costs nothing.
     let mut kernel = File::open(plan.kernel()).map_err(|source| BuildError::OpenKernel {
         path: plan.kernel().to_owned(),
@@ -186,7 +195,18 @@ pub(super) fn build_with(
         vcpus.push(vcpu);
     }
 
-    // Assemble, everything parked.
+    assemble_parked(plan, vm, bindings, memslots, vcpus, console)
+}
+
+/// CPUs and VM state must already be installed before any device can inject an IRQ.
+pub(super) fn assemble_parked(
+    plan: MachinePlan,
+    vm: Arc<KvmVm>,
+    bindings: Vec<Binding>,
+    memslots: MemSlots,
+    vcpus: Vec<KvmVcpu>,
+    console: ConsoleBackend,
+) -> Result<(PausedMachine, MachineEvents), BuildError> {
     let (events, machine_events) = mpsc::unbounded_channel();
     let (mut runtime, device_exits) = DeviceRuntime::new();
     let mut pio = Vec::new();
@@ -198,15 +218,23 @@ pub(super) fn build_with(
         &mut runtime,
         &mut pio,
     )?;
+    let mut mmio = Vec::new();
+    let mut blocks = BTreeMap::new();
+    for id in plan.probe_order() {
+        let block =
+            AttachedBlock::attach(id, plan.devices()[id].block(), &vm, &mut runtime, &mut mmio)?;
+        blocks.insert(id.clone(), block);
+    }
     let buses = Arc::new(Buses {
         pio: PioBus::new(pio)?,
-        mmio: MmioBus::default(),
+        mmio: MmioBus::new(mmio)?,
     });
     let vcpus = Vcpus::spawn(vcpus, buses, events)?;
     let parts = Box::new(Parts {
         vcpus,
         runtime,
         platform,
+        blocks,
         bindings,
         memslots,
         vm,

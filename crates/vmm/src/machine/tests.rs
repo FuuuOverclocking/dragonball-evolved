@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use api::block::{AddDisk, BlockDevConfig};
 use api::boot::{KernelConfig, SetKernel};
 use api::machine::{
     ConsoleConfig, MemoryBacking, MemorySizeMib, SetConsole, SetCpus, SetMemory, SetMemoryBacking,
@@ -20,6 +21,7 @@ use super::platform::{Captured, ConsoleBackend};
 use super::*;
 use crate::arch::x86_64::layout::PVH_INFO_START;
 use crate::devices::runtime::Response;
+use crate::devices::virtio::block::BlockQuiesced;
 use crate::kvm_context::KvmContext;
 use crate::memory::policy::BackingKind;
 use crate::memory::store::MemoryView;
@@ -135,6 +137,147 @@ async fn a_built_machine_boots_the_mini_guest_to_its_reset_on_kvm() {
     let memory = machine.teardown().await.unwrap();
     assert_eq!(memory.layout(), &layout);
     closed(&mut events).await;
+}
+
+fn disk(id: &str, path: &Path, root: bool) -> VmmCommand {
+    AddDisk(BlockDevConfig {
+        id: Some(id.into()),
+        path: path.into(),
+        read_only: true,
+        root,
+    })
+    .into_vmm_command()
+}
+
+#[tokio::test(flavor = "local")]
+async fn guest_reads_root_disk_and_pause_exports_stable_queues_on_kvm() {
+    let Some(context) = kvm() else { return };
+    let mut code = elf::serial_reset_payload(true);
+    code.truncate(code.len() - 10);
+    code.extend(LOOP);
+    let kernel = TempFile::new(&elf::image(&code, true));
+    let root = TempFile::new(&[0xab; 512]);
+    let data = TempFile::new(&[0xcd; 512]);
+    for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
+        let spec = spec(
+            &kernel,
+            None,
+            vec![
+                disk("data", data.path(), false),
+                disk("root", root.path(), true),
+                SetCpus(VcpuCount(2)).into_vmm_command(),
+                SetMemoryBacking(backing).into_vmm_command(),
+            ],
+        );
+        let (paused, mut events, output) = build(&context, &spec);
+        assert_eq!(paused.plan().probe_order(), ["root", "data"]);
+        assert_eq!(
+            paused.quiesced_blocks()["root"].worker,
+            Response::Replied(BlockQuiesced::Inactive)
+        );
+        let view = std::sync::Arc::downgrade(paused.memory());
+        let running = paused.resume().await.map_err(|(_, error)| error).unwrap();
+        time::timeout(TIMEOUT, async {
+            while output.0.lock().unwrap().as_slice() != BOOT_OK {
+                assert!(
+                    events.machine.try_recv().is_err(),
+                    "guest failed before disk handshake"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guest did not finish its disk read");
+        let paused = running.pause().await.map_err(|(_, error)| error).unwrap();
+        let first = paused.quiesced_blocks().clone();
+        let Response::Replied(BlockQuiesced::Active(queue)) = first["root"].worker else {
+            panic!("root worker did not export its queue: {first:?}");
+        };
+        assert_eq!((queue.next_avail, queue.next_used), (1, 1));
+        assert_eq!(first["root"].resample, Response::Replied(()));
+        assert_eq!(
+            first["data"].worker,
+            Response::Replied(BlockQuiesced::Inactive)
+        );
+        assert_eq!(first["data"].resample, Response::Replied(()));
+        assert_eq!(
+            paused
+                .memory()
+                .read_obj::<u8>(GuestAddress(0x5000))
+                .unwrap(),
+            0xab
+        );
+        let counter = paused
+            .memory()
+            .read_obj::<u32>(GuestAddress(COUNTER))
+            .unwrap();
+        let running = paused.resume().await.map_err(|(_, error)| error).unwrap();
+        time::timeout(TIMEOUT, async {
+            while running
+                .memory()
+                .read_obj::<u32>(GuestAddress(COUNTER))
+                .unwrap()
+                == counter
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let paused = running.pause().await.map_err(|(_, error)| error).unwrap();
+        assert_eq!(paused.quiesced_blocks(), &first);
+        let memory = paused.teardown().await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &view.upgrade().unwrap(),
+            memory.view()
+        ));
+        assert_eq!(
+            memory.view().read_obj::<u8>(GuestAddress(0x5000)).unwrap(),
+            0xab
+        );
+        closed(&mut events).await;
+        drop(memory);
+        assert!(
+            view.upgrade().is_none(),
+            "transport or worker retained RAM after teardown"
+        );
+    }
+}
+
+#[tokio::test(flavor = "local")]
+async fn failed_block_worker_is_recorded_without_stopping_the_guest_on_kvm() {
+    let Some(context) = kvm() else { return };
+    let mut code = elf::serial_reset_payload(true);
+    let write = [0xc7, 0x05, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00];
+    let at = code
+        .windows(write.len())
+        .position(|bytes| bytes == write)
+        .unwrap();
+    code[at + 8] = 32; // avail index exceeds the guest's 16-entry queue.
+    let kernel = TempFile::new(&elf::image(&code, true));
+    let root = TempFile::new(&[0xab; 512]);
+    let (paused, mut events, _) = build(
+        &context,
+        &spec(&kernel, None, vec![disk("root", root.path(), true)]),
+    );
+    let running = paused.resume().await.map_err(|(_, error)| error).unwrap();
+    let exit = time::timeout(TIMEOUT, events.devices.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exit.name.as_ref(), "root");
+    assert!(exit.result.is_err());
+    assert!(events.machine.try_recv().is_err());
+    let paused = running.pause().await.map_err(|(_, error)| error).unwrap();
+    assert_eq!(paused.quiesced_blocks()["root"].worker, Response::Exited);
+    assert_eq!(
+        paused.quiesced_blocks()["root"].resample,
+        Response::Replied(())
+    );
+    let running = paused.resume().await.map_err(|(_, error)| error).unwrap();
+    let paused = running.pause().await.map_err(|(_, error)| error).unwrap();
+    assert_eq!(paused.quiesced_blocks()["root"].worker, Response::Exited);
+    paused.teardown().await.unwrap();
 }
 
 #[tokio::test(flavor = "local")]

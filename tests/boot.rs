@@ -58,7 +58,6 @@ fn run_config(config: &Path, limit: Duration) -> Output {
 }
 
 #[test]
-#[ignore = "P5: virtio-blk is being rebuilt in crates/vmm"]
 fn configuration_autostarts_pvh_serial_and_virtio_block() {
     if !Path::new("/dev/kvm").exists() {
         return;
@@ -135,7 +134,7 @@ fn configuration_boots_a_guest_on_shared_memory() {
 
 /// Requires DBE_KERNEL and optionally DBE_INITRD/DBE_ROOTFS.
 #[test]
-#[ignore = "P5: virtio-blk is being rebuilt in crates/vmm"]
+#[ignore = "requires DBE_KERNEL and optional DBE_INITRD/DBE_ROOTFS images"]
 fn linux_pvh_smoke_boot() {
     let kernel = std::env::var_os("DBE_KERNEL").expect("set DBE_KERNEL to a PVH vmlinux");
     let mut machine = serde_json::json!({ "memory_mib": 512, "kernel": { "path": std::path::PathBuf::from(kernel), "cmdline": std::env::var("DBE_CMDLINE").ok(), "initrd": std::env::var_os("DBE_INITRD").map(std::path::PathBuf::from) } });
@@ -254,7 +253,8 @@ async fn rest_api_configures_and_shuts_down_before_start() {
         return;
     }
     let mut api = ApiProcess::spawn().await;
-    let disk = json!({ "path": "/test/disk", "root": true });
+    let kernel = elf::TempFile::new(&elf::image(&[0xeb, 0xfe], true));
+    let disk = json!({ "path": "/test/dbe-missing-disk", "root": true });
     for (method, path, body, status) in [
         ("PUT", "/v1/machine/console", json!("none"), StatusCode::OK),
         ("PUT", "/v1/machine/memory-mib", json!(16), StatusCode::OK),
@@ -267,7 +267,7 @@ async fn rest_api_configures_and_shuts_down_before_start() {
         (
             "PUT",
             "/v1/machine/kernel",
-            json!({ "path": "/test/kernel" }),
+            json!({ "path": kernel.path() }),
             StatusCode::OK,
         ),
         ("PUT", "/v1/disks", disk.clone(), StatusCode::OK),
@@ -289,7 +289,7 @@ async fn rest_api_configures_and_shuts_down_before_start() {
         reply["error"]
             .as_str()
             .unwrap()
-            .contains("virtio-blk is not supported yet"),
+            .contains("open the block backing file"),
         "{reply}"
     );
     let (status, info) = api.request("GET", "/v1/", Value::Null).await;

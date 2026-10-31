@@ -5,16 +5,19 @@
 //! or in its old one beside the error. They are not meant to be cancelled:
 //! every wait inside them is bounded by a timeout, so they always finish.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use logger::warn_unlimited;
 use tokio::time::Instant;
 
+use super::block::AttachedBlock;
 use super::plan::MachinePlan;
 use super::platform::Platform;
 use super::vcpu::{VcpuError, Vcpus};
 use crate::devices::runtime::{DeviceRuntime, Response, ShutdownError};
+use crate::devices::virtio::block::BlockQuiesced;
 use crate::error::render_chain;
 use crate::memory::store::{MemoryStore, MemoryView};
 use crate::vm::{Binding, KvmVm, MemSlots};
@@ -52,6 +55,13 @@ pub struct QuiescedDevice {
     pub response: Response<()>,
 }
 
+/// The two tasks of one block device, recorded under its plan ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuiescedBlock {
+    pub worker: Response<BlockQuiesced>,
+    pub resample: Response<()>,
+}
+
 /// Everything a built machine owns, whatever its state. Fields drop in order,
 /// so the vCPUs are told to stop before anything they reach goes away.
 #[derive(Debug)]
@@ -59,6 +69,7 @@ pub(super) struct Parts {
     pub(super) vcpus: Vcpus,
     pub(super) runtime: DeviceRuntime,
     pub(super) platform: Platform,
+    pub(super) blocks: BTreeMap<String, AttachedBlock>,
     pub(super) bindings: Vec<Binding>,
     pub(super) memslots: MemSlots,
     pub(super) vm: Arc<KvmVm>,
@@ -75,6 +86,7 @@ impl Parts {
             vcpus,
             runtime,
             platform,
+            blocks,
             bindings,
             memslots,
             vm,
@@ -84,6 +96,14 @@ impl Parts {
         let devices = runtime.shutdown(DEVICE_GRACE).await;
         // Restores the terminal, now that nothing serves the console.
         drop(platform);
+        for block in blocks.into_values() {
+            let AttachedBlock {
+                worker,
+                resample,
+                transport,
+            } = block;
+            drop((transport, worker, resample));
+        }
         drop(bindings);
         drop(memslots);
         match (vcpus, devices) {
@@ -100,8 +120,32 @@ impl Parts {
 
     /// Asks every device to quiesce, within one shared deadline. A device
     /// that has exited or does not answer is recorded, and the rest go on.
-    async fn quiesce_devices(&self) -> Vec<QuiescedDevice> {
+    async fn quiesce_devices(&self) -> (Vec<QuiescedDevice>, BTreeMap<String, QuiescedBlock>) {
         let deadline = Instant::now() + DEVICE_TIMEOUT;
+        let mut workers = BTreeMap::new();
+        for (id, block) in &self.blocks {
+            let response = block
+                .worker
+                .quiesce(deadline.saturating_duration_since(Instant::now()))
+                .await;
+            warn_response(block.worker.name(), &response, "quiesce");
+            workers.insert(id.clone(), response);
+        }
+        let mut blocks = BTreeMap::new();
+        for (id, block) in &self.blocks {
+            let resample = block
+                .resample
+                .quiesce(deadline.saturating_duration_since(Instant::now()))
+                .await;
+            warn_response(block.resample.name(), &resample, "quiesce");
+            blocks.insert(
+                id.clone(),
+                QuiescedBlock {
+                    worker: workers[id],
+                    resample,
+                },
+            );
+        }
         let mut quiesced = Vec::new();
         for device in self.platform.devices() {
             let response = device
@@ -122,13 +166,27 @@ impl Parts {
                 response,
             });
         }
-        quiesced
+        (quiesced, blocks)
     }
 
     /// Asks every device to resume, within one shared deadline. A device that
     /// has exited or does not answer is left as it is.
     async fn resume_devices(&self) {
         let deadline = Instant::now() + DEVICE_TIMEOUT;
+        for block in self.blocks.values() {
+            let response = block
+                .resample
+                .resume(deadline.saturating_duration_since(Instant::now()))
+                .await;
+            warn_response(block.resample.name(), &response, "resume");
+        }
+        for block in self.blocks.values() {
+            let response = block
+                .worker
+                .resume(deadline.saturating_duration_since(Instant::now()))
+                .await;
+            warn_response(block.worker.name(), &response, "resume");
+        }
         for device in self.platform.devices() {
             let name = device.name();
             match device
@@ -143,6 +201,16 @@ impl Parts {
                     warn_unlimited!("device {name} did not resume in time");
                 }
             }
+        }
+    }
+}
+
+fn warn_response<Q>(name: &str, response: &Response<Q>, operation: &str) {
+    match response {
+        Response::Replied(_) => {}
+        Response::Exited => warn_unlimited!("device {name} has exited; continuing without it"),
+        Response::TimedOut => {
+            warn_unlimited!("device {name} did not {operation} in time; continuing without it")
         }
     }
 }
@@ -189,10 +257,11 @@ impl Machine {
             }
             return Err((self, PauseError(error)));
         }
-        let quiesced = self.parts.quiesce_devices().await;
+        let (quiesced, blocks) = self.parts.quiesce_devices().await;
         Ok(PausedMachine {
             parts: self.parts,
             quiesced,
+            blocks,
         })
     }
 
@@ -221,6 +290,7 @@ impl Machine {
 pub struct PausedMachine {
     parts: Box<Parts>,
     quiesced: Vec<QuiescedDevice>,
+    blocks: BTreeMap<String, QuiescedBlock>,
 }
 
 impl PausedMachine {
@@ -235,7 +305,25 @@ impl PausedMachine {
                 response: Response::Replied(()),
             })
             .collect();
-        Self { parts, quiesced }
+        // Cold assembly alone uses this: no guest has had access to an activator.
+        let blocks = parts
+            .blocks
+            .keys()
+            .map(|id| {
+                (
+                    id.clone(),
+                    QuiescedBlock {
+                        worker: Response::Replied(BlockQuiesced::Inactive),
+                        resample: Response::Replied(()),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            parts,
+            quiesced,
+            blocks,
+        }
     }
 
     /// Resumes the devices, then the vCPUs.
@@ -252,7 +340,7 @@ impl PausedMachine {
             if let Err(again) = self.parts.vcpus.pause(VCPU_TIMEOUT).await {
                 warn_unlimited!("after a failed resume: {}", render_chain(&again));
             }
-            self.quiesced = self.parts.quiesce_devices().await;
+            (self.quiesced, self.blocks) = self.parts.quiesce_devices().await;
             return Err((self, ResumeError(error)));
         }
         Ok(Machine { parts: self.parts })
@@ -261,6 +349,11 @@ impl PausedMachine {
     /// What each device answered when the machine paused, in attach order.
     pub fn quiesced(&self) -> &[QuiescedDevice] {
         &self.quiesced
+    }
+
+    /// Typed block outcomes, keyed by the normalized configuration ID.
+    pub fn quiesced_blocks(&self) -> &BTreeMap<String, QuiescedBlock> {
+        &self.blocks
     }
 
     /// Stops the vCPUs and then the devices, closes the VM and hands its

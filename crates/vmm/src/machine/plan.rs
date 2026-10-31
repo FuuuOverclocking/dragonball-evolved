@@ -4,17 +4,22 @@
 //! A plan is guest ABI only: how the host holds guest memory is a separate
 //! [`HostPolicy`], decided alongside it but never part of it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use api::machine::ConsoleConfig;
 
-use crate::align::BackingPageSize;
-use crate::arch::x86_64::layout::CMDLINE_MAX_SIZE;
+use crate::align::{Alignment, BackingPageSize};
+use crate::arch::x86_64::layout::{
+    CMDLINE_MAX_SIZE, LEGACY_GSIS, VIRTIO_MMIO_LEN, VIRTIO_MMIO_WINDOW,
+};
 use crate::kvm_context::HostCapabilities;
 use crate::memory::layout::{MemoryLayout, MemoryLayoutError};
 use crate::memory::policy::{BackingKind, HostPolicy, HostPolicyError};
+use crate::resources::{AddressPool, AddressPoolError, IdPool, IdPoolError};
+use crate::space::{Gpa, Gsi, Range};
 use crate::spec::MachineSpec;
 
 /// The command line a guest gets unless the user gives one.
@@ -89,8 +94,110 @@ pub enum PlanError {
     Cmdline(#[source] CmdlineError),
     /// device id {0} is used twice
     DuplicateDevice(String),
-    /// disk {0} cannot be attached: virtio-blk is not supported yet
-    DiskUnsupported(String),
+    /// only one root disk is allowed
+    MultipleRoots,
+    /// allocate or replay a virtio-mmio window
+    Mmio(#[from] AddressPoolError<Gpa>),
+    /// allocate or replay a legacy interrupt line
+    Gsi(#[from] IdPoolError<Gsi>),
+    /// virtio-mmio grant {0} must be one aligned 4 KiB window
+    InvalidGrant(Range<Gpa>),
+    /// device grant {range} exceeds the host physical address limit {max}
+    BeyondMaxGpa { range: Range<Gpa>, max: Gpa },
+    /// device grant {0} overlaps guest RAM
+    OverlapsRam(Range<Gpa>),
+    /// guest probe order must name every device exactly once, with the root first
+    ProbeOrder,
+}
+
+/// Only the resource pools currently consumed by the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceBook {
+    virtio_mmio: AddressPool<Gpa>,
+    legacy_gsi: IdPool<Gsi>,
+}
+
+impl ResourceBook {
+    fn fresh() -> Self {
+        Self {
+            virtio_mmio: AddressPool::new("virtio-mmio", VIRTIO_MMIO_WINDOW),
+            legacy_gsi: IdPool::new("legacy GSI", LEGACY_GSIS),
+        }
+    }
+}
+
+/// The register window and interrupt line granted to a virtio-mmio device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMmioGrant {
+    pub mmio: Range<Gpa>,
+    pub gsi: Gsi,
+}
+
+impl VirtioMmioGrant {
+    fn allocate(book: &ResourceBook) -> Result<(Self, ResourceBook), PlanError> {
+        let (mmio, virtio_mmio) = book
+            .virtio_mmio
+            .allocate(VIRTIO_MMIO_LEN, Alignment::new(VIRTIO_MMIO_LEN).unwrap())?;
+        let (gsi, legacy_gsi) = book.legacy_gsi.allocate()?;
+        Ok((
+            Self { mmio, gsi },
+            ResourceBook {
+                virtio_mmio,
+                legacy_gsi,
+            },
+        ))
+    }
+
+    fn reserve(self, book: &ResourceBook) -> Result<ResourceBook, PlanError> {
+        if self.mmio.len() != VIRTIO_MMIO_LEN
+            || !self
+                .mmio
+                .is_aligned(Alignment::new(VIRTIO_MMIO_LEN).unwrap())
+        {
+            return Err(PlanError::InvalidGrant(self.mmio));
+        }
+        Ok(ResourceBook {
+            virtio_mmio: book.virtio_mmio.reserve(self.mmio)?,
+            legacy_gsi: book.legacy_gsi.reserve(self.gsi)?,
+        })
+    }
+}
+
+/// A disk's backing and guest-visible placement; its ID is the map key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockPlan {
+    path: PathBuf,
+    read_only: bool,
+    root: bool,
+    grant: VirtioMmioGrant,
+}
+
+impl BlockPlan {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+    pub fn root(&self) -> bool {
+        self.root
+    }
+    pub fn grant(&self) -> VirtioMmioGrant {
+        self.grant
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevicePlan {
+    Block(BlockPlan),
+}
+
+impl DevicePlan {
+    pub fn block(&self) -> &BlockPlan {
+        match self {
+            Self::Block(block) => block,
+        }
+    }
 }
 
 /// What the guest sees of a machine.
@@ -98,7 +205,9 @@ pub enum PlanError {
 pub struct MachinePlan {
     vcpus: u8,
     memory: MemoryLayout,
-    cmdline: KernelCmdline,
+    base_cmdline: KernelCmdline,
+    devices: BTreeMap<String, DevicePlan>,
+    probe_order: Vec<String>,
     com1: bool,
     kernel: PathBuf,
     initrd: Option<PathBuf>,
@@ -127,7 +236,7 @@ impl MachinePlan {
             page_size: BackingPageSize::base(host.page_size),
         };
         policy.check(&memory, host).map_err(PlanError::Policy)?;
-        let cmdline = KernelCmdline::new(kernel.cmdline.as_deref().unwrap_or(DEFAULT_CMDLINE))
+        let base_cmdline = KernelCmdline::new(kernel.cmdline.as_deref().unwrap_or(DEFAULT_CMDLINE))
             .map_err(PlanError::Cmdline)?;
         let mut ids = HashSet::new();
         if let Some(device) = spec
@@ -137,19 +246,39 @@ impl MachinePlan {
         {
             return Err(PlanError::DuplicateDevice(device.id().to_owned()));
         }
-        // Refused rather than left out: a guest booted without the disks it
-        // was configured with would run against the wrong root.
-        if let Some(disk) = spec.blocks().next() {
-            return Err(PlanError::DiskUnsupported(disk.id.clone()));
+        let mut blocks: Vec<_> = spec.blocks().collect();
+        if blocks.iter().filter(|block| block.root).count() > 1 {
+            return Err(PlanError::MultipleRoots);
+        }
+        blocks.sort_by_key(|block| !block.root);
+        let mut book = ResourceBook::fresh();
+        let mut devices = BTreeMap::new();
+        let mut probe_order = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let (grant, next) = VirtioMmioGrant::allocate(&book)?;
+            book = next;
+            probe_order.push(block.id.clone());
+            devices.insert(
+                block.id.clone(),
+                DevicePlan::Block(BlockPlan {
+                    path: block.path.clone(),
+                    read_only: block.read_only,
+                    root: block.root,
+                    grant,
+                }),
+            );
         }
         let plan = Self {
             vcpus,
             memory,
-            cmdline,
+            base_cmdline,
+            devices,
+            probe_order,
             com1: spec.console() == ConsoleConfig::Stdio,
             kernel: kernel.path.clone(),
             initrd: kernel.initrd.clone(),
         };
+        plan.replay(host)?;
         Ok((plan, policy))
     }
 
@@ -161,8 +290,104 @@ impl MachinePlan {
         &self.memory
     }
 
-    pub fn cmdline(&self) -> &KernelCmdline {
-        &self.cmdline
+    pub fn devices(&self) -> &BTreeMap<String, DevicePlan> {
+        &self.devices
+    }
+
+    /// Root first, then the original configuration order, independent of map order.
+    pub fn probe_order(&self) -> &[String] {
+        &self.probe_order
+    }
+
+    pub fn base_cmdline(&self) -> &KernelCmdline {
+        &self.base_cmdline
+    }
+
+    /// Derived from immutable decisions; its final size was validated at construction.
+    pub fn cmdline(&self) -> KernelCmdline {
+        KernelCmdline(self.derive_cmdline())
+    }
+
+    fn derive_cmdline(&self) -> String {
+        let mut text = self.base_cmdline.as_str().to_owned();
+        for id in &self.probe_order {
+            let block = self.devices[id].block();
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            write!(
+                text,
+                "virtio_mmio.device=4K@{:#x}:{}",
+                block.grant.mmio.start().0,
+                block.grant.gsi.0
+            )
+            .unwrap();
+            if block.root {
+                text.push_str(if block.read_only {
+                    " root=/dev/vda ro"
+                } else {
+                    " root=/dev/vda rw"
+                });
+            }
+        }
+        text
+    }
+
+    /// Validates recorded grants on this host without reallocating or changing the plan.
+    pub fn replay(&self, host: &HostCapabilities) -> Result<ResourceBook, PlanError> {
+        let max = host.max_vcpus.min(usize::from(MAX_VCPUS));
+        let vcpus = self.vcpus;
+        if vcpus == 0 || usize::from(vcpus) > max {
+            return Err(PlanError::VcpuCount { count: vcpus, max });
+        }
+        HostPolicy {
+            kind: BackingKind::AnonymousPrivate,
+            page_size: BackingPageSize::base(host.page_size),
+        }
+        .check(&self.memory, host)
+        .map_err(PlanError::Policy)?;
+        let mut seen = HashSet::new();
+        if self.probe_order.len() != self.devices.len()
+            || self
+                .probe_order
+                .iter()
+                .any(|id| !self.devices.contains_key(id) || !seen.insert(id))
+        {
+            return Err(PlanError::ProbeOrder);
+        }
+        let roots: Vec<_> = self
+            .devices
+            .iter()
+            .filter(|(_, device)| device.block().root)
+            .collect();
+        if roots.len() > 1 {
+            return Err(PlanError::MultipleRoots);
+        }
+        if let Some((id, _)) = roots.first()
+            && self.probe_order.first() != Some(id)
+        {
+            return Err(PlanError::ProbeOrder);
+        }
+        let mut book = ResourceBook::fresh();
+        for device in self.devices.values() {
+            let grant = device.block().grant;
+            book = grant.reserve(&book)?;
+            if grant.mmio.last().unwrap() > host.max_gpa() {
+                return Err(PlanError::BeyondMaxGpa {
+                    range: grant.mmio,
+                    max: host.max_gpa(),
+                });
+            }
+            if self
+                .memory
+                .windows()
+                .any(|(_, window)| window.placement().overlaps(grant.mmio))
+            {
+                return Err(PlanError::OverlapsRam(grant.mmio));
+            }
+        }
+        KernelCmdline::new(&self.derive_cmdline()).map_err(PlanError::Cmdline)?;
+        Ok(book)
     }
 
     /// Whether the guest has a COM1, which carries the console.
@@ -326,6 +551,37 @@ mod tests {
     }
 
     #[test]
+    fn replay_rechecks_vcpu_counts_against_the_current_host() {
+        let mut source = host();
+        source.max_vcpus = 2;
+        let spec = spec([SetCpus(VcpuCount(2)).into_vmm_command()]);
+        let (plan, _) = MachinePlan::new(&spec, &source).unwrap();
+        assert!(plan.replay(&source).is_ok());
+        let mut target = host();
+        target.max_vcpus = 1;
+        assert_eq!(
+            plan.replay(&target),
+            Err(PlanError::VcpuCount { count: 2, max: 1 })
+        );
+    }
+
+    #[test]
+    fn replay_rejects_vcpu_counts_outside_the_xapic_range() {
+        let original = plan(&spec([])).unwrap();
+        for count in [0, 255] {
+            let mut bad = original.clone();
+            bad.vcpus = count;
+            assert_eq!(
+                bad.replay(&host()),
+                Err(PlanError::VcpuCount { count, max: 254 })
+            );
+        }
+        let mut largest = original;
+        largest.vcpus = 254;
+        assert!(largest.replay(&host()).is_ok());
+    }
+
+    #[test]
     fn a_kernel_and_16_mib_of_memory_are_required() {
         assert_eq!(plan(&MachineSpec::default()), Err(PlanError::NoKernel));
         let small = spec([SetMemory(MemorySizeMib(15)).into_vmm_command()]);
@@ -372,18 +628,202 @@ mod tests {
     }
 
     #[test]
-    fn disks_are_refused_until_virtio_blk_is_back() {
-        let error = plan(&spec([disk("a"), disk("b")])).unwrap_err();
-        assert_eq!(error, PlanError::DiskUnsupported("a".into()));
+    fn block_plans_are_keyed_by_id_with_root_first_probe_order() {
+        let mut root = AddDisk(BlockDevConfig {
+            id: Some("root".into()),
+            path: "/test/root".into(),
+            read_only: true,
+            root: true,
+        });
+        let configured = spec([disk("z"), root.clone().into_vmm_command(), disk("a")]);
+        let plan = plan(&configured).unwrap();
+        assert_eq!(plan.probe_order(), ["root", "z", "a"]);
         assert_eq!(
-            error.to_string(),
-            "disk a cannot be attached: virtio-blk is not supported yet"
+            plan.devices()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["a", "root", "z"]
+        );
+        let mut grants = Vec::new();
+        for (index, id) in plan.probe_order().iter().enumerate() {
+            let block = plan.devices()[id].block();
+            let grant = block.grant();
+            assert_eq!(grant.mmio.start(), Gpa(0xc000_0000 + index as u64 * 0x1000));
+            assert_eq!(grant.mmio.len(), 0x1000);
+            assert!(grant.mmio.is_aligned(Alignment::new(0x1000).unwrap()));
+            assert!(VIRTIO_MMIO_WINDOW.contains_range(grant.mmio));
+            assert_eq!(grant.gsi, Gsi(5 + index as u32));
+            assert!(grants.iter().all(|previous: &VirtioMmioGrant| {
+                !previous.mmio.overlaps(grant.mmio) && previous.gsi != grant.gsi
+            }));
+            assert!(
+                plan.memory()
+                    .windows()
+                    .all(|(_, window)| !window.placement().overlaps(grant.mmio))
+            );
+            grants.push(grant);
+        }
+        assert_eq!(
+            plan.cmdline().as_str(),
+            format!(
+                "{DEFAULT_CMDLINE} virtio_mmio.device=4K@0xc0000000:5 root=/dev/vda ro virtio_mmio.device=4K@0xc0001000:6 virtio_mmio.device=4K@0xc0002000:7"
+            )
+        );
+        assert_eq!(plan.replay(&host()).unwrap(), {
+            let mut book = ResourceBook::fresh();
+            for grant in grants {
+                book = grant.reserve(&book).unwrap();
+            }
+            book
+        });
+        root.0.read_only = false;
+        assert!(
+            self::plan(&spec([root.into_vmm_command()]))
+                .unwrap()
+                .cmdline()
+                .as_str()
+                .ends_with("root=/dev/vda rw")
+        );
+    }
+
+    #[test]
+    fn pools_and_the_host_bound_device_grants() {
+        let many = |count| spec((0..count).map(|n| disk(&format!("disk{n}"))));
+        assert_eq!(
+            plan(&many(19)).unwrap().devices()["disk18"]
+                .block()
+                .grant()
+                .gsi,
+            Gsi(23)
+        );
+        assert_eq!(
+            plan(&many(20)),
+            Err(PlanError::Gsi(IdPoolError::Exhausted {
+                pool: "legacy GSI"
+            }))
+        );
+        let full = ResourceBook {
+            virtio_mmio: ResourceBook::fresh()
+                .virtio_mmio
+                .reserve(VIRTIO_MMIO_WINDOW)
+                .unwrap(),
+            legacy_gsi: ResourceBook::fresh().legacy_gsi,
+        };
+        assert_eq!(
+            VirtioMmioGrant::allocate(&full).unwrap_err(),
+            PlanError::Mmio(AddressPoolError::Exhausted {
+                pool: "virtio-mmio"
+            })
+        );
+        let configured = many(1);
+        let narrow = HostCapabilities::fake(31, 8, 4096);
+        assert!(matches!(
+            MachinePlan::new(&configured, &narrow),
+            Err(PlanError::BeyondMaxGpa { .. })
+        ));
+        assert!(matches!(
+            plan(&configured).unwrap().replay(&narrow),
+            Err(PlanError::BeyondMaxGpa { .. })
+        ));
+        assert!(MachinePlan::new(&spec([]), &narrow).is_ok());
+    }
+
+    #[test]
+    fn replay_rejects_malformed_or_shared_grants_and_probe_order() {
+        let original = plan(&spec([disk("a"), disk("b")])).unwrap();
+        let grant = original.devices()["a"].block().grant();
+        let malformed = [
+            Range::new(Gpa(0xc000_0001), 0x1000).unwrap(),
+            Range::new(Gpa(0xc000_0000), 0x2000).unwrap(),
+            Range::new(Gpa(0xc000_0000), 0).unwrap(),
+            Range::new(Gpa(0xbfff_f000), 0x1000).unwrap(),
+        ];
+        for mmio in malformed {
+            let mut bad = original.clone();
+            let DevicePlan::Block(block) = bad.devices.get_mut("a").unwrap();
+            block.grant.mmio = mmio;
+            assert!(bad.replay(&host()).is_err());
+        }
+        for shared in [
+            grant,
+            VirtioMmioGrant {
+                mmio: Range::new(Gpa(0xc000_2000), 0x1000).unwrap(),
+                ..grant
+            },
+            VirtioMmioGrant {
+                gsi: Gsi(4),
+                ..grant
+            },
+        ] {
+            let mut bad = original.clone();
+            let DevicePlan::Block(block) = bad.devices.get_mut("b").unwrap();
+            block.grant = shared;
+            assert!(bad.replay(&host()).is_err());
+        }
+        for order in [vec!["a"], vec!["a", "a"], vec!["a", "missing"]] {
+            let mut bad = original.clone();
+            bad.probe_order = order.into_iter().map(Into::into).collect();
+            assert_eq!(bad.replay(&host()), Err(PlanError::ProbeOrder));
+        }
+        let mut bad = original.clone();
+        let DevicePlan::Block(block) = bad.devices.get_mut("b").unwrap();
+        block.root = true;
+        assert_eq!(bad.replay(&host()), Err(PlanError::ProbeOrder));
+        let DevicePlan::Block(block) = bad.devices.get_mut("a").unwrap();
+        block.root = true;
+        assert_eq!(bad.replay(&host()), Err(PlanError::MultipleRoots));
+        let configured = spec([disk("a")])
+            .with_device_unchecked(DeviceSpec::Block(BlockSpec {
+                id: "r1".into(),
+                path: "/r1".into(),
+                root: true,
+                read_only: true,
+            }))
+            .with_device_unchecked(DeviceSpec::Block(BlockSpec {
+                id: "r2".into(),
+                path: "/r2".into(),
+                root: true,
+                read_only: true,
+            }));
+        assert_eq!(plan(&configured), Err(PlanError::MultipleRoots));
+    }
+
+    #[test]
+    fn derived_cmdline_is_bounded_and_replay_never_appends() {
+        let configured = spec([disk("a")]);
+        let suffix_len =
+            plan(&configured).unwrap().cmdline().as_str().len() - DEFAULT_CMDLINE.len();
+        let longest = "x".repeat(CMDLINE_MAX_SIZE - 1 - suffix_len);
+        let fits = configured
+            .apply(SetKernel(kernel(Some(&longest))).into_vmm_command())
+            .unwrap();
+        let fits = plan(&fits).unwrap();
+        assert_eq!(fits.cmdline().to_bytes_with_nul().len(), CMDLINE_MAX_SIZE);
+        let before = fits.clone();
+        fits.replay(&host()).unwrap();
+        assert_eq!(fits, before);
+        assert_eq!(fits.cmdline(), before.cmdline());
+        let too_long = spec([
+            disk("a"),
+            SetKernel(kernel(Some(&(longest + "x")))).into_vmm_command(),
+        ]);
+        assert!(matches!(
+            plan(&too_long),
+            Err(PlanError::Cmdline(CmdlineError::TooLong {
+                len: CMDLINE_MAX_SIZE,
+                ..
+            }))
+        ));
+        let empty = spec([disk("a"), SetKernel(kernel(Some(""))).into_vmm_command()]);
+        assert_eq!(
+            plan(&empty).unwrap().cmdline().as_str(),
+            "virtio_mmio.device=4K@0xc0000000:5"
         );
     }
 
     #[test]
     fn device_ids_must_be_unique() {
-        // Checked before disks are refused, so the rule holds for any device.
         // `apply` refuses duplicates, so only a spec made some other way has them.
         let duplicated = spec([disk("a")]).with_device_unchecked(DeviceSpec::Block(BlockSpec {
             id: "a".into(),

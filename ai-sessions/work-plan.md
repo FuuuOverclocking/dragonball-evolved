@@ -356,9 +356,9 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
   - 基线：旧代码 `d970b2e` 在 KVM 下全部测试通过（vmm lib 102、block 17、boot 2 + 顶层 4、serial 5、snapshot 8）。
   - 真实 Linux 冒烟（A6）的 guest 制品在 `/work/dbe-kernel`，不进仓库：
     - `build/vmlinux`：`.references/linux`（7.3.0）在仓库外构建（源码树保持只读）。配置为 `x86_64_defconfig` + `kvm_guest.config`，再加 `PVH`、`X86_MPPARSE`、`SERIAL_8250_CONSOLE`、`VIRTIO_MMIO(_CMDLINE_DEVICES)`、`VIRTIO_BLK`、`EXT4_FS`、`DEVTMPFS(_MOUNT)`、`MEMORY_HOTPLUG/HOTREMOVE`、`CONTIG_ALLOC`、`VIRTIO_MEM`、`DEBUG_INFO_NONE`。构建命令：`make O=/work/dbe-kernel/build -j$(nproc) vmlinux`。本机没有 pahole，因此不开 BTF。这个内核没有 `MEMORY_HOTPLUG_DEFAULT_ONLINE`，P6 改用 `memhp_default_state=`。
-    - `initramfs.cpio.gz`：静态 busybox，由内核的 `scripts/gen_init_cpio` 生成，内含 `/dev/console`；`/init` 输出 `DBE_LINUX_OK …` 后 `reboot -f`。
-    - `rootfs.ext4`：64 MiB，用 `mkfs.ext4 -d` 生成；`/sbin/init` 同上，供 P5 的 virtio-blk 根盘使用。
-    - 运行方式：`DBE_KERNEL=/work/dbe-kernel/build/vmlinux DBE_INITRD=/work/dbe-kernel/initramfs.cpio.gz sg kvm -c 'cargo test -p dragonball-evolved --test boot linux_pvh_smoke_boot -- --ignored --nocapture'`。
+    - `initramfs-drained.cpio.gz`：静态 busybox，由内核的 `scripts/gen_init_cpio` 生成，内含 `/dev/console`；`/init` 输出 `DBE_LINUX_OK …`，调用 `tcdrain` 后 `reboot -f`。初版 `initramfs.cpio.gz` 保留，但未排空 guest TTY，强制重启时可能丢标记。
+    - `rootfs-drained.ext4`：64 MiB，用 `mkfs.ext4 -d` 生成；`/sbin/init` 同样排空 TTY 后重启，供 virtio-blk 根盘验证。初版 `rootfs.ext4` 保留。
+    - initramfs 运行方式：`DBE_KERNEL=/work/dbe-kernel/build/vmlinux DBE_INITRD=/work/dbe-kernel/initramfs-drained.cpio.gz sg kvm -c 'cargo test -p dragonball-evolved --test boot linux_pvh_smoke_boot -- --ignored --nocapture'`。根盘验证则去掉 `DBE_INITRD`，设置 `DBE_ROOTFS=/work/dbe-kernel/rootfs-drained.ext4` 与包含 `rootflags=noload` 的 `DBE_CMDLINE`。
 - [x] **P0 起步**：
   - `crates/vmm` 已移为 `crates/vmm.old`，workspace 中 `exclude`；
   - 新 crate 包含进程外壳（`start`、`VmmClient`、`VmmServer`、`ProcessCtx`、`VmmExitStatus`、`KvmContext`、`MachineSpec::apply`、只处理配置与查询的主循环）、`error::render_chain`、`tests/common/elf.rs`；
@@ -405,11 +405,19 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
   - 真实 CLI：双 vCPU、512 MiB、shared backing，Linux 7.3 + initramfs 启动，输出 `DBE_LINUX_OK` 后 `reboot -f`，VMM 退出码 0。配置与完整日志位于 `/work/dbe-kernel/pvh-smoke.{toml,stdout,stderr}`。
   - 真实 Linux REST：anonymous backing；GET Running → Pause → GET Paused → 输入串口行（暂停期间不处理）→ Resume → guest 读到原行并重启，VMM 退出码 0。驱动为 `/work/dbe-kernel/drive-control.py`，日志为 `pvh-control.{stdout,stderr}`。验证用 init 在强制重启前调用 `tcdrain`，避免把 guest TTY 未排空误认为 VMM 丢数据。
 - [ ] **P5 virtio-blk 与快照**：
-  - [x] **P5a 设备实现**：Session/Activation、MMIO 状态机与 SHM 寄存器、中断重采样、协作式 block worker 和 guest-driver 测试已实现。reset 确认在旧队列/RAM 引用释放后发出，停泊状态也能处理 reset。
+  - [x] **P5a 设备实现**（`e341726`）：Session/Activation、MMIO 状态机与 SHM 寄存器、中断重采样、协作式 block worker 和 guest-driver 测试已实现。reset 确认在旧队列/RAM 引用释放后发出，停泊状态也能处理 reset。
     - 独立审查发现并修复：`virtio-queue` 的非 fallible pop 会吞掉错误，avail ring 位于 GPA 0 时可能空转；改为 fallible iter 并检测无进展。限速改为保留小数额度。
     - 新增确定性批次上限和聚合磁盘越界测试；去掉批次上限/聚合范围检查后对应测试失败，恢复修复后通过。
     - 全量 fmt、clippy、API feature matrix、schema、KVM 测试通过；block 集成测试 25 项。
-  - [ ] **P5b 设备 plan 与机器接线**。
+    - RAM 归还前置修复另提交为 `060d04d`；两组修复合并检查共 349 项测试通过。
+  - [x] **P5b 设备 plan 与机器接线**：
+    - plan 按设备 ID 键控，单独记录根盘优先的探测顺序；MMIO/GSI grant 分配与 replay 校验，cmdline 从基础文本和记录资源派生。
+    - `machine::block::AttachedBlock` 持有 transport、worker、resample 句柄；`assemble_parked` 共用已配置 vCPU 后的设备装配路径；暂停记录逐盘类型化状态。
+    - 补齐 replay 的宿主 vCPU/xAPIC 上限检查；回归测试先在旧实现失败，修复后通过。
+    - fmt、clippy、API feature matrix、schema、KVM workspace 测试通过（357 项）；独立装配审查无确认缺陷。
+    - 主会话实际 CLI 验证：Linux 7.3 从 `rootfs-drained.ext4` 只读启动，连续三次输出完整 `DBE_LINUX_OK rootfs` 并正常退出；另跑通根盘/initramfs 冒烟测试。原始 rootfs/initramfs 的强制重启未排空 TTY 问题在制品中修正，原制品保留。
+    - 根盘 REST/串口验证日志证明 Pause/Resume 后仍可读 `/dev/vda` 的 512 字节，位于 `/work/dbe-kernel/p5b-root-control.{stdout,api.log}`。
+    - 失败注入覆盖的遗留：注册与任务生成之间的装配失败、卡住 worker 的可重试 RAM 清理，随 P5c 的失败所有权处理补上。
   - [ ] **P5c 快照与失败资源保留**。
 - [ ] P6 virtio-mem
 - [ ] P7 快照持久化
