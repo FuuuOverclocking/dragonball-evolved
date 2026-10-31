@@ -1,8 +1,11 @@
 pub mod align;
 pub mod arch;
+pub mod bus;
+pub mod devices;
 mod error;
 mod exit_status;
 mod kvm_context;
+pub mod machine;
 mod main_loop;
 pub mod memory;
 mod process_ctx;
