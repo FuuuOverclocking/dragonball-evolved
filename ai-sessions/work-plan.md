@@ -373,7 +373,23 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
   - 内容契约暂缺（只有一个变体，没有消费者）；
   - 16 MiB 的 PVH 下限放到 P3b 的 plan；
   - `KvmVm::new` / `create_vm` 失败时会丢掉 `MemoryStore`，P5 的 rebuild 需要把它交回。
-- [ ] **P3a 设备运行时与平台设备**（进行中）。
+- [x] **P3a 设备运行时与平台设备**：
+  - `devices::control`：协作式控制协议 `Command { Quiesce(Ack<Q>), Resume, Stop }`；`Control::handle` / `park`；任务可以停泊启动。
+  - `devices::runtime`：`DeviceRuntime` 只负责放置、监督与 io 线程；持有方拿着类型化的 `DeviceHandle<Q>`，应答为 `Replied` / `Exited` / `TimedOut`；意外退出走可单独持有的 `DeviceExits`；`shutdown(grace)` 按每个任务的完成信号等待。
+  - `bus::Bus<A>`（`PioBus` / `MmioBus`）；串口与 stdio 控制台、i8042、`MachineEvent`。
+  - 旧测试全部移植，新增停泊启动、已退出、超时、退出流等测试。
+- 提交（从这里开始，每个阶段验收后提交）：
+  - `e3b85cf` 文档迁移；
+  - `0eba888` P0–P2（单独检出后构建与测试均通过）；
+  - `794e9eb` P3a。
+- [x] **P3b vCPU 与机器装配**（`fb76f92`）：
+  - `machine::plan::MachinePlan::new(&spec, host) -> (MachinePlan, HostPolicy)`：只含 guest ABI，不内嵌 spec，含 16 MiB 下限；`KernelCmdline` 类型。
+  - `machine::build`：读文件 → 生成启动数据（纯，`machine::boot`）→ 写入；vCPU 线程与设备任务都停泊启动，返回 `(PausedMachine, MachineEvents)`。
+  - `Machine::pause` / `PausedMachine::resume` 按值转换，失败时连同错误交回原状态，所有等待都有上限；设备 `Exited` / `TimedOut` 记入 `PausedMachine::quiesced()`，pause 照常完成；两种状态都可以 `teardown -> MemoryStore`。
+  - vCPU 线程沿用旧的踢出与 I/O 完成语义；`MachineEvents`（机器事件 + 设备退出）与机器分开持有。
+  - 测试：机器级 KVM 测试（mini guest 启动到复位、双 vCPU 拆除并交还内存、initrd modlist、状态往返、两种状态都能拆除）；构建失败不泄漏 fd、线程与映射；`compile_fail` 证明运行中的机器没有暂停态的 API。全 workspace 292 项通过。
+  - 执行说明：子代理在收尾阶段长时间无进展并被停止，但代码已完整、检查全部通过，由主会话审查后提交。
+- [ ] **P4 生命周期与接线**。
 - [ ] P3 机器核心
 - [ ] P4 生命周期与接线
 - [ ] P5 virtio-blk 与快照
