@@ -6,18 +6,90 @@ use std::time::Duration;
 
 use common::guest::*;
 use common::{TempDisk, wait_until};
-use virtio_queue::QueueT;
+use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress};
 use vmm::bus::BusDevice;
 use vmm::devices::async_fd::AsyncEventFd;
 use vmm::devices::runtime::{DeviceExits, DeviceHandle, DeviceRuntime, Placement, Response, Start};
 use vmm::devices::virtio::block::{BlockError, BlockHandle, BlockQuiesced, BlockResources};
-use vmm::devices::virtio::mmio::{MmioTransport, NEEDS_RESET};
-use vmm::devices::virtio::{
-    Activation, ActivationError, ResetError, SessionControl, activation_channel, session_channel,
+use vmm::devices::virtio::mmio::{
+    DeviceDesc, MmioRegs, MmioTransport, MmioTransportSnapshot, NEEDS_RESET, QueueError, QueueRegs,
+    RestoreError, VERSION_1,
 };
+use vmm::devices::virtio::{
+    Activation, ActivationError, ActivationRx, Activator, IrqTrigger, ResetError, SessionControl,
+    activation_channel, session_channel,
+};
+use vmm::space::Gpa;
+use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 
 const WITHIN: Duration = Duration::from_secs(5);
+
+struct TransportFixture {
+    guest: GuestDriver,
+    desc: DeviceDesc,
+    activator: Activator,
+    receiver: ActivationRx,
+    interrupt: Arc<IrqTrigger>,
+    notifier: EventFd,
+}
+
+impl TransportFixture {
+    fn new() -> Self {
+        let (activator, receiver) = activation_channel();
+        Self {
+            guest: GuestDriver::new(),
+            desc: DeviceDesc {
+                device_type: 2,
+                features: VERSION_1 | (1 << 9),
+                queue_max: vec![256],
+                config: 8u64.to_le_bytes().to_vec(),
+            },
+            activator,
+            receiver,
+            interrupt: Arc::new(IrqTrigger::new().unwrap()),
+            notifier: EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC).unwrap(),
+        }
+    }
+
+    fn snapshot(&self) -> MmioTransportSnapshot {
+        MmioTransportSnapshot {
+            desc: self.desc.clone(),
+            regs: MmioRegs::new(&self.desc),
+            interrupt_status: 0,
+        }
+    }
+
+    fn ready_snapshot(&self, status: u32) -> MmioTransportSnapshot {
+        let mut snapshot = self.snapshot();
+        snapshot.regs.status = status;
+        snapshot.regs.driver_features = VERSION_1;
+        snapshot.regs.queues[0] = QueueRegs {
+            size: u32::from(QUEUE_SIZE),
+            ready: true,
+            desc: Gpa(DESC_TABLE),
+            avail: Gpa(AVAIL_RING),
+            used: Gpa(USED_RING),
+        };
+        snapshot
+    }
+
+    fn restore(
+        &self,
+        snapshot: MmioTransportSnapshot,
+        session: Option<SessionControl>,
+    ) -> Result<MmioTransport, RestoreError> {
+        MmioTransport::restore(
+            self.desc.clone(),
+            self.guest.mem.clone(),
+            self.activator.clone(),
+            self.interrupt.clone(),
+            vec![self.notifier.try_clone().unwrap()],
+            snapshot,
+            session,
+        )
+    }
+}
 
 struct Block {
     runtime: DeviceRuntime,
@@ -67,6 +139,37 @@ impl Block {
             self.handle.interrupt.clone(),
             vec![self.handle.queue_notifier.try_clone().unwrap()],
         ))
+    }
+
+    fn restored_transport(
+        &self,
+        guest: &GuestDriver,
+        snapshot: MmioTransportSnapshot,
+        queue: Queue,
+    ) -> Arc<MmioTransport> {
+        let (control, session) = session_channel();
+        self.handle
+            .activator
+            .activate(Activation {
+                queues: vec![queue],
+                mem: guest.mem.clone(),
+                interrupt: self.handle.interrupt.clone(),
+                driver_features: snapshot.regs.driver_features,
+                session,
+            })
+            .unwrap();
+        Arc::new(
+            MmioTransport::restore(
+                self.handle.desc.clone(),
+                guest.mem.clone(),
+                self.handle.activator.clone(),
+                self.handle.interrupt.clone(),
+                vec![self.handle.queue_notifier.try_clone().unwrap()],
+                snapshot,
+                Some(control),
+            )
+            .unwrap(),
+        )
     }
 }
 
@@ -709,21 +812,25 @@ async fn reset_acknowledgement_follows_release_of_old_queue_and_ram() {
 }
 
 #[tokio::test(flavor = "local")]
-async fn failed_reset_keeps_the_old_session_and_registers_until_acknowledged() {
-    let disk = TempDisk::new("failed-reset", &[0; SECTOR_SIZE]);
-    let (_resources, handle) =
-        BlockResources::open("failed-reset", disk.path(), true, None).unwrap();
-    let (activator, mut receiver) = activation_channel();
-    let guest = GuestDriver::new();
-    let transport = Arc::new(MmioTransport::new(
-        handle.desc,
-        guest.mem,
-        activator,
-        handle.interrupt,
-        vec![handle.queue_notifier],
-    ));
-    configure(&transport, USED_RING as u32, u32::from(QUEUE_SIZE));
-    let old = receiver.recv().await.unwrap();
+async fn failed_reset_keeps_the_restored_session_and_registers_until_acknowledged() {
+    let mut fixture = TransportFixture::new();
+    let (control, session) = session_channel();
+    fixture
+        .activator
+        .activate(Activation {
+            queues: vec![fixture.guest.queue()],
+            mem: fixture.guest.mem.clone(),
+            interrupt: fixture.interrupt.clone(),
+            driver_features: VERSION_1,
+            session,
+        })
+        .unwrap();
+    let transport = Arc::new(
+        fixture
+            .restore(fixture.ready_snapshot(15), Some(control))
+            .unwrap(),
+    );
+    let old = fixture.receiver.recv().await.unwrap();
     reset(transport.clone()).await;
     assert_eq!(reg(&transport, 0x70), 15 | NEEDS_RESET);
     assert_eq!(reg(&transport, 0x44), 1);
@@ -731,14 +838,14 @@ async fn failed_reset_keeps_the_old_session_and_registers_until_acknowledged() {
     configure(&transport, USED_RING as u32, u32::from(QUEUE_SIZE));
     assert_eq!(reg(&transport, 0x70), 15 | NEEDS_RESET);
     assert!(
-        receiver.try_recv().is_none(),
+        fixture.receiver.try_recv().is_none(),
         "failed reset admitted a second queue owner"
     );
     drop(old);
     reset(transport.clone()).await;
     assert_eq!(reg(&transport, 0x70), 0);
     configure(&transport, USED_RING as u32, u32::from(QUEUE_SIZE));
-    assert!(receiver.try_recv().is_some());
+    assert!(fixture.receiver.try_recv().is_some());
 }
 
 #[tokio::test(flavor = "local")]
@@ -858,5 +965,321 @@ async fn invalid_status_descriptor_and_non_sector_payload_do_not_mutate_disk() {
     assert_eq!(guest.read_bytes(status, 1), [0xff]);
     assert_eq!(guest.read_bytes(odd_status, 1), [VIRTIO_BLK_S_IOERR]);
     assert_eq!(disk.contents(), [0x33; SECTOR_SIZE]);
+    block.shutdown().await;
+}
+
+#[test]
+fn transport_restore_rejects_descriptor_changes() {
+    for field in 0..4 {
+        let mut fixture = TransportFixture::new();
+        let snapshot = fixture.snapshot();
+        match field {
+            0 => fixture.desc.device_type += 1,
+            1 => fixture.desc.features ^= 1 << 5,
+            2 => fixture.desc.queue_max[0] /= 2,
+            3 => fixture.desc.config = 9u64.to_le_bytes().to_vec(),
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            fixture.restore(snapshot, None),
+            Err(RestoreError::Descriptor)
+        ));
+    }
+}
+
+#[test]
+fn transport_restore_rejects_queue_and_notifier_counts() {
+    let fixture = TransportFixture::new();
+    for count in [0, 2] {
+        let mut snapshot = fixture.snapshot();
+        snapshot.regs.queues = vec![QueueRegs::default(); count];
+        assert!(matches!(
+            fixture.restore(snapshot, None),
+            Err(RestoreError::QueueCount)
+        ));
+        let notifiers = (0..count)
+            .map(|_| fixture.notifier.try_clone().unwrap())
+            .collect();
+        assert!(matches!(
+            MmioTransport::restore(
+                fixture.desc.clone(),
+                fixture.guest.mem.clone(),
+                fixture.activator.clone(),
+                fixture.interrupt.clone(),
+                notifiers,
+                fixture.snapshot(),
+                None,
+            ),
+            Err(RestoreError::Notifiers)
+        ));
+    }
+}
+
+#[test]
+fn transport_restore_rejects_status_progression_and_unnegotiated_features() {
+    let fixture = TransportFixture::new();
+    for status in [2, 4, 5, 7, 8, 9, 10, 12, 14, 16, 32, 256, u32::MAX, 128 | 7] {
+        let mut snapshot = fixture.snapshot();
+        snapshot.regs.status = status;
+        snapshot.regs.driver_features = VERSION_1;
+        assert!(matches!(
+            fixture.restore(snapshot, None),
+            Err(RestoreError::Status(saved)) if saved == status
+        ));
+    }
+    assert!(matches!(
+        fixture.restore(fixture.ready_snapshot(3), None),
+        Err(RestoreError::Status(3))
+    ));
+    for status in [11, 15, 11 | 128, 15 | NEEDS_RESET] {
+        for features in [0, 1 << 9, VERSION_1 | (1 << 63)] {
+            let mut snapshot = fixture.snapshot();
+            snapshot.regs.status = status;
+            snapshot.regs.driver_features = features;
+            assert!(matches!(
+                fixture.restore(snapshot, None),
+                Err(RestoreError::Features)
+            ));
+        }
+    }
+}
+
+#[test]
+fn transport_restore_validates_only_ready_queue_geometry_and_ranges() {
+    let fixture = TransportFixture::new();
+    for size in [0, 17, 512, u32::MAX] {
+        let mut snapshot = fixture.ready_snapshot(11);
+        snapshot.regs.queues[0].size = size;
+        assert!(matches!(
+            fixture.restore(snapshot.clone(), None),
+            Err(RestoreError::Queue {
+                index: 0,
+                error: QueueError::Geometry,
+            })
+        ));
+        snapshot.regs.queues[0].ready = false;
+        assert_eq!(
+            fixture.restore(snapshot.clone(), None).unwrap().snapshot(),
+            snapshot
+        );
+    }
+    for field in 0..3 {
+        for address in [1, 0x3ffff0, 0x400000, u64::MAX - 15] {
+            let mut snapshot = fixture.ready_snapshot(15 | NEEDS_RESET);
+            let queue = &mut snapshot.regs.queues[0];
+            match field {
+                0 => queue.desc = Gpa(address),
+                1 => queue.avail = Gpa(address),
+                2 => queue.used = Gpa(address),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                fixture.restore(snapshot.clone(), None),
+                Err(RestoreError::Queue { index: 0, error })
+                    if matches!((address, &error), (1, QueueError::Alignment) | (_, QueueError::Bounds))
+            ));
+            snapshot.regs.queues[0].ready = false;
+            assert_eq!(
+                fixture.restore(snapshot.clone(), None).unwrap().snapshot(),
+                snapshot
+            );
+        }
+    }
+}
+
+#[test]
+fn transport_snapshot_and_restore_round_trip_inactive_negotiation_and_error_states() {
+    let mut fixture = TransportFixture::new();
+    for base in [0, 1, 3, 11, 15] {
+        for flags in [0, 128, NEEDS_RESET, 128 | NEEDS_RESET] {
+            for ready in [false, true] {
+                if ready && base < 11 {
+                    continue;
+                }
+                let status = base | flags;
+                let mut snapshot = if ready {
+                    fixture.ready_snapshot(status)
+                } else {
+                    let mut snapshot = fixture.snapshot();
+                    snapshot.regs.status = status;
+                    snapshot.regs.driver_features = match base {
+                        11 | 15 => VERSION_1 | (1 << 9),
+                        3 => u64::MAX,
+                        _ => 0,
+                    };
+                    snapshot
+                };
+                snapshot.regs.features_sel = u32::MAX;
+                snapshot.regs.driver_features_sel = u32::MAX;
+                snapshot.regs.queue_sel = u32::MAX;
+                let transport = fixture.restore(snapshot.clone(), None).unwrap();
+                assert_eq!(transport.snapshot(), snapshot);
+                assert_eq!(reg(&transport, 0x10), 0);
+                assert_eq!(reg(&transport, 0x34), 0);
+                assert_eq!(reg(&transport, 0x44), 0);
+                assert!(fixture.receiver.try_recv().is_none());
+                assert_eq!(
+                    fixture.notifier.read().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                transport.write(0x70, &0u32.to_le_bytes());
+                assert_eq!(transport.snapshot(), fixture.snapshot());
+            }
+        }
+    }
+}
+
+#[test]
+fn transport_snapshot_does_not_retain_ram() {
+    let fixture = TransportFixture::new();
+    let memory = Arc::downgrade(&fixture.guest.mem);
+    let transport = fixture.restore(fixture.ready_snapshot(11), None).unwrap();
+    let owners = Arc::strong_count(&fixture.guest.mem);
+    let snapshot = transport.snapshot();
+    assert_eq!(Arc::strong_count(&fixture.guest.mem), owners);
+    drop(transport);
+    drop(fixture);
+    assert!(memory.upgrade().is_none());
+    assert_eq!(snapshot.regs.queues[0].desc, Gpa(DESC_TABLE));
+}
+
+#[test]
+fn transport_restore_never_injects_irq_and_explicit_reraise_uses_current_pending_bits() {
+    let mut fixture = TransportFixture::new();
+    for status in [0, 1, 2, 3] {
+        let mut snapshot = fixture.ready_snapshot(15 | NEEDS_RESET);
+        snapshot.interrupt_status = status;
+        let transport = fixture.restore(snapshot.clone(), None).unwrap();
+        assert_eq!(transport.snapshot(), snapshot);
+        assert!(fixture.receiver.try_recv().is_none());
+        assert_eq!(
+            fixture.interrupt.irq_fd().read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            fixture.notifier.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fixture.interrupt.reraise_pending().unwrap();
+        if status != 0 {
+            assert_eq!(fixture.interrupt.irq_fd().read().unwrap(), 1);
+        } else {
+            assert_eq!(
+                fixture.interrupt.irq_fd().read().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        fixture.interrupt.acknowledge(status);
+        fixture.interrupt.reraise_pending().unwrap();
+        assert_eq!(
+            fixture.interrupt.irq_fd().read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    fixture.interrupt.restore_status(2).unwrap();
+    for status in [4, 7, 1 << 31, u32::MAX] {
+        let mut snapshot = fixture.snapshot();
+        snapshot.interrupt_status = status;
+        assert!(matches!(
+            fixture.restore(snapshot, None),
+            Err(RestoreError::Interrupt(error)) if error.0 == status
+        ));
+        assert_eq!(fixture.interrupt.status(), 2);
+        assert_eq!(
+            fixture.interrupt.irq_fd().read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[tokio::test(flavor = "local")]
+async fn transport_restored_negotiation_activates_only_on_explicit_driver_ok() {
+    let mut fixture = TransportFixture::new();
+    let transport = fixture.restore(fixture.ready_snapshot(11), None).unwrap();
+    assert!(fixture.receiver.try_recv().is_none());
+    transport.write(0x70, &15u32.to_le_bytes());
+    let activation = fixture.receiver.recv().await.unwrap();
+    assert_eq!(activation.queues[0].size(), QUEUE_SIZE);
+    assert_eq!(fixture.notifier.read().unwrap(), 1);
+    drop(activation);
+    transport.write(0x70, &0u32.to_le_bytes());
+    assert_eq!(reg(&transport, 0x70), 0);
+}
+
+#[tokio::test(flavor = "local")]
+async fn restored_transport_pairs_queue_progress_with_a_worker_parked_until_resume() {
+    let disk = TempDisk::new("transport-restore", &[0xab; SECTOR_SIZE]);
+    let source = Block::new(&disk, false, Placement::VmmMain, Start::Running, None);
+    let mut guest = GuestDriver::new();
+    let transport = source.transport(&guest);
+    configure(&transport, USED_RING as u32, u32::from(QUEUE_SIZE));
+    request(&mut guest, VIRTIO_BLK_T_IN, 0, SECTOR_SIZE as u32);
+    source.complete(&guest, 1).await;
+    let Response::Replied(BlockQuiesced::Active(queue)) = source.control.quiesce(WITHIN).await
+    else {
+        panic!("source queue inactive");
+    };
+    let snapshot = transport.snapshot();
+    source.shutdown().await;
+    drop(transport);
+
+    let restored = Block::new(&disk, false, Placement::VmmMain, Start::Parked, None);
+    let transport =
+        restored.restored_transport(&guest, snapshot.clone(), Queue::try_from(queue).unwrap());
+    assert_eq!(transport.snapshot(), snapshot);
+    assert_eq!(
+        restored
+            .handle
+            .interrupt
+            .irq_fd()
+            .read()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let (data, status, _) = request(&mut guest, VIRTIO_BLK_T_IN, 0, SECTOR_SIZE as u32);
+    transport.write(0x50, &0u32.to_le_bytes());
+    assert_eq!(
+        restored.control.quiesce(WITHIN).await,
+        Response::Replied(BlockQuiesced::Active(queue))
+    );
+    assert_eq!(guest.used_idx(), 1);
+    assert_eq!(guest.read_bytes(status, 1), [0xff]);
+    restored.handle.interrupt.reraise_pending().unwrap();
+    assert_eq!(restored.handle.interrupt.irq_fd().read().unwrap(), 1);
+    assert_eq!(restored.control.resume(WITHIN).await, Response::Replied(()));
+    wait_until("restored transport completion", || guest.used_idx() == 2).await;
+    assert_eq!(guest.read_bytes(status, 1), [VIRTIO_BLK_S_OK]);
+    assert_eq!(guest.read_bytes(data, SECTOR_SIZE), [0xab; SECTOR_SIZE]);
+    restored.shutdown().await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn restored_transport_reset_releases_backend_ram_without_resuming_the_worker() {
+    let disk = TempDisk::new("restored-reset", &[0xab; SECTOR_SIZE]);
+    let block = Block::new(&disk, false, Placement::Io, Start::Parked, None);
+    let mut fixture = TransportFixture::new();
+    fixture.desc = block.handle.desc.clone();
+    let mut snapshot = fixture.ready_snapshot(15 | NEEDS_RESET);
+    snapshot.interrupt_status = 2;
+    let queue = Queue::try_from(fixture.guest.queue().state()).unwrap();
+    let transport = block.restored_transport(&fixture.guest, snapshot, queue);
+    let (_, status, _) = request(&mut fixture.guest, VIRTIO_BLK_T_IN, 0, SECTOR_SIZE as u32);
+    transport.write(0x50, &0u32.to_le_bytes());
+    assert!(matches!(
+        block.control.quiesce(WITHIN).await,
+        Response::Replied(BlockQuiesced::Active(_))
+    ));
+    assert_eq!(Arc::strong_count(&fixture.guest.mem), 3);
+    reset(transport.clone()).await;
+    assert_eq!(Arc::strong_count(&fixture.guest.mem), 2);
+    assert_eq!(transport.snapshot().regs, MmioRegs::new(&block.handle.desc));
+    assert_eq!(reg(&transport, 0x60), 0);
+    assert_eq!(fixture.guest.used_idx(), 0);
+    assert_eq!(fixture.guest.read_bytes(status, 1), [0xff]);
+    assert_eq!(
+        block.control.quiesce(WITHIN).await,
+        Response::Replied(BlockQuiesced::Inactive)
+    );
     block.shutdown().await;
 }

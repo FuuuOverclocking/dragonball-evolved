@@ -23,6 +23,10 @@ pub struct IrqTrigger {
     resample_fd: EventFd,
 }
 
+/// invalid saved virtio interrupt status {0:#x}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, displaydoc::Display, thiserror::Error)]
+pub struct InterruptStatusError(pub u32);
+
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub enum ResampleError {
     /// register the interrupt resample descriptor
@@ -59,6 +63,22 @@ impl IrqTrigger {
         self.status.fetch_and(!bits, Ordering::SeqCst);
     }
 
+    /// Restore status without injecting an interrupt; the caller keeps workers quiesced.
+    pub fn restore_status(&self, status: u32) -> Result<(), InterruptStatusError> {
+        if status & !(VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG) != 0 {
+            return Err(InterruptStatusError(status));
+        }
+        self.status.store(status, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn reraise_pending(&self) -> io::Result<()> {
+        if self.status() != 0 {
+            self.irq_fd.write(1)?;
+        }
+        Ok(())
+    }
+
     pub fn irq_fd(&self) -> &EventFd {
         &self.irq_fd
     }
@@ -83,9 +103,7 @@ impl IrqTrigger {
                 }
                 result = resample.read() => {
                     result.map_err(ResampleError::Read)?;
-                    if self.status() != 0 {
-                        self.irq_fd.write(1).map_err(ResampleError::Inject)?;
-                    }
+                    self.reraise_pending().map_err(ResampleError::Inject)?;
                 }
             }
             tokio::task::yield_now().await;
@@ -95,12 +113,58 @@ impl IrqTrigger {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::time::Duration;
 
     use super::*;
     use crate::devices::runtime::{DeviceRuntime, Response, Start};
+    use crate::error::render_chain;
 
     const WITHIN: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn resample_errors_preserve_typed_sources() {
+        for (error, message) in [
+            (
+                ResampleError::Register(io::Error::other("resample failure")),
+                "register the interrupt resample descriptor",
+            ),
+            (
+                ResampleError::Read(io::Error::other("resample failure")),
+                "read the interrupt resample descriptor",
+            ),
+            (
+                ResampleError::Inject(io::Error::other("resample failure")),
+                "reinject the pending interrupt",
+            ),
+        ] {
+            let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
+            assert_eq!(source.kind(), io::ErrorKind::Other);
+            assert_eq!(error.to_string(), message);
+            assert_eq!(render_chain(&error), format!("{message}: resample failure"));
+        }
+    }
+
+    #[test]
+    fn restored_status_replaces_bits_without_injection() {
+        let interrupt = IrqTrigger::new().unwrap();
+        interrupt.restore_status(3).unwrap();
+        interrupt.restore_status(1).unwrap();
+        assert_eq!(interrupt.status(), 1);
+        assert_eq!(interrupt.restore_status(5), Err(InterruptStatusError(5)));
+        assert_eq!(interrupt.status(), 1);
+        assert_eq!(
+            interrupt.irq_fd().read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        interrupt.restore_status(0).unwrap();
+        interrupt.reraise_pending().unwrap();
+        assert_eq!(interrupt.status(), 0);
+        assert_eq!(
+            interrupt.irq_fd().read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
 
     #[tokio::test(flavor = "local")]
     async fn resample_only_reinjects_pending_bits_and_parks() {

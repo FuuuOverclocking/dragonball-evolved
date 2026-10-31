@@ -419,8 +419,9 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
     - 根盘 REST/串口验证日志证明 Pause/Resume 后仍可读 `/dev/vda` 的 512 字节，位于 `/work/dbe-kernel/p5b-root-control.{stdout,api.log}`。
     - 失败注入覆盖的遗留：注册与任务生成之间的装配失败、卡住 worker 的可重试 RAM 清理，随 P5c 的失败所有权处理补上。
   - [ ] **P5c 快照与失败资源保留**：
-    - [x] **P5c1 暂停证明**：CPU 转换失败返回只能拆除的 `FailedMachine`，不再返回未证明的 Running/Paused 状态；主循环直接移交失败资源给拆除流程。Timeout 优先于 Exited，仅 Exited 的失败可由真实 GuestReset 判为正常退出；编译失败测试、混合 ACK 和一次性资源移交测试通过。
-    - [ ] **P5c2 transport 状态恢复**（进行中）：纯数据快照、描述符/队列/状态校验、构造时绑定恢复会话、IRQ 状态恢复与显式补发分离。
+    - [x] **P5c1 暂停证明**（`62d75c2`）：CPU 转换失败返回只能拆除的 `FailedMachine`，不再返回未证明的 Running/Paused 状态；主循环直接移交失败资源给拆除流程。Timeout 优先于 Exited，仅 Exited 的失败可由真实 GuestReset 判为正常退出；编译失败测试、混合 ACK 和一次性资源移交测试通过。
+    - [x] **P5c2 transport 状态恢复**：纯数据快照、描述符/队列/状态校验、构造时绑定恢复会话、IRQ 状态恢复与显式补发分离。修正子代理误删的 source/from 属性，补错误链与下转型测试；35 项 block/transport 集成测试通过。
+    - 两组改动合并验收：fmt、clippy、API feature matrix、schema、KVM workspace 共 380 项通过；真实 Linux 根盘只读启动、完整标记和正常退出再次通过。
     - [ ] **P5c3 整机 capture/rebuild**：平台输入暂存、KVM 状态、逐设备状态、共享停泊装配和可重试失败清理。
 - [ ] P6 virtio-mem
 - [ ] P7 快照持久化
