@@ -15,6 +15,10 @@ pub mod spec;
 pub mod vm;
 mod vmm_server;
 
+#[cfg(test)]
+#[path = "../tests/common/elf.rs"]
+mod test_guest;
+
 use std::{io, thread};
 
 use tokio::runtime::{Builder, LocalOptions};

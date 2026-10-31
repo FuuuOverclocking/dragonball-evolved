@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt::Write;
 
+use api::ApiError;
+
 /// Renders `error` and its source chain as `outer: inner: innermost`, for
 /// `ApiError` replies and `VmmExitStatus::Error`.
 pub(crate) fn render_chain(error: &dyn Error) -> String {
@@ -11,6 +13,11 @@ pub(crate) fn render_chain(error: &dyn Error) -> String {
         source = cause.source();
     }
     message
+}
+
+/// The reply for a request that failed with `error`, its source chain included.
+pub(crate) fn api_error(error: &dyn Error) -> ApiError {
+    ApiError::msg(render_chain(error))
 }
 
 #[cfg(test)]

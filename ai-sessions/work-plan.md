@@ -269,8 +269,8 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
 ### P4 生命周期与接线
 
 - Controller 状态 × 请求保持穷举 match（design.md §4.3 的表仍然适用）。
-- 用一个通用的操作构造（取消、回复、归还 Vm）实现 Start / Pause / Resume。
-- Busy 期间仍观察 GuestReset、VcpuFailed、DeviceExit。pause 进行中收到 GuestReset：取消操作，然后拆除。
+- 操作 future 独占机器，按类型区分 Start / Pause / Resume 的完成结果；操作不取消，等待本身有上限。
+- Busy 期间仍观察 GuestReset、VcpuFailed、DeviceExit。Shutdown 立即确认并关闭请求入口；Shutdown 或 GuestReset 到达时，等待在途操作归还机器后再拆除。
 - 为“已构建、未运行”定义独立状态。
 - 接通 Start，并恢复顶层被 ignore 的测试。
 
@@ -393,9 +393,12 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
   - vCPU 线程沿用旧的踢出与 I/O 完成语义；`MachineEvents`（机器事件 + 设备退出）与机器分开持有。
   - 测试：机器级 KVM 测试（mini guest 启动到复位、双 vCPU 拆除并交还内存、initrd modlist、状态往返、两种状态都能拆除）；构建失败不泄漏 fd、线程与映射；`compile_fail` 证明运行中的机器没有暂停态的 API。全 workspace 292 项通过。
   - 执行说明：子代理在收尾阶段长时间无进展并被停止，但代码已完整、检查全部通过，由主会话审查后提交。
-- [ ] **P4 生命周期与接线**。
-- [ ] P3 机器核心
-- [ ] P4 生命周期与接线
+- [x] **P4 生命周期与接线**：
+  - `main_loop::controller`：NotStarted / Running / Paused / Busy；在途操作独占机器，事件由主循环继续接收，Shutdown 不取消操作。
+  - Start 接通；plan 在 P5 之前明确拒绝磁盘配置，不静默忽略。
+  - fmt、clippy、API feature matrix、schema 和 KVM workspace 测试通过；Busy 与完成轮次中的复位事件有确定性回归覆盖，补充 `vmm::start` 公开接口的复位/暂停/恢复并发测试，boot 测试连续 10 次通过。
+  - 真实 CLI：双 vCPU、512 MiB、shared backing，Linux 7.3 + initramfs 启动，输出 `DBE_LINUX_OK` 后 `reboot -f`，VMM 退出码 0。配置与完整日志位于 `/work/dbe-kernel/pvh-smoke.{toml,stdout,stderr}`。
+  - 真实 Linux REST：anonymous backing；GET Running → Pause → GET Paused → 输入串口行（暂停期间不处理）→ Resume → guest 读到原行并重启，VMM 退出码 0。驱动为 `/work/dbe-kernel/drive-control.py`，日志为 `pvh-control.{stdout,stderr}`。验证用 init 在强制重启前调用 `tcdrain`，避免把 guest TTY 未排空误认为 VMM 丢数据。
 - [ ] P5 virtio-blk 与快照
 - [ ] P6 virtio-mem
 - [ ] P7 快照持久化

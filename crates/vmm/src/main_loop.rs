@@ -1,236 +1,415 @@
-use std::error::Error;
+//! Lifecycle decisions live in `controller`; this loop owns requests, events
+//! and one local operation future at a time. Selecting only borrows that
+//! future: losing a select round never drops or cancels the operation.
 
-use api::instance_info::{InstanceInfo, VmState};
-use api::logger::UpdateLogger;
-use api::{ApiError, ApiResult, Reply, VmmCommand, VmmRequest};
+mod controller;
 
+use std::future::pending;
+
+use api::{ApiResult, Reply};
+use logger::warn_unlimited;
+use tokio::select;
+
+use self::controller::{
+    Busy, Controller, Event, Exit, Instance, Live, Next, StartError, Transition,
+};
 use crate::VmmExitStatus;
 use crate::error::render_chain;
-use crate::process_ctx::{ProcessCtx, UpdateLoggerFn};
+use crate::machine::{
+    Machine, MachineEvents, MachinePlan, PauseError, PausedMachine, ResumeError, build,
+};
+use crate::process_ctx::ProcessCtx;
 use crate::spec::MachineSpec;
 use crate::vmm_server::{Inbound, VmmServer};
 
-#[derive(Debug, displaydoc::Display, thiserror::Error)]
-enum Rejection {
-    /// starting a machine is not supported yet
-    StartUnsupported,
-    /// machine is not started
-    NotStarted,
-    /// live upgrade is not supported
-    HandoverUnsupported,
-}
+type State = Controller<Machine, PausedMachine>;
 
-/// What request handling needs from the process: everything but KVM.
-#[derive(Clone, Copy)]
-struct Instance<'a> {
-    id: &'a str,
-    version: &'a str,
-    update_logger: UpdateLoggerFn,
-}
-
-enum Step {
-    Continue(MachineSpec),
-    Exit(VmmExitStatus),
+/// Completion variants carry exactly the machine type their operation returns.
+enum Input {
+    Inbound(Inbound),
+    Event(Event),
+    Started(Result<Machine, StartError>),
+    Paused(Result<PausedMachine, (Machine, PauseError)>),
+    Resumed(Result<Machine, (PausedMachine, ResumeError)>),
 }
 
 pub(crate) async fn run(server: VmmServer, ctx: &ProcessCtx) -> VmmExitStatus {
+    serve(server, ctx, State::NotStarted(MachineSpec::default())).await
+}
+
+async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> VmmExitStatus {
     let instance = Instance {
         id: &ctx.id,
         version: &ctx.version,
         update_logger: ctx.update_logger,
     };
-    serve(server, instance).await
-}
-
-async fn serve(mut server: VmmServer, instance: Instance<'_>) -> VmmExitStatus {
-    let mut spec = MachineSpec::default();
+    let mut server = Some(server);
+    let mut stopping = None;
     loop {
-        let request = match server.next_inbound().await {
-            Inbound::Request(request) => request,
-            // No machine exists yet, so nothing outlives the clients.
-            Inbound::Detached => return VmmExitStatus::Ok,
+        // On exit, an operation still owns its machine until it finishes.
+        // Keep selecting events meanwhile, but never take another request.
+        if let Some(exit) = stopping.take() {
+            match &controller {
+                Controller::Busy(_) => stopping = Some(exit),
+                Controller::NotStarted(_) | Controller::Running(_) | Controller::Paused(_) => {
+                    return teardown(controller, exit).await;
+                }
+            }
+        }
+        let input = next_input(&mut controller, &mut server).await;
+        // The operation can enqueue an event during its final poll, AFTER
+        // the event arm was polled. Consume it before dropping Start's events
+        // or moving straight from completion to teardown.
+        match &input {
+            Input::Started(_) | Input::Paused(_) | Input::Resumed(_) => {
+                let events = match &mut controller {
+                    Controller::Busy(Busy::Starting(starting)) => &mut starting.events,
+                    Controller::Busy(Busy::Pausing(pausing)) => &mut pausing.events,
+                    Controller::Busy(Busy::Resuming(resuming)) => &mut resuming.events,
+                    Controller::NotStarted(_) | Controller::Running(_) | Controller::Paused(_) => {
+                        unreachable!("completion while not Busy")
+                    }
+                };
+                while let Ok(event) = events.machine.try_recv() {
+                    let exit = machine_exit(event);
+                    stopping = Some(prefer_exit(stopping.take(), exit));
+                    server = None;
+                }
+            }
+            Input::Inbound(_) | Input::Event(_) => {}
+        }
+        let next = match (controller, input) {
+            (state, Input::Inbound(inbound)) => controller::on_inbound(state, inbound, instance),
+            (state, Input::Event(event)) => controller::on_event(state, event),
+            (Controller::Busy(Busy::Starting(starting)), Input::Started(result)) => {
+                controller::on_started(starting, result)
+            }
+            (Controller::Busy(Busy::Pausing(pausing)), Input::Paused(result)) => {
+                controller::on_paused(pausing, result)
+            }
+            (Controller::Busy(Busy::Resuming(resuming)), Input::Resumed(result)) => {
+                controller::on_resumed(resuming, result)
+            }
+            // next_input only polls the operation belonging to this state.
+            (
+                Controller::NotStarted(_) | Controller::Running(_) | Controller::Paused(_),
+                Input::Started(_) | Input::Paused(_) | Input::Resumed(_),
+            )
+            | (Controller::Busy(Busy::Starting(_)), Input::Paused(_) | Input::Resumed(_))
+            | (Controller::Busy(Busy::Pausing(_)), Input::Started(_) | Input::Resumed(_))
+            | (Controller::Busy(Busy::Resuming(_)), Input::Started(_) | Input::Paused(_)) => {
+                unreachable!("completion from a different operation")
+            }
         };
-        match handle(spec, request, instance) {
-            Step::Continue(next) => spec = next,
-            Step::Exit(status) => return status,
-        }
+        controller = match next {
+            Next::Stay(state) => state,
+            Next::Start(spec, reply) => start(spec, reply, ctx),
+            Next::Pause(running, reply) => {
+                Controller::Busy(Busy::Pausing(Transition::new(running, reply, |machine| {
+                    Box::pin(machine.pause())
+                })))
+            }
+            Next::Resume(paused, reply) => {
+                Controller::Busy(Busy::Resuming(Transition::new(paused, reply, |machine| {
+                    Box::pin(machine.resume())
+                })))
+            }
+            Next::Exit(state, exit) => {
+                // Dropping the receiver closes admission and drops queued replies.
+                server = None;
+                // A fatal event while stopping must not be hidden by Shutdown/reset.
+                stopping = Some(prefer_exit(stopping.take(), exit));
+                state
+            }
+        };
     }
 }
 
-fn handle(spec: MachineSpec, request: VmmRequest, instance: Instance<'_>) -> Step {
-    match request {
-        VmmRequest::GetInstanceInfo(_, reply) => reply.send(InstanceInfo {
-            id: instance.id.to_owned(),
-            version: instance.version.to_owned(),
-            state: VmState::NotStarted,
+fn start(spec: MachineSpec, reply: Reply<ApiResult<()>>, ctx: &ProcessCtx) -> State {
+    // The documented synchronous exception on vmm-main: reading kernel/initrd
+    // and building the parked machine. It has not run any guest code yet.
+    let built = MachinePlan::new(&spec, ctx.kvm_ctx.capabilities())
+        .map_err(StartError::Plan)
+        .and_then(|(plan, policy)| build(plan, policy, &ctx.kvm_ctx).map_err(StartError::Build));
+    controller::on_built(
+        spec,
+        reply,
+        built.map(|(paused, events)| {
+            let operation: controller::Operation<Result<Machine, StartError>> =
+                Box::pin(async move {
+                    match paused.resume().await {
+                        Ok(running) => Ok(running),
+                        Err((paused, error)) => {
+                            // A failed first resume is retryable, but only after
+                            // tearing down the machine it returned. Never cancel this.
+                            warn_unlimited!("failed Start: {}", render_chain(&error));
+                            paused.teardown().await.map_err(StartError::Teardown)?;
+                            Err(StartError::Resume(error))
+                        }
+                    }
+                });
+            (operation, events)
         }),
-        VmmRequest::UpdateLogger(UpdateLogger(config), reply) => {
-            reply.send((instance.update_logger)(config).map_err(|error| api_error(&*error)));
-        }
-        VmmRequest::SetCpus(value, reply) => {
-            return configure(spec, VmmCommand::SetCpus(value, ()), reply);
-        }
-        VmmRequest::SetMemory(value, reply) => {
-            return configure(spec, VmmCommand::SetMemory(value, ()), reply);
-        }
-        VmmRequest::SetMemoryBacking(value, reply) => {
-            return configure(spec, VmmCommand::SetMemoryBacking(value, ()), reply);
-        }
-        VmmRequest::SetConsole(value, reply) => {
-            return configure(spec, VmmCommand::SetConsole(value, ()), reply);
-        }
-        VmmRequest::SetKernel(value, reply) => {
-            return configure(spec, VmmCommand::SetKernel(value, ()), reply);
-        }
-        VmmRequest::AddDisk(value, reply) => {
-            return configure(spec, VmmCommand::AddDisk(value, ()), reply);
-        }
-        VmmRequest::Start(_, reply) => reply.send(Err(api_error(&Rejection::StartUnsupported))),
-        VmmRequest::Pause(_, reply) | VmmRequest::Resume(_, reply) => {
-            reply.send(Err(api_error(&Rejection::NotStarted)));
-        }
-        VmmRequest::HandoverState(_, reply) => {
-            reply.send(Err(api_error(&Rejection::HandoverUnsupported)));
-        }
-        VmmRequest::Shutdown(_, reply) => {
-            reply.send(Ok(()));
-            return Step::Exit(VmmExitStatus::Ok);
-        }
-    }
-    Step::Continue(spec)
+    )
 }
 
-fn configure(spec: MachineSpec, command: VmmCommand, reply: Reply<ApiResult<()>>) -> Step {
-    match spec.apply(command) {
-        Ok(next) => {
-            reply.send(Ok(()));
-            Step::Continue(next)
+/// Events precede completions and requests. In particular a reset is not
+/// reclassified as a fatal PauseError::Exited if both are ready together.
+async fn next_input(state: &mut State, server: &mut Option<VmmServer>) -> Input {
+    match state {
+        Controller::NotStarted(_) => Input::Inbound(next_inbound(server).await),
+        Controller::Running(Live { events, .. }) | Controller::Paused(Live { events, .. }) => {
+            select! {
+                biased;
+                event = next_event(events) => Input::Event(event),
+                inbound = next_inbound(server) => Input::Inbound(inbound),
+            }
         }
-        Err(error) => {
-            reply.send(Err(api_error(&error)));
-            Step::Continue(spec)
+        Controller::Busy(Busy::Starting(starting)) => {
+            select! {
+                biased;
+                event = next_event(&mut starting.events) => Input::Event(event),
+                result = &mut starting.operation => Input::Started(result),
+                inbound = next_inbound(server) => Input::Inbound(inbound),
+            }
+        }
+        Controller::Busy(Busy::Pausing(pausing)) => {
+            select! {
+                biased;
+                event = next_event(&mut pausing.events) => Input::Event(event),
+                result = &mut pausing.operation => Input::Paused(result),
+                inbound = next_inbound(server) => Input::Inbound(inbound),
+            }
+        }
+        Controller::Busy(Busy::Resuming(resuming)) => {
+            select! {
+                biased;
+                event = next_event(&mut resuming.events) => Input::Event(event),
+                result = &mut resuming.operation => Input::Resumed(result),
+                inbound = next_inbound(server) => Input::Inbound(inbound),
+            }
         }
     }
 }
 
-fn api_error(error: &dyn Error) -> ApiError {
-    ApiError::msg(render_chain(error))
+async fn next_inbound(server: &mut Option<VmmServer>) -> Inbound {
+    match server {
+        Some(server) => server.next_inbound().await,
+        None => pending().await,
+    }
+}
+
+/// Closed streams do not spin or hide the other source. Both recv methods
+/// are cancel-safe; an unready event future can be dropped each select round.
+async fn next_event(events: &mut MachineEvents) -> Event {
+    select! {
+        biased;
+        Some(event) = events.machine.recv() => Event::Machine(event),
+        Some(exit) = events.devices.next() => Event::Device(exit),
+        else => pending().await,
+    }
+}
+
+fn prefer_exit(prior: Option<Exit>, next: Exit) -> Exit {
+    match (prior, next) {
+        (_, teardown @ Exit::StartTeardown(_)) => teardown,
+        (Some(prior @ Exit::StartTeardown(_)), _) => prior,
+        (_, fatal @ Exit::VcpuFailed { .. }) => fatal,
+        (Some(prior @ Exit::VcpuFailed { .. }), _) => prior,
+        (Some(reset @ Exit::GuestReset), Exit::TransitionFailed(_)) => reset,
+        (Some(Exit::TransitionFailed(_)), reset @ Exit::GuestReset) => reset,
+        (_, failure @ Exit::TransitionFailed(_)) => failure,
+        (Some(prior), _) => prior,
+        (None, exit) => exit,
+    }
+}
+
+fn machine_exit(event: crate::machine::MachineEvent) -> Exit {
+    match event {
+        crate::machine::MachineEvent::GuestReset => Exit::GuestReset,
+        crate::machine::MachineEvent::VcpuFailed { index, error } => {
+            Exit::VcpuFailed { index, error }
+        }
+    }
+}
+
+async fn teardown(state: State, mut exit: Exit) -> VmmExitStatus {
+    // Busy is settled by the serving loop, which keeps observing events.
+    let (mut operation, mut events): (controller::Operation<_>, _) = match state {
+        Controller::NotStarted(_) => return controller::exit_status(exit, Ok(())),
+        Controller::Running(Live { machine, events }) => (
+            Box::pin(async move { machine.teardown().await.map(drop) }),
+            events,
+        ),
+        Controller::Paused(Live { machine, events }) => (
+            Box::pin(async move { machine.teardown().await.map(drop) }),
+            events,
+        ),
+        Controller::Busy(_) => unreachable!("teardown before the operation finished"),
+    };
+    // Teardown is also never cancelled. Events retain their meaning until it
+    // completes; a late vCPU failure must not disappear behind Shutdown.
+    let result = loop {
+        select! {
+            biased;
+            event = next_event(&mut events) => match event {
+                Event::Machine(event) => exit = prefer_exit(Some(exit), machine_exit(event)),
+                Event::Device(device) => warn_unlimited!("device {} exited during teardown", device.name),
+            },
+            result = &mut operation => break result,
+        }
+    };
+    // Same final-poll race as a lifecycle completion above.
+    while let Ok(event) = events.machine.try_recv() {
+        exit = prefer_exit(Some(exit), machine_exit(event));
+    }
+    controller::exit_status(exit, result)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+
+    use std::path::Path;
+    use std::time::Duration;
 
     use api::RawVmmOp;
-    use api::block::{AddDisk, BlockDevConfig};
-    use api::instance_info::GetInstanceInfo;
-    use api::lifecycle::{Pause, Resume, Shutdown, Start};
-    use api::live_upgrade::HandoverState;
-    use api::logger::LoggerConfig;
-    use api::machine::{SetCpus, VcpuCount};
+    use api::boot::{KernelConfig, SetKernel};
+    use api::lifecycle::Pause;
+    use api::machine::{ConsoleConfig, SetConsole, SetCpus, VcpuCount};
+    use tokio::sync::oneshot;
+    use vm_memory::{Bytes, GuestAddress};
 
     use super::*;
-    use crate::spec::SpecError;
-    use crate::vmm_server::{VmmClient, pair};
-
-    const INSTANCE: Instance<'static> = Instance {
-        id: "test-id",
-        version: "test-version",
-        update_logger: |_| Ok(()),
-    };
-
-    fn send<Op: RawVmmOp>(client: &VmmClient, op: Op) -> oneshot::Receiver<Op::Response> {
-        let (request, reply) = op.into_vmm_request();
-        client.send(request).unwrap();
-        reply
-    }
-
-    fn root_disk() -> AddDisk {
-        AddDisk(BlockDevConfig {
-            id: None,
-            path: "/test/disk".into(),
-            read_only: false,
-            root: true,
-        })
-    }
-
-    fn rejected(error: impl Error) -> Result<ApiResult<()>, oneshot::TryRecvError> {
-        Ok(Err(api_error(&error)))
-    }
+    use crate::{KvmContext, test_guest as elf};
 
     #[tokio::test(flavor = "local")]
-    async fn configuration_accumulates_and_reports_rule_violations() {
-        let (client, server) = pair();
-        let replies = [
-            send(&client, SetCpus(VcpuCount(2))),
-            send(&client, SetCpus(VcpuCount(0))),
-            send(&client, root_disk()),
-            send(&client, root_disk()),
-        ];
-        drop(client);
-        assert_eq!(serve(server, INSTANCE).await, VmmExitStatus::Ok);
-
-        let [cpus, no_cpus, disk, second_root] = replies;
-        assert_eq!(cpus.try_recv(), Ok(Ok(())));
-        assert_eq!(no_cpus.try_recv(), rejected(SpecError::VcpuCount(0)));
-        assert_eq!(disk.try_recv(), Ok(Ok(())));
-        assert_eq!(second_root.try_recv(), rejected(SpecError::SecondRootDisk));
-    }
-
-    #[tokio::test(flavor = "local")]
-    async fn lifecycle_requests_are_rejected_until_shutdown() {
-        let (client, server) = pair();
-        let info = send(&client, GetInstanceInfo);
-        let start = send(&client, Start);
-        let pause = send(&client, Pause);
-        let resume = send(&client, Resume);
-        let handover = send(&client, HandoverState {});
-        let shutdown = send(&client, Shutdown);
-        let late = send(&client, GetInstanceInfo);
-        assert_eq!(serve(server, INSTANCE).await, VmmExitStatus::Ok);
-
-        let info = info.try_recv().unwrap();
-        assert_eq!(
-            (info.id.as_str(), info.version.as_str(), info.state),
-            ("test-id", "test-version", VmState::NotStarted)
-        );
-        assert_eq!(start.try_recv(), rejected(Rejection::StartUnsupported));
-        assert_eq!(pause.try_recv(), rejected(Rejection::NotStarted));
-        assert_eq!(resume.try_recv(), rejected(Rejection::NotStarted));
-        assert_eq!(
-            handover.try_recv().unwrap().unwrap_err(),
-            api_error(&Rejection::HandoverUnsupported)
-        );
-        assert_eq!(shutdown.try_recv(), Ok(Ok(())));
-        assert_eq!(late.try_recv(), Err(oneshot::TryRecvError::Disconnected));
-    }
-
-    /// apply the logger configuration
-    #[derive(Debug, displaydoc::Display, thiserror::Error)]
-    struct LoggerFailed(#[source] io::Error);
-
-    #[tokio::test(flavor = "local")]
-    async fn logger_updates_report_their_whole_error_chain() {
-        let instance = Instance {
-            update_logger: |_| Err(LoggerFailed(io::Error::other("target is gone")).into()),
-            ..INSTANCE
+    async fn events_queued_in_a_failed_starts_final_poll_are_not_lost() {
+        if !Path::new("/dev/kvm").exists() {
+            return;
+        }
+        let ctx = ProcessCtx {
+            id: "final-poll".into(),
+            version: "test".into(),
+            kvm_ctx: KvmContext::from_dev_path("/dev/kvm").unwrap(),
+            update_logger: |_| Ok(()),
         };
-        let (client, server) = pair();
-        let update = send(&client, UpdateLogger(LoggerConfig::default()));
-        drop(client);
-        assert_eq!(serve(server, instance).await, VmmExitStatus::Ok);
-        assert_eq!(
-            update.try_recv(),
-            Ok(Err(ApiError::msg(
-                "apply the logger configuration: target is gone"
-            )))
-        );
+        for (event, expected) in [
+            (crate::machine::MachineEvent::GuestReset, VmmExitStatus::Ok),
+            (
+                crate::machine::MachineEvent::VcpuFailed {
+                    index: 0,
+                    error: "injected fault".into(),
+                },
+                VmmExitStatus::Error("vCPU 0 failed: injected fault".into()),
+            ),
+        ] {
+            let (sender, machine) = tokio::sync::mpsc::unbounded_channel();
+            let (_, devices) = crate::devices::runtime::DeviceRuntime::new();
+            let events = MachineEvents { machine, devices };
+            let (request, answer) = api::lifecycle::Start.into_vmm_request();
+            let api::VmmRequest::Start(_, reply) = request else {
+                unreachable!()
+            };
+            let operation = Box::pin(async move {
+                sender.send(event).unwrap();
+                Err(StartError::Resume(ResumeError(
+                    crate::machine::VcpuError::Exited(0),
+                )))
+            });
+            let state = State::Busy(Busy::Starting(controller::Starting::new(
+                MachineSpec::default(),
+                reply,
+                events,
+                operation,
+            )));
+            let (_client, server) = crate::vmm_server::pair();
+            let status = tokio::time::timeout(Duration::from_secs(3), serve(server, &ctx, state))
+                .await
+                .expect("the final-poll event was dropped with failed Start");
+            assert_eq!(status, expected);
+            assert!(answer.try_recv().unwrap().is_err());
+        }
     }
 
     #[tokio::test(flavor = "local")]
-    async fn losing_every_client_before_start_exits_cleanly() {
-        let (client, server) = pair();
-        drop(client);
-        assert_eq!(serve(server, INSTANCE).await, VmmExitStatus::Ok);
+    async fn guest_reset_during_an_in_flight_pause_on_kvm() {
+        if !Path::new("/dev/kvm").exists() {
+            return;
+        }
+        let kvm = KvmContext::from_dev_path("/dev/kvm").unwrap();
+        // Wait for the host's flag, then reset via i8042. No timing sleeps.
+        let mut code = vec![
+            0x83, 0x3d, 0x00, 0x80, 0x00, 0x00, 0x00, // cmp dword [0x8000], 0
+            0x74, 0xf7, // je back
+        ];
+        code.extend(elf::serial_reset_payload(false));
+        let kernel = elf::TempFile::new(&elf::image(&code, true));
+        let spec = [
+            SetKernel(KernelConfig {
+                path: kernel.path().into(),
+                cmdline: None,
+                initrd: None,
+            })
+            .into_vmm_command(),
+            SetConsole(ConsoleConfig::None).into_vmm_command(),
+            SetCpus(VcpuCount(2)).into_vmm_command(),
+        ]
+        .into_iter()
+        .try_fold(MachineSpec::default(), |spec, op| spec.apply(op))
+        .unwrap();
+        let (plan, policy) = MachinePlan::new(&spec, kvm.capabilities()).unwrap();
+        let (paused, events) = build(plan, policy, &kvm).unwrap();
+        let machine = paused.resume().await.map_err(|(_, e)| e).unwrap();
+        let memory = machine.memory().clone();
+        let (request, answer) = Pause.into_vmm_request();
+        let api::VmmRequest::Pause(_, reply) = request else {
+            unreachable!()
+        };
+        let (entered, started) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        // A controlled prelude models an in-flight bounded wait, then executes
+        // the real transition. The operation owns the real KVM machine all
+        // along; its loop must still receive the guest's *real* reset event.
+        let pausing = Transition::new(Live { machine, events }, reply, |machine| {
+            Box::pin(async move {
+                entered.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), wait)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                machine.pause().await
+            })
+        });
+        let state = State::Busy(Busy::Pausing(pausing));
+        let (client, server) = crate::vmm_server::pair();
+        let ctx = ProcessCtx {
+            id: "reset-during-pause".into(),
+            version: "test".into(),
+            kvm_ctx: kvm,
+            update_logger: |_| Ok(()),
+        };
+        let trigger = async {
+            started.await.unwrap();
+            memory.write_obj(1u32, GuestAddress(0x8000)).unwrap();
+            // The loop closes admission when it observes the reset, BEFORE
+            // the gated operation completes. Queries must not hide the event.
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let (request, _) = api::instance_info::GetInstanceInfo.into_vmm_request();
+                    if client.send(request).is_err() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Busy failed to observe the guest reset");
+            assert_eq!(answer.try_recv(), Err(::oneshot::TryRecvError::Empty));
+            drop(memory);
+            release.send(()).unwrap();
+        };
+        let (status, ()) = tokio::join!(serve(server, &ctx, state), trigger);
+        assert_eq!(status, VmmExitStatus::Ok);
+        assert_eq!(answer.try_recv(), Ok(Ok(())));
     }
 }

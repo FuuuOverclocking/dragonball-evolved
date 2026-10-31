@@ -1,9 +1,6 @@
 //! Machine-level tests on KVM, booting the mini PVH guest from
 //! `tests/common/elf.rs`.
 
-#[path = "../../tests/common/elf.rs"]
-mod elf;
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -27,6 +24,7 @@ use crate::kvm_context::KvmContext;
 use crate::memory::policy::BackingKind;
 use crate::memory::store::MemoryView;
 use crate::spec::MachineSpec;
+use crate::test_guest as elf;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const BOOT_OK: &[u8] = b"DBE_BOOT_OK\n";

@@ -58,7 +58,7 @@ fn run_config(config: &Path, limit: Duration) -> Output {
 }
 
 #[test]
-#[ignore = "P4: machine start is being rebuilt in crates/vmm"]
+#[ignore = "P5: virtio-blk is being rebuilt in crates/vmm"]
 fn configuration_autostarts_pvh_serial_and_virtio_block() {
     if !Path::new("/dev/kvm").exists() {
         return;
@@ -84,7 +84,6 @@ fn configuration_autostarts_pvh_serial_and_virtio_block() {
 }
 
 #[test]
-#[ignore = "P4: machine start is being rebuilt in crates/vmm"]
 fn pvh_module_list_points_to_loaded_initrd() {
     if !Path::new("/dev/kvm").exists() {
         return;
@@ -112,7 +111,6 @@ fn pvh_module_list_points_to_loaded_initrd() {
 }
 
 #[test]
-#[ignore = "P4: machine start is being rebuilt in crates/vmm"]
 fn configuration_boots_a_guest_on_shared_memory() {
     if !Path::new("/dev/kvm").exists() {
         return;
@@ -135,8 +133,9 @@ fn configuration_boots_a_guest_on_shared_memory() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("DBE_BOOT_OK"));
 }
 
+/// Requires DBE_KERNEL and optionally DBE_INITRD/DBE_ROOTFS.
 #[test]
-#[ignore = "requires DBE_KERNEL and optionally DBE_INITRD/DBE_ROOTFS; unavailable until P5 rebuilds machine start and virtio-blk"]
+#[ignore = "P5: virtio-blk is being rebuilt in crates/vmm"]
 fn linux_pvh_smoke_boot() {
     let kernel = std::env::var_os("DBE_KERNEL").expect("set DBE_KERNEL to a PVH vmlinux");
     let mut machine = serde_json::json!({ "memory_mib": 512, "kernel": { "path": std::path::PathBuf::from(kernel), "cmdline": std::env::var("DBE_CMDLINE").ok(), "initrd": std::env::var_os("DBE_INITRD").map(std::path::PathBuf::from) } });
@@ -290,7 +289,7 @@ async fn rest_api_configures_and_shuts_down_before_start() {
         reply["error"]
             .as_str()
             .unwrap()
-            .contains("not supported yet"),
+            .contains("virtio-blk is not supported yet"),
         "{reply}"
     );
     let (status, info) = api.request("GET", "/v1/", Value::Null).await;
@@ -304,7 +303,6 @@ async fn rest_api_configures_and_shuts_down_before_start() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "P4: machine start is being rebuilt in crates/vmm"]
 async fn rest_api_configures_pauses_and_shuts_down_a_real_vm() {
     use hyper_uds::StatusCode;
     if !Path::new("/dev/kvm").exists() {
@@ -373,5 +371,5 @@ async fn rest_api_configures_pauses_and_shuts_down_a_real_vm() {
             ));
         }
     }
-    api.wait_for_exit().await;
+    assert!(api.wait_for_exit().await.success());
 }

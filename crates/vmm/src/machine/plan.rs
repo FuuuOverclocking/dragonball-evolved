@@ -89,6 +89,8 @@ pub enum PlanError {
     Cmdline(#[source] CmdlineError),
     /// device id {0} is used twice
     DuplicateDevice(String),
+    /// disk {0} cannot be attached: virtio-blk is not supported yet
+    DiskUnsupported(String),
 }
 
 /// What the guest sees of a machine.
@@ -134,6 +136,11 @@ impl MachinePlan {
             .find(|device| !ids.insert(device.id()))
         {
             return Err(PlanError::DuplicateDevice(device.id().to_owned()));
+        }
+        // Refused rather than left out: a guest booted without the disks it
+        // was configured with would run against the wrong root.
+        if let Some(disk) = spec.blocks().next() {
+            return Err(PlanError::DiskUnsupported(disk.id.clone()));
         }
         let plan = Self {
             vcpus,
@@ -354,18 +361,29 @@ mod tests {
         ));
     }
 
+    fn disk(id: &str) -> api::VmmCommand {
+        AddDisk(BlockDevConfig {
+            id: Some(id.into()),
+            path: "/test/disk".into(),
+            read_only: false,
+            root: false,
+        })
+        .into_vmm_command()
+    }
+
+    #[test]
+    fn disks_are_refused_until_virtio_blk_is_back() {
+        let error = plan(&spec([disk("a"), disk("b")])).unwrap_err();
+        assert_eq!(error, PlanError::DiskUnsupported("a".into()));
+        assert_eq!(
+            error.to_string(),
+            "disk a cannot be attached: virtio-blk is not supported yet"
+        );
+    }
+
     #[test]
     fn device_ids_must_be_unique() {
-        let disk = |id: &str| {
-            AddDisk(BlockDevConfig {
-                id: Some(id.into()),
-                path: "/test/disk".into(),
-                read_only: false,
-                root: false,
-            })
-            .into_vmm_command()
-        };
-        assert!(plan(&spec([disk("a"), disk("b")])).is_ok());
+        // Checked before disks are refused, so the rule holds for any device.
         // `apply` refuses duplicates, so only a spec made some other way has them.
         let duplicated = spec([disk("a")]).with_device_unchecked(DeviceSpec::Block(BlockSpec {
             id: "a".into(),
