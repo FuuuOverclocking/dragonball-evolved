@@ -432,7 +432,13 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
       - 最终完整日志：`/work/dbe-kernel/p5c3-anonymous-1793450302740458021/`、`p5c3-shared-1793450306881183550/`；普通 CLI 再次输出 `DBE_LINUX_OK rootfs` 并正常 reboot，日志 `p5c3-cli-final.{stdout,stderr}`。
       - 本阶段遵循 `/verify`，未运行测试、typecheck、clippy 或 API/schema CI；新增确定性回归用例留给 CI。`cargo build --workspace` 和 VMM 格式检查通过。重复读取已缓存的第零扇区不证明后端 I/O；验证改为读取不同扇区并观察真实块计数。
       - 范围仍为同宿主、同进程、已有 RAM 的停机恢复；不包含持久化、磁盘内容快照、跨宿主迁移，也未启用动态 XSTATE 权限。不支持的 supervisor state 明确拒绝，P7 再处理持久化。
-- [ ] P6 virtio-mem
+- [ ] **P6 virtio-mem（执行中）**：阶段计划见 `ai-sessions/p6-plan.md`。
+  - [ ] P6a：固定 Window、Population、chunk slice 注册/discard 与协议纯核。
+  - [ ] P6b：I/O LocalRuntime 上的内存服务，独占 Population、注册及未完成变更。
+  - [ ] P6c：virtio-mem worker、动态配置/generation 和 pending 操作排空。
+  - [ ] P6d：配置/ResizeMemory API、按 kind 装配及生命周期。
+  - [ ] P6e：Population 快照和真实 Linux grow/shrink/zero/regrow 验收。
+  - 启动方式：先提交计划，再由不重叠子代理编写 P6a，主会话检查实际 diff 和公共 KVM 运行结果；保持没有 hotplug 配置的 VMM 可启动。
 - [ ] P7 快照持久化
 
 ## 附录 A：重写时必须保留的事实
