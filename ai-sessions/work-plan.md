@@ -349,7 +349,11 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
 
 - [x] **环境**：`fuu` 已加入 `kvm` 组。当前会话用 `sg kvm -c '…'` 运行需要 KVM 的命令，不必重新登录。
   - 基线：旧代码 `d970b2e` 在 KVM 下全部测试通过（vmm lib 102、block 17、boot 2 + 顶层 4、serial 5、snapshot 8）。
-  - 真实 Linux 冒烟（A6）缺内核：design.md 中的 `/fuu.code/kangaroo-6.6/vmlinux` 在本机不存在，P5 前需要提供 PVH 内核（以及可选的 initrd / rootfs）。
+  - 真实 Linux 冒烟（A6）的 guest 制品在 `/work/dbe-kernel`，不进仓库：
+    - `build/vmlinux`：`.references/linux`（7.3.0）在仓库外构建（源码树保持只读）。配置为 `x86_64_defconfig` + `kvm_guest.config`，再加 `PVH`、`X86_MPPARSE`、`SERIAL_8250_CONSOLE`、`VIRTIO_MMIO(_CMDLINE_DEVICES)`、`VIRTIO_BLK`、`EXT4_FS`、`DEVTMPFS(_MOUNT)`、`MEMORY_HOTPLUG/HOTREMOVE`、`CONTIG_ALLOC`、`VIRTIO_MEM`、`DEBUG_INFO_NONE`。构建命令：`make O=/work/dbe-kernel/build -j$(nproc) vmlinux`。本机没有 pahole，因此不开 BTF。这个内核没有 `MEMORY_HOTPLUG_DEFAULT_ONLINE`，P6 改用 `memhp_default_state=`。
+    - `initramfs.cpio.gz`：静态 busybox，由内核的 `scripts/gen_init_cpio` 生成，内含 `/dev/console`；`/init` 输出 `DBE_LINUX_OK …` 后 `reboot -f`。
+    - `rootfs.ext4`：64 MiB，用 `mkfs.ext4 -d` 生成；`/sbin/init` 同上，供 P5 的 virtio-blk 根盘使用。
+    - 运行方式：`DBE_KERNEL=/work/dbe-kernel/build/vmlinux DBE_INITRD=/work/dbe-kernel/initramfs.cpio.gz sg kvm -c 'cargo test -p dragonball-evolved --test boot linux_pvh_smoke_boot -- --ignored --nocapture'`。
 - [x] **P0 起步**：
   - `crates/vmm` 已移为 `crates/vmm.old`，workspace 中 `exclude`；
   - 新 crate 包含进程外壳（`start`、`VmmClient`、`VmmServer`、`ProcessCtx`、`VmmExitStatus`、`KvmContext`、`MachineSpec::apply`、只处理配置与查询的主循环）、`error::render_chain`、`tests/common/elf.rs`；
