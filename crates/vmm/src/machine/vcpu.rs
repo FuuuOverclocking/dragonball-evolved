@@ -18,10 +18,10 @@ use std::time::Duration;
 use std::{io, mem, ptr, thread};
 
 use kvm_bindings::{
-    KVM_MP_STATE_UNINITIALIZED, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, Msrs,
-    kvm_mp_state,
+    KVM_MAX_CPUID_ENTRIES, KVM_MP_STATE_UNINITIALIZED, KVM_REG_GUEST_SSP, KVM_SYSTEM_EVENT_RESET,
+    KVM_SYSTEM_EVENT_SHUTDOWN, Msrs, Xsave, kvm_mp_state, kvm_msr_entry, kvm_x86_reg_kvm,
 };
-use kvm_ioctls::VcpuExit;
+use kvm_ioctls::{VcpuExit, VmFd};
 use logger::{error_unlimited, info, warn_unlimited};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task;
@@ -30,6 +30,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryError};
 use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
 use vmm_sys_util::{errno, fam};
 
+use super::kvm_state::{VcpuSnapshot, xsave_fam_len};
 use crate::arch::x86_64::cpuid::{self, CpuidError};
 use crate::arch::x86_64::{lapic, msr, regs};
 use crate::bus::{MmioBus, PioBus};
@@ -132,6 +133,118 @@ pub enum VcpuError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, displaydoc::Display)]
+pub enum CaptureStep {
+    /// get the multiprocessing state
+    MpState,
+    /// get the general registers
+    Regs,
+    /// get the special registers
+    Sregs,
+    /// get the XSAVE state
+    Xsave,
+    /// get the LAPIC
+    Lapic,
+    /// get the CPUID
+    Cpuid,
+    /// get the MSRs
+    Msrs,
+    /// get the active shadow stack pointer through KVM_GET_ONE_REG
+    Ssp,
+    /// get the XCRs
+    Xcrs,
+    /// get the debug registers
+    DebugRegs,
+    /// get the vCPU events
+    Events,
+}
+
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
+pub enum CaptureVcpuError {
+    /// vCPU {0} has exited or no longer has a live thread handle
+    Exited(u8),
+    /// vCPU {0} is not known to be paused
+    NotPaused(u8),
+    /// build the snapshot MSR query
+    Msrs(#[from] fam::Error),
+    /// VM of vCPU {0} does not report a valid KVM_CAP_XSAVE2 buffer size
+    XsaveSize(u8),
+    /// allocate the full XSAVE buffer of vCPU {index}
+    XsaveAllocation {
+        index: u8,
+        #[source]
+        source: fam::Error,
+    },
+    /// vCPU {0} has unsupported supervisor or inconsistent XSAVE state
+    Xstate(u8),
+    /// KVM read {read} of the {total} snapshot MSRs of vCPU {index}
+    PartialMsrs {
+        index: u8,
+        read: usize,
+        total: usize,
+    },
+    /// {step} of vCPU {index}
+    Kvm {
+        index: u8,
+        step: CaptureStep,
+        #[source]
+        source: kvm_ioctls::Error,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, displaydoc::Display)]
+pub enum RestoreStep {
+    /// restore the CPUID
+    Cpuid,
+    /// restore the multiprocessing state
+    MpState,
+    /// restore the general registers
+    Regs,
+    /// restore the special registers
+    Sregs,
+    /// restore the XSAVE state
+    Xsave,
+    /// restore the XCRs
+    Xcrs,
+    /// restore the debug registers
+    DebugRegs,
+    /// restore the LAPIC
+    Lapic,
+    /// restore the xstate control MSRs before XSAVE
+    XstateMsrs,
+    /// restore the remaining MSRs, including CET supervisor state
+    Msrs,
+    /// restore the active shadow stack pointer through KVM_SET_ONE_REG after XSAVE and S_CET
+    Ssp,
+    /// restore the wall-clock registration after the VM clock
+    WallClock,
+    /// restore the vCPU events
+    Events,
+    /// notify KVM that the guest clock may be out of sync
+    Clock,
+}
+
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
+pub enum RestoreVcpuError {
+    /// build the snapshot MSR set
+    Msrs(#[from] fam::Error),
+    /// saved XSAVE buffer of vCPU {0} does not match the VM's KVM_CAP_XSAVE2 size
+    XsaveSize(u8),
+    /// saved active SSP presence of vCPU {0} does not match CPUID shadow stack support
+    Ssp(u8),
+    /// vCPU {0} has unsupported supervisor or inconsistent XSAVE state
+    Xstate(u8),
+    /// KVM set {set} of the {total} snapshot MSRs of vCPU {index}
+    PartialMsrs { index: u8, set: usize, total: usize },
+    /// {step} of vCPU {index}
+    Kvm {
+        index: u8,
+        step: RestoreStep,
+        #[source]
+        source: kvm_ioctls::Error,
+    },
+}
+
 /// Why a vCPU stopped running its guest. `Copy`, so the exit path builds it
 /// without allocating.
 #[derive(Debug, Clone, Copy, displaydoc::Display, thiserror::Error)]
@@ -218,24 +331,23 @@ enum VcpuCommand {
 pub(super) struct Vcpus(Vec<VcpuHandle>);
 
 impl Vcpus {
-    /// Starts one parked thread per vCPU; `vcpus[i]` is vCPU `i`.
-    pub(super) fn spawn(
+    /// Failure retains started threads for cleanup; unstarted fds close before returning.
+    pub(super) fn spawn_retained(
         vcpus: Vec<KvmVcpu>,
         buses: Arc<Buses>,
         events: tokio_mpsc::UnboundedSender<MachineEvent>,
-    ) -> Result<Self, SpawnVcpuError> {
-        install_kick_handler()?;
-        let mut handles = Vec::with_capacity(vcpus.len());
-        for (index, fd) in (0..=u8::MAX).zip(vcpus) {
-            // Handles already spawned stop their threads when dropped.
-            handles.push(VcpuHandle::spawn(
-                index,
-                fd,
-                Arc::clone(&buses),
-                events.clone(),
-            )?);
+    ) -> Result<Self, (Self, SpawnVcpuError)> {
+        let mut started = Self(Vec::with_capacity(vcpus.len()));
+        if let Err(error) = install_kick_handler() {
+            return Err((started, error));
         }
-        Ok(Self(handles))
+        for (index, fd) in (0..=u8::MAX).zip(vcpus) {
+            match VcpuHandle::spawn(index, fd, Arc::clone(&buses), events.clone()) {
+                Ok(handle) => started.0.push(handle),
+                Err(error) => return Err((started, error)),
+            }
+        }
+        Ok(started)
     }
 
     pub(super) fn len(&self) -> usize {
@@ -246,35 +358,54 @@ impl Vcpus {
     /// Only an acknowledgement proves the pause barrier was reached; a queued
     /// command and its kick alone do not prove that the vCPU is parked.
     pub(super) async fn pause(&mut self, within: Duration) -> Result<(), VcpuError> {
-        self.request(VcpuCommand::Pause, within).await
+        self.request(VcpuCommand::Pause, State::Paused, within)
+            .await
     }
 
     /// Asks every vCPU to run, and waits at most `within` for all of them.
     pub(super) async fn resume(&mut self, within: Duration) -> Result<(), VcpuError> {
-        self.request(VcpuCommand::Resume, within).await
+        self.request(VcpuCommand::Resume, State::Running, within)
+            .await
     }
 
-    /// Stops every vCPU and joins its thread, waiting at most `within`. A
-    /// thread that does not end in time is left to end on its own, holding
-    /// its VM, and so the guest memory, until it does.
-    pub(super) async fn stop(mut self, within: Duration) -> Result<(), VcpuError> {
+    /// Timeouts retain exit/join ownership for retry; completed handles are always removed.
+    pub(super) async fn stop_wait(&mut self, within: Duration) -> Result<(), VcpuError> {
         let deadline = Instant::now() + within;
         for handle in &mut self.0 {
             handle.command(VcpuCommand::Stop);
         }
         let mut first = None;
-        for handle in mem::take(&mut self.0) {
-            if let Err(error) = handle.join(deadline).await {
+        for handle in &mut self.0 {
+            if let Err(error) = handle.thread.join_wait(handle.index, deadline).await {
                 warn_unlimited!("{}", render_chain(&error));
                 first.get_or_insert(error);
             }
         }
+        self.0.retain(|handle| !handle.thread.is_joined());
         first.map_or(Ok(()), Err)
+    }
+
+    /// Capture requires live, currently acknowledged parked threads, not a stale Pause ack.
+    pub(super) fn capture_state(&self, vm: &VmFd) -> Result<Vec<VcpuSnapshot>, CaptureVcpuError> {
+        for handle in &self.0 {
+            handle.ensure_capturable()?;
+        }
+        let states = self
+            .0
+            .iter()
+            .map(|handle| handle.capture_state(vm))
+            .collect::<Result<_, _>>()?;
+        // Refuse an exit that occurred while another CPU's state was read.
+        for handle in &self.0 {
+            handle.ensure_capturable()?;
+        }
+        Ok(states)
     }
 
     async fn request(
         &mut self,
         command: fn(oneshot::Sender<()>) -> VcpuCommand,
+        state: State,
         within: Duration,
     ) -> Result<(), VcpuError> {
         let deadline = Instant::now() + within;
@@ -287,7 +418,11 @@ impl Vcpus {
                 (handle.index, answer)
             })
             .collect();
-        wait_for_replies(answers, deadline).await
+        wait_for_replies(answers, deadline).await?;
+        for handle in &mut self.0 {
+            handle.state = Some(state);
+        }
+        Ok(())
     }
 }
 
@@ -325,9 +460,24 @@ struct VcpuHandle {
     commands: mpsc::Sender<VcpuCommand>,
     // The handle's own fd of the vCPU, to set `immediate_exit` with.
     kick: KvmVcpu,
+    thread: VcpuThread,
+    // Invalidated before queuing any command; restored only by a cohort ack.
+    state: Option<State>,
+}
+
+/// Timeout retains both exit notification and join ownership for retry.
+#[derive(Debug)]
+struct VcpuThread {
     exited: Option<oneshot::Receiver<()>>,
-    // Held until joined, which keeps the thread's pthread_t valid for kicks.
-    thread: Option<thread::JoinHandle<()>>,
+    owner: ThreadOwner,
+}
+
+#[derive(Debug)]
+enum ThreadOwner {
+    // Keeps pthread_t valid for kicks until the thread is handed to join.
+    Running(thread::JoinHandle<()>),
+    Joining(task::JoinHandle<thread::Result<()>>),
+    Joined,
 }
 
 impl VcpuHandle {
@@ -370,14 +520,18 @@ impl VcpuHandle {
             index,
             commands,
             kick,
-            exited: Some(exited),
-            thread: Some(thread),
+            thread: VcpuThread {
+                exited: Some(exited),
+                owner: ThreadOwner::Running(thread),
+            },
+            state: Some(State::Paused),
         })
     }
 
     /// Queues `command`, then kicks. A thread that has ended has dropped its
     /// receiver, and the reply slot goes with the command.
     fn command(&mut self, command: VcpuCommand) {
+        self.state = None;
         if self.commands.send(command).is_ok() {
             self.kick();
         }
@@ -386,7 +540,7 @@ impl VcpuHandle {
     fn kick(&mut self) {
         self.kick.set_kvm_immediate_exit(1);
         fence(Ordering::SeqCst);
-        let Some(thread) = &self.thread else {
+        let ThreadOwner::Running(thread) = &self.thread.owner else {
             return;
         };
         // SAFETY: the thread is not joined while its handle is held, so its pthread_t is valid.
@@ -400,30 +554,240 @@ impl VcpuHandle {
         }
     }
 
-    /// Waits until `deadline` for the thread to end, then joins it on the
-    /// blocking pool.
-    async fn join(mut self, deadline: Instant) -> Result<(), VcpuError> {
-        let index = self.index;
-        if let Some(exited) = self.exited.take()
-            && time::timeout_at(deadline, exited).await.is_err()
-        {
-            return Err(VcpuError::TimedOut(index));
+    fn ensure_capturable(&self) -> Result<(), CaptureVcpuError> {
+        if !self.thread.is_alive() {
+            return Err(CaptureVcpuError::Exited(self.index));
         }
-        let Some(thread) = self.thread.take() else {
-            return Ok(());
+        if self.state != Some(State::Paused) {
+            return Err(CaptureVcpuError::NotPaused(self.index));
+        }
+        Ok(())
+    }
+
+    fn capture_state(&self, vm: &VmFd) -> Result<VcpuSnapshot, CaptureVcpuError> {
+        let index = self.index;
+        let fd = &self.kick;
+        let kvm = |step| {
+            move |source| CaptureVcpuError::Kvm {
+                index,
+                step,
+                source,
+            }
         };
-        match time::timeout_at(deadline, task::spawn_blocking(move || thread.join())).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(_))) => Err(VcpuError::Panicked(index)),
-            Ok(Err(source)) => Err(VcpuError::Join { index, source }),
-            Err(_) => Err(VcpuError::TimedOut(index)),
+        // KVM_GET_MP_STATE may accept APIC events and change LAPIC state.
+        let mp_state = fd.get_mp_state().map_err(kvm(CaptureStep::MpState))?;
+        let regs = fd.get_regs().map_err(kvm(CaptureStep::Regs))?;
+        let sregs = fd.get_sregs().map_err(kvm(CaptureStep::Sregs))?;
+        let lapic = fd.get_lapic().map_err(kvm(CaptureStep::Lapic))?;
+        let cpuid = fd
+            .get_cpuid2(KVM_MAX_CPUID_ENTRIES)
+            .map_err(kvm(CaptureStep::Cpuid))?;
+        let entries: Vec<_> = msr::snapshot_msr_indices(&cpuid)
+            .into_iter()
+            .map(|index| kvm_msr_entry {
+                index,
+                ..Default::default()
+            })
+            .collect();
+        let mut query = Msrs::from_entries(&entries)?;
+        let read = fd.get_msrs(&mut query).map_err(kvm(CaptureStep::Msrs))?;
+        // KVM stops at the first unsupported MSR; a partial required-state read is not a snapshot.
+        if read != entries.len() {
+            return Err(CaptureVcpuError::PartialMsrs {
+                index,
+                read,
+                total: entries.len(),
+            });
+        }
+        let msrs = query.as_slice().to_vec();
+        let xcrs = fd.get_xcrs().map_err(kvm(CaptureStep::Xcrs))?;
+        let fam_len = xsave_fam_len(vm).ok_or(CaptureVcpuError::XsaveSize(index))?;
+        let mut xsave = Xsave::new(fam_len)
+            .map_err(|source| CaptureVcpuError::XsaveAllocation { index, source })?;
+        // SAFETY: full VM XSAVE2 FAM, parked vCPU, and unchanged dynamic user permissions through GET.
+        unsafe { fd.get_xsave2(&mut xsave) }.map_err(kvm(CaptureStep::Xsave))?;
+        let ssp = if msr::has_shadow_stack(&cpuid) {
+            let mut data = [0; mem::size_of::<u64>()];
+            fd.get_one_reg(kvm_x86_reg_kvm(KVM_REG_GUEST_SSP), &mut data)
+                .map_err(kvm(CaptureStep::Ssp))?;
+            Some(u64::from_ne_bytes(data))
+        } else {
+            None
+        };
+        let debug_regs = fd.get_debug_regs().map_err(kvm(CaptureStep::DebugRegs))?;
+        // Other state reads can change pending events, so these must be last.
+        let vcpu_events = fd.get_vcpu_events().map_err(kvm(CaptureStep::Events))?;
+        let snapshot = VcpuSnapshot {
+            index,
+            mp_state,
+            regs,
+            sregs,
+            xsave,
+            lapic,
+            cpuid,
+            msrs,
+            ssp,
+            xcrs,
+            debug_regs,
+            vcpu_events,
+        };
+        if !snapshot.xstate_supported() {
+            return Err(CaptureVcpuError::Xstate(index));
+        }
+        Ok(snapshot)
+    }
+}
+
+impl VcpuThread {
+    fn is_alive(&self) -> bool {
+        matches!(&self.owner, ThreadOwner::Running(thread) if !thread.is_finished())
+            && self
+                .exited
+                .as_ref()
+                .is_some_and(|exited| !exited.is_terminated() && exited.is_empty())
+    }
+
+    fn is_joined(&self) -> bool {
+        matches!(self.owner, ThreadOwner::Joined)
+    }
+
+    async fn join_wait(&mut self, index: u8, deadline: Instant) -> Result<(), VcpuError> {
+        if let Some(exited) = &mut self.exited {
+            // Join even after a closed exit sender to distinguish unwinding from clean exit.
+            let _ = time::timeout_at(deadline, exited)
+                .await
+                .map_err(|_| VcpuError::TimedOut(index))?;
+            self.exited = None;
+        }
+        if matches!(self.owner, ThreadOwner::Running(_)) {
+            let ThreadOwner::Running(thread) = mem::replace(&mut self.owner, ThreadOwner::Joined)
+            else {
+                unreachable!("the thread is still owned here");
+            };
+            self.owner = ThreadOwner::Joining(task::spawn_blocking(move || thread.join()));
+        }
+        let result = match &mut self.owner {
+            ThreadOwner::Joining(join) => time::timeout_at(deadline, join)
+                .await
+                .map_err(|_| VcpuError::TimedOut(index))?,
+            ThreadOwner::Joined => return Ok(()),
+            ThreadOwner::Running(_) => unreachable!("the blocking pool owns the join"),
+        };
+        // Completed joins, including panics, must release kick fds and never be polled twice.
+        self.owner = ThreadOwner::Joined;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(VcpuError::Panicked(index)),
+            Err(source) => Err(VcpuError::Join { index, source }),
         }
     }
 }
 
+/// XCR0/XSS/XFD precede XSAVE; LAPIC precedes TSC deadline; events follow MSRs.
+pub(super) fn restore_state(
+    fd: &KvmVcpu,
+    vm: &VmFd,
+    snapshot: &VcpuSnapshot,
+) -> Result<(), RestoreVcpuError> {
+    let index = snapshot.index;
+    if !snapshot.ssp_matches_cpuid() {
+        return Err(RestoreVcpuError::Ssp(index));
+    }
+    if !snapshot.xstate_supported() {
+        return Err(RestoreVcpuError::Xstate(index));
+    }
+    let kvm = |step| {
+        move |source| RestoreVcpuError::Kvm {
+            index,
+            step,
+            source,
+        }
+    };
+    fd.set_cpuid2(&snapshot.cpuid)
+        .map_err(kvm(RestoreStep::Cpuid))?;
+    fd.set_mp_state(snapshot.mp_state)
+        .map_err(kvm(RestoreStep::MpState))?;
+    fd.set_regs(&snapshot.regs)
+        .map_err(kvm(RestoreStep::Regs))?;
+    fd.set_sregs(&snapshot.sregs)
+        .map_err(kvm(RestoreStep::Sregs))?;
+    fd.set_xcrs(&snapshot.xcrs)
+        .map_err(kvm(RestoreStep::Xcrs))?;
+    let controls: Vec<_> = snapshot
+        .msrs
+        .iter()
+        .copied()
+        .filter(|entry| msr::is_xstate_control(entry.index))
+        .collect();
+    restore_msrs(fd, index, &controls, RestoreStep::XstateMsrs)?;
+    // CPUID may allocate dynamic xstate, so validate the full target size after installing it.
+    if xsave_fam_len(vm) != Some(snapshot.xsave.as_slice().len()) {
+        return Err(RestoreVcpuError::XsaveSize(index));
+    }
+    // SAFETY: same-host full VM XSAVE2 FAM and unchanged dynamic permissions through SET; XFD is restored.
+    unsafe { fd.set_xsave2(&snapshot.xsave) }.map_err(kvm(RestoreStep::Xsave))?;
+    fd.set_debug_regs(&snapshot.debug_regs)
+        .map_err(kvm(RestoreStep::DebugRegs))?;
+    fd.set_lapic(&snapshot.lapic)
+        .map_err(kvm(RestoreStep::Lapic))?;
+    // Supervisor CET state is outside the XSAVE UABI and must be installed after SET_XSAVE.
+    let remaining: Vec<_> = snapshot
+        .msrs
+        .iter()
+        .copied()
+        .filter(|entry| !msr::is_xstate_control(entry.index))
+        .collect();
+    restore_msrs(fd, index, &remaining, RestoreStep::Msrs)?;
+    if let Some(ssp) = snapshot.ssp {
+        fd.set_one_reg(kvm_x86_reg_kvm(KVM_REG_GUEST_SSP), &ssp.to_ne_bytes())
+            .map_err(kvm(RestoreStep::Ssp))?;
+    }
+    fd.set_vcpu_events(&snapshot.vcpu_events)
+        .map_err(kvm(RestoreStep::Events))?;
+    // KVM_CLOCK_CTRL needs an active pv_time cache; disabled registrations legitimately have none.
+    if msr::pvclock_enabled(&snapshot.msrs) {
+        fd.kvmclock_ctrl().map_err(kvm(RestoreStep::Clock))?;
+    }
+    Ok(())
+}
+
+/// Replay wall-clock aliases in captured order after SET_CLOCK, which determines the epoch written to RAM.
+pub(super) fn restore_wall_clock(
+    fd: &KvmVcpu,
+    snapshot: &VcpuSnapshot,
+) -> Result<(), RestoreVcpuError> {
+    let entries: Vec<_> = msr::wall_clock_msrs(&snapshot.msrs).collect();
+    restore_msrs(fd, snapshot.index, &entries, RestoreStep::WallClock)
+}
+
+fn restore_msrs(
+    fd: &KvmVcpu,
+    index: u8,
+    entries: &[kvm_msr_entry],
+    step: RestoreStep,
+) -> Result<(), RestoreVcpuError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let msrs = Msrs::from_entries(entries)?;
+    let set = fd.set_msrs(&msrs).map_err(|source| RestoreVcpuError::Kvm {
+        index,
+        step,
+        source,
+    })?;
+    if set != entries.len() {
+        return Err(RestoreVcpuError::PartialMsrs {
+            index,
+            set,
+            total: entries.len(),
+        });
+    }
+    Ok(())
+}
+
 impl Drop for VcpuHandle {
     fn drop(&mut self) {
-        if self.thread.is_some() {
+        if matches!(self.thread.owner, ThreadOwner::Running(_)) {
             self.command(VcpuCommand::Stop);
         }
     }
@@ -702,6 +1066,210 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn exit_notification_timeout_preserves_receiver_and_thread_for_retry() {
+        let (release, released) = mpsc::channel();
+        let (notice, exited) = oneshot::channel();
+        let thread = thread::spawn(move || {
+            released.recv_timeout(TIMEOUT).unwrap();
+            let _ = notice.send(());
+        });
+        let mut pending = VcpuThread {
+            exited: Some(exited),
+            owner: ThreadOwner::Running(thread),
+        };
+        assert!(matches!(
+            pending.join_wait(3, Instant::now()).await,
+            Err(VcpuError::TimedOut(3))
+        ));
+        assert!(pending.exited.is_some());
+        assert!(matches!(pending.owner, ThreadOwner::Running(_)));
+        assert!(pending.is_alive());
+        release.send(()).unwrap();
+        pending
+            .join_wait(3, Instant::now() + TIMEOUT)
+            .await
+            .unwrap();
+        assert!(pending.is_joined());
+        assert!(pending.exited.is_none());
+        pending.join_wait(3, Instant::now()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_pool_join_timeout_retains_the_actual_join_task() {
+        let (release, released) = mpsc::channel();
+        let (ready, notified) = mpsc::channel();
+        let (notice, exited) = oneshot::channel();
+        let thread = thread::spawn(move || {
+            notice.send(()).unwrap();
+            ready.send(()).unwrap();
+            // The notice is not the OS join: retain the real handle until return.
+            released.recv_timeout(TIMEOUT).unwrap();
+        });
+        notified.recv_timeout(TIMEOUT).unwrap();
+        let mut pending = VcpuThread {
+            exited: Some(exited),
+            owner: ThreadOwner::Running(thread),
+        };
+        assert!(
+            !pending.is_alive(),
+            "an exit notice invalidates an old Pause ack"
+        );
+        assert!(matches!(
+            pending.join_wait(4, Instant::now()).await,
+            Err(VcpuError::TimedOut(4))
+        ));
+        assert!(pending.exited.is_none());
+        assert!(matches!(pending.owner, ThreadOwner::Joining(_)));
+        assert!(!pending.is_joined());
+        release.send(()).unwrap();
+        pending
+            .join_wait(4, Instant::now() + TIMEOUT)
+            .await
+            .unwrap();
+        assert!(pending.is_joined());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panicked_thread_is_joined_even_when_its_exit_sender_was_dropped() {
+        let (notice, exited) = oneshot::channel();
+        let thread = thread::spawn(move || {
+            let _notice = notice;
+            panic!("regression: panic before sending the exit notice");
+        });
+        let mut pending = VcpuThread {
+            exited: Some(exited),
+            owner: ThreadOwner::Running(thread),
+        };
+        assert!(matches!(
+            pending.join_wait(5, Instant::now() + TIMEOUT).await,
+            Err(VcpuError::Panicked(5))
+        ));
+        assert!(
+            pending.is_joined(),
+            "a panic must not retain completed ownership"
+        );
+        assert!(!pending.is_alive());
+        pending.join_wait(5, Instant::now()).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_vcpu_roundtrips_with_and_without_registered_pvclock_on_kvm() {
+        use crate::machine::kvm_state;
+
+        let Some(context) = kvm() else { return };
+        let supported = msr::snapshot_msr_indices(&context.capabilities().supported_cpuid);
+        for registration in [
+            None,
+            Some((msr::MSR_KVM_SYSTEM_TIME, msr::MSR_KVM_WALL_CLOCK)),
+            Some((msr::MSR_KVM_SYSTEM_TIME_NEW, msr::MSR_KVM_WALL_CLOCK_NEW)),
+        ] {
+            if registration.is_some_and(|(system, _)| !supported.contains(&system)) {
+                continue;
+            }
+            for kind in [BackingKind::AnonymousPrivate, BackingKind::SharedMemfd] {
+                let memory = store(&context, MemoryLayout::boot(16 << 20).unwrap(), kind);
+                let (vm, bindings, slots) = create_vm(&context, memory).unwrap();
+                let view = Arc::downgrade(vm.memory().view());
+                let cpu = bsp(&context, &vm, &[0xf4]);
+                if let Some((system, wall)) = registration {
+                    let entries = [
+                        kvm_msr_entry {
+                            index: wall,
+                            data: 0x3000,
+                            ..Default::default()
+                        },
+                        kvm_msr_entry {
+                            index: system,
+                            data: 0x2001,
+                            ..Default::default()
+                        },
+                    ];
+                    restore_msrs(&cpu, 0, &entries, RestoreStep::Msrs).unwrap();
+                }
+                let (events, _receiver) = tokio_mpsc::unbounded_channel();
+                let mut vcpus = Vcpus::spawn_retained(vec![cpu], Arc::default(), events).unwrap();
+                let saved = vcpus.capture_state(vm.fd()).unwrap().pop().unwrap();
+                let vm_state = kvm_state::capture_vm_kvm(vm.fd()).unwrap();
+                assert!(msr::snapshot_msrs_match(&saved.cpuid, &saved.msrs));
+                assert!(saved.ssp_matches_cpuid());
+                assert_eq!(msr::pvclock_enabled(&saved.msrs), registration.is_some());
+                vcpus.stop_wait(TIMEOUT).await.unwrap();
+                drop((bindings, slots));
+                let memory = vm.into_memory().unwrap();
+                assert!(Arc::ptr_eq(memory.view(), &view.upgrade().unwrap()));
+
+                let (vm, _bindings, _slots) = create_vm(&context, memory).unwrap();
+                kvm_state::restore_vm_kvm(vm.fd(), &vm_state).unwrap();
+                let fresh = vm.create_vcpu(0).unwrap();
+                assert_eq!(fresh.kvmclock_ctrl().unwrap_err().errno(), libc::EINVAL);
+                restore_state(&fresh, vm.fd(), &saved).unwrap();
+                if let Some(ssp) = saved.ssp {
+                    let mut data = [0; mem::size_of::<u64>()];
+                    fresh
+                        .get_one_reg(kvm_x86_reg_kvm(KVM_REG_GUEST_SSP), &mut data)
+                        .unwrap();
+                    assert_eq!(u64::from_ne_bytes(data), ssp);
+                }
+                kvm_state::restore_vm_clock(vm.fd(), &vm_state).unwrap();
+                restore_wall_clock(&fresh, &saved).unwrap();
+                assert!(Arc::ptr_eq(vm.memory().view(), &view.upgrade().unwrap()));
+                if registration.is_some() {
+                    fresh.kvmclock_ctrl().unwrap();
+                } else {
+                    assert_eq!(fresh.kvmclock_ctrl().unwrap_err().errno(), libc::EINVAL);
+                }
+                let mut query = Msrs::from_entries(&saved.msrs).unwrap();
+                assert_eq!(fresh.get_msrs(&mut query).unwrap(), saved.msrs.len());
+                let clocks = msr::wall_clock_msrs(&saved.msrs).chain(
+                    saved.msrs.iter().copied().filter(|entry| {
+                        matches!(
+                            entry.index,
+                            msr::MSR_KVM_SYSTEM_TIME | msr::MSR_KVM_SYSTEM_TIME_NEW
+                        )
+                    }),
+                );
+                for before in clocks {
+                    let after = query
+                        .as_slice()
+                        .iter()
+                        .find(|entry| entry.index == before.index)
+                        .unwrap();
+                    assert_eq!(after.data, before.data);
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_rejects_unknown_or_exited_cpus_despite_an_old_pause_ack_on_kvm() {
+        let Some(context) = kvm() else { return };
+        let (vm, _bindings) = boot_vm(&context);
+        let vcpu = bsp(&context, &vm, &[0xf4]);
+        let (events, _receiver) = tokio_mpsc::unbounded_channel();
+        let mut vcpus = Vcpus::spawn_retained(vec![vcpu], Arc::default(), events).unwrap();
+        vcpus.pause(TIMEOUT).await.unwrap();
+        vcpus.0[0].state = None;
+        assert!(matches!(
+            vcpus.capture_state(vm.fd()),
+            Err(CaptureVcpuError::NotPaused(0))
+        ));
+        vcpus.0[0].state = Some(State::Paused);
+        // Direct Stop preserves the stale ack deliberately; a parked thread needs no kick.
+        vcpus.0[0].commands.send(VcpuCommand::Stop).unwrap();
+        vcpus.0[0]
+            .thread
+            .join_wait(0, Instant::now() + TIMEOUT)
+            .await
+            .unwrap();
+        assert!(matches!(
+            vcpus.capture_state(vm.fd()),
+            Err(CaptureVcpuError::Exited(0))
+        ));
+        vcpus.stop_wait(TIMEOUT).await.unwrap();
+        assert_eq!(vcpus.len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn mixed_closed_and_unanswered_replies_prioritize_timeout() {
         for closed_first in [true, false] {
             let (closed, exited) = oneshot::channel();
@@ -768,7 +1336,7 @@ mod tests {
             mmio,
         });
         let (events, mut receiver) = tokio_mpsc::unbounded_channel();
-        let mut vcpus = Vcpus::spawn(vec![vcpu], buses, events).unwrap();
+        let mut vcpus = Vcpus::spawn_retained(vec![vcpu], buses, events).unwrap();
 
         vcpus.resume(TIMEOUT).await.unwrap();
         entered.recv_timeout(TIMEOUT).expect("the guest never read");
@@ -784,7 +1352,8 @@ mod tests {
         assert_eq!(regs.rip, ENTRY.0 + 5);
         assert_eq!(regs.rcx, 0, "the instruction after the MMIO read ran");
 
-        vcpus.stop(TIMEOUT).await.unwrap();
+        vcpus.stop_wait(TIMEOUT).await.unwrap();
+        assert_eq!(vcpus.len(), 0);
         assert!(receiver.try_recv().is_err(), "the vCPU reported an event");
         // Stopped vCPUs hold nothing: the VM gives its memory back.
         drop(bindings);
@@ -830,7 +1399,7 @@ mod tests {
             pio,
             mmio: MmioBus::default(),
         });
-        let mut vcpus = Vcpus::spawn(vec![vcpu], buses, events).unwrap();
+        let mut vcpus = Vcpus::spawn_retained(vec![vcpu], buses, events).unwrap();
 
         // Pausing parked vCPUs is idempotent.
         vcpus.pause(TIMEOUT).await.unwrap();
@@ -838,7 +1407,8 @@ mod tests {
         let event = time::timeout(TIMEOUT, receiver.recv()).await.unwrap();
         assert_eq!(event, Some(MachineEvent::GuestReset));
         assert_eq!(*output.0.lock().unwrap(), b"OK");
-        vcpus.stop(TIMEOUT).await.unwrap();
+        vcpus.stop_wait(TIMEOUT).await.unwrap();
+        assert_eq!(vcpus.len(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -888,7 +1458,7 @@ mod tests {
             view.write_obj(MARKER, GuestAddress(CHUNK.0)).unwrap();
             let vcpu = bsp(&context, &vm, &code);
             let (events, mut receiver) = tokio_mpsc::unbounded_channel();
-            let mut vcpus = Vcpus::spawn(vec![vcpu], Arc::default(), events).unwrap();
+            let mut vcpus = Vcpus::spawn_retained(vec![vcpu], Arc::default(), events).unwrap();
 
             // Waits for the guest to make progress and read `expected`.
             let observe = |expected: u32| async move {
@@ -917,7 +1487,8 @@ mod tests {
             observe(MARKER).await;
             drop(binding);
             observe(0).await;
-            vcpus.stop(TIMEOUT).await.unwrap();
+            vcpus.stop_wait(TIMEOUT).await.unwrap();
+            assert_eq!(vcpus.len(), 0);
             assert!(receiver.try_recv().is_err(), "the guest or its vCPU failed");
         }
     }

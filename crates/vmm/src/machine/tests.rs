@@ -211,6 +211,31 @@ async fn guest_reads_root_disk_and_pause_exports_stable_queues_on_kvm() {
             .memory()
             .read_obj::<u32>(GuestAddress(COUNTER))
             .unwrap();
+        let snapshot = paused.capture().await.unwrap();
+        assert_eq!(snapshot.plan, *paused.plan());
+        assert_eq!(snapshot.vcpus.len(), 2);
+        let saved_devices = snapshot.devices.clone();
+        let memory = paused.teardown().await.unwrap();
+        closed(&mut events).await;
+        let (paused, rebuilt_events) = super::snapshot::rebuild_with(
+            snapshot,
+            memory,
+            &context,
+            ConsoleBackend::Captured(output.clone()),
+        )
+        .await
+        .unwrap();
+        events = rebuilt_events;
+        assert!(stays(paused.memory()).await, "rebuild ran a parked CPU");
+        assert_eq!(paused.quiesced_blocks(), &first);
+        assert_eq!(paused.capture().await.unwrap().devices, saved_devices);
+        assert_eq!(
+            paused
+                .memory()
+                .read_obj::<u32>(GuestAddress(COUNTER))
+                .unwrap(),
+            counter
+        );
         let running = paused.resume().await.map_err(|(_, error)| error).unwrap();
         time::timeout(TIMEOUT, async {
             while running
@@ -270,6 +295,13 @@ async fn failed_block_worker_is_recorded_without_stopping_the_guest_on_kvm() {
     assert!(events.machine.try_recv().is_err());
     let paused = running.pause().await.map_err(|(_, error)| error).unwrap();
     assert_eq!(paused.quiesced_blocks()["root"].worker, Response::Exited);
+    assert!(matches!(
+        paused.capture().await,
+        Err(CaptureError::Block {
+            source: CaptureBlockError::WorkerExited,
+            ..
+        })
+    ));
     assert_eq!(
         paused.quiesced_blocks()["root"].resample,
         Response::Replied(())
@@ -438,4 +470,119 @@ async fn teardown_works_from_both_states_on_kvm() {
         0
     );
     closed(&mut events).await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn changed_backend_is_rejected_with_ready_ram_before_assembly_on_kvm() {
+    let Some(context) = kvm() else { return };
+    let mut code = elf::serial_reset_payload(true);
+    code.truncate(code.len() - 10);
+    code.extend(LOOP);
+    let kernel = TempFile::new(&elf::image(&code, true));
+    let root = TempFile::new(&[0xab; 512]);
+    let data = TempFile::new(&[0xcd; 512]);
+    for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
+        let configured = spec(
+            &kernel,
+            None,
+            vec![
+                disk("root", root.path(), true),
+                disk("z-data", data.path(), false),
+                SetMemoryBacking(backing).into_vmm_command(),
+            ],
+        );
+        let (paused, mut events, output) = build(&context, &configured);
+        let running = paused.resume().await.map_err(|(_, error)| error).unwrap();
+        time::timeout(TIMEOUT, async {
+            while output.0.lock().unwrap().as_slice() != BOOT_OK {
+                assert!(events.machine.try_recv().is_err());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let paused = running.pause().await.map_err(|(_, error)| error).unwrap();
+        let saved = paused.capture().await.unwrap();
+        let DeviceSnapshot::Block(root_state) = &saved.devices["root"];
+        assert!(root_state.queue.is_some());
+        let memory = paused.teardown().await.unwrap();
+        closed(&mut events).await;
+        let weak = std::sync::Arc::downgrade(memory.view());
+        let disk = std::fs::OpenOptions::new()
+            .write(true)
+            .open(data.path())
+            .unwrap();
+        disk.set_len(1024).unwrap();
+        let failure = super::snapshot::rebuild_with(
+            saved,
+            memory,
+            &context,
+            ConsoleBackend::Captured(output),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            failure.error,
+            RebuildError::Block(AttachBlockError::Restore { .. })
+        ));
+        let RebuildMemory::Ready(memory) = failure.memory else {
+            panic!("invalid backend created a VM")
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            &weak.upgrade().unwrap(),
+            memory.view()
+        ));
+        drop(memory);
+        assert!(weak.upgrade().is_none(), "preparation retained queued RAM");
+        disk.set_len(512).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn assembly_failure_retains_ram_and_drops_unstarted_cpu_fds_on_kvm() {
+    let Some(context) = kvm() else { return };
+    let kernel = TempFile::new(&elf::image(&LOOP, true));
+    for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
+        let configured = spec(
+            &kernel,
+            None,
+            vec![SetMemoryBacking(backing).into_vmm_command()],
+        );
+        let (plan, policy) = MachinePlan::new(&configured, context.capabilities()).unwrap();
+        let memory = crate::memory::store::MemoryStore::materialize(
+            plan.memory().clone(),
+            policy,
+            context.capabilities(),
+        )
+        .unwrap();
+        let weak = std::sync::Arc::downgrade(memory.view());
+        let (vm, bindings, slots) = crate::vm::create_vm(&context, memory).unwrap();
+        let cpu = vm.create_vcpu(0).unwrap();
+        let platform = PlatformSnapshot {
+            i8042: Default::default(),
+            serial: Some(Default::default()),
+        };
+        let (pending, error) = super::build::assemble_parked(
+            plan,
+            vm,
+            bindings,
+            slots,
+            vec![cpu],
+            std::collections::BTreeMap::new(),
+            &platform,
+            ConsoleBackend::Captured(Captured::default()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BuildError::Platform(PlatformError::Spawn { .. })
+        ));
+        let memory = pending.wait(TIMEOUT).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &weak.upgrade().unwrap(),
+            memory.view()
+        ));
+        drop(memory);
+        assert!(weak.upgrade().is_none());
+    }
 }

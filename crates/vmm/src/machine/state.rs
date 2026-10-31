@@ -13,12 +13,12 @@ use logger::warn_unlimited;
 use tokio::time::Instant;
 
 use super::block::AttachedBlock;
+use super::cleanup::PendingCleanup;
 use super::plan::MachinePlan;
-use super::platform::Platform;
+use super::platform::{Platform, PlatformQuiesced};
 use super::vcpu::{VcpuError, Vcpus};
 use crate::devices::runtime::{DeviceRuntime, Response, ShutdownError};
 use crate::devices::virtio::block::BlockQuiesced;
-use crate::error::render_chain;
 use crate::memory::store::{MemoryStore, MemoryView};
 use crate::vm::{Binding, KvmVm, MemSlots};
 
@@ -77,50 +77,17 @@ pub(super) struct Parts {
 }
 
 impl Parts {
-    /// Stops the vCPUs, then the devices; only once both have stopped is the
-    /// memory handed back. A vCPU thread that does not stop keeps the VM, and
-    /// so the memory, mapped until it ends; a device that does not stop may
-    /// still reach the memory, which is therefore not handed back either.
-    async fn teardown(self) -> Result<MemoryStore, TeardownError> {
-        let Self {
-            vcpus,
-            runtime,
-            platform,
-            blocks,
-            bindings,
-            memslots,
-            vm,
-            plan: _,
-        } = self;
-        let vcpus = vcpus.stop(VCPU_TIMEOUT).await;
-        let devices = runtime.shutdown(DEVICE_GRACE).await;
-        // Restores the terminal, now that nothing serves the console.
-        drop(platform);
-        for block in blocks.into_values() {
-            let AttachedBlock {
-                worker,
-                resample,
-                transport,
-            } = block;
-            drop((transport, worker, resample));
-        }
-        drop(bindings);
-        drop(memslots);
-        match (vcpus, devices) {
-            (Err(vcpus), devices) => {
-                if let Err(devices) = devices {
-                    warn_unlimited!("{}", render_chain(&devices));
-                }
-                Err(TeardownError::Vcpus(vcpus))
-            }
-            (Ok(()), Err(devices)) => Err(TeardownError::Devices(devices)),
-            (Ok(()), Ok(())) => KvmVm::into_memory(vm).map_err(|_| TeardownError::VmHeld),
-        }
+    async fn teardown(self: Box<Self>) -> Result<MemoryStore, (PendingCleanup, TeardownError)> {
+        PendingCleanup::from_parts(self)
+            .wait(VCPU_TIMEOUT + DEVICE_GRACE)
+            .await
     }
 
     /// Asks every device to quiesce, within one shared deadline. A device
     /// that has exited or does not answer is recorded, and the rest go on.
-    async fn quiesce_devices(&self) -> (Vec<QuiescedDevice>, BTreeMap<String, QuiescedBlock>) {
+    pub(super) async fn quiesce_devices(
+        &self,
+    ) -> (PlatformQuiesced, BTreeMap<String, QuiescedBlock>) {
         let deadline = Instant::now() + DEVICE_TIMEOUT;
         let mut workers = BTreeMap::new();
         for (id, block) in &self.blocks {
@@ -146,27 +113,17 @@ impl Parts {
                 },
             );
         }
-        let mut quiesced = Vec::new();
-        for device in self.platform.devices() {
-            let response = device
-                .quiesce(deadline.saturating_duration_since(Instant::now()))
-                .await;
-            let name = device.name();
-            match response {
-                Response::Replied(()) => {}
-                Response::Exited => {
-                    warn_unlimited!("device {name} has exited; pausing without it");
-                }
-                Response::TimedOut => {
-                    warn_unlimited!("device {name} did not quiesce in time; pausing without it");
-                }
-            }
-            quiesced.push(QuiescedDevice {
-                name: name.into(),
-                response,
-            });
+        let platform = self
+            .platform
+            .quiesce(deadline.saturating_duration_since(Instant::now()))
+            .await;
+        if let Some(response) = &platform.serial {
+            warn_response("console-input", response, "quiesce");
         }
-        (quiesced, blocks)
+        if let Some(response) = &platform.output {
+            warn_response("console-output", response, "quiesce");
+        }
+        (platform, blocks)
     }
 
     /// Asks every device to resume, within one shared deadline. A device that
@@ -187,22 +144,41 @@ impl Parts {
                 .await;
             warn_response(block.worker.name(), &response, "resume");
         }
-        for device in self.platform.devices() {
-            let name = device.name();
-            match device
-                .resume(deadline.saturating_duration_since(Instant::now()))
-                .await
-            {
-                Response::Replied(()) => {}
-                Response::Exited => {
-                    warn_unlimited!("device {name} has exited; resuming without it");
-                }
-                Response::TimedOut => {
-                    warn_unlimited!("device {name} did not resume in time");
-                }
-            }
+        let platform = self
+            .platform
+            .resume(deadline.saturating_duration_since(Instant::now()))
+            .await;
+        if let Some(response) = &platform.serial {
+            warn_response("console-input", response, "resume");
+        }
+        if let Some(response) = &platform.output {
+            warn_response("console-output", response, "resume");
         }
     }
+}
+
+fn platform_diagnostics(platform: &PlatformQuiesced) -> Vec<QuiescedDevice> {
+    fn erased<Q>(response: &Response<Q>) -> Response<()> {
+        match response {
+            Response::Replied(_) => Response::Replied(()),
+            Response::Exited => Response::Exited,
+            Response::TimedOut => Response::TimedOut,
+        }
+    }
+    let mut devices = Vec::new();
+    if let Some(response) = &platform.serial {
+        devices.push(QuiescedDevice {
+            name: "console-input".into(),
+            response: erased(response),
+        });
+    }
+    if let Some(response) = &platform.output {
+        devices.push(QuiescedDevice {
+            name: "console-output".into(),
+            response: *response,
+        });
+    }
+    devices
 }
 
 fn warn_response<Q>(name: &str, response: &Response<Q>, operation: &str) {
@@ -232,6 +208,12 @@ fn warn_response<Q>(name: &str, response: &Response<Q>, operation: &str) {
 /// }
 /// ```
 ///
+/// ```compile_fail,E0599
+/// async fn capture(machine: &vmm::machine::Machine) {
+///     let _ = machine.capture().await;
+/// }
+/// ```
+///
 /// Dropping a machine instead of tearing it down stops it without waiting:
 /// vCPU threads are asked to stop and keep the memory mapped until they have.
 #[derive(Debug)]
@@ -252,17 +234,18 @@ impl Machine {
         if let Err(error) = self.parts.vcpus.pause(VCPU_TIMEOUT).await {
             return Err((FailedMachine { parts: self.parts }, PauseError(error)));
         }
-        let (quiesced, blocks) = self.parts.quiesce_devices().await;
+        let (platform, blocks) = self.parts.quiesce_devices().await;
         Ok(PausedMachine {
             parts: self.parts,
-            quiesced,
+            quiesced: platform_diagnostics(&platform),
+            platform,
             blocks,
         })
     }
 
     /// Stops the vCPUs and the devices, closes the VM and hands its memory
     /// back; see [`PausedMachine::teardown`].
-    pub async fn teardown(self) -> Result<MemoryStore, TeardownError> {
+    pub async fn teardown(self) -> Result<MemoryStore, (PendingCleanup, TeardownError)> {
         self.parts.teardown().await
     }
 
@@ -295,6 +278,12 @@ impl Machine {
 /// }
 /// ```
 ///
+/// ```compile_fail,E0599
+/// async fn capture(machine: &vmm::machine::FailedMachine) {
+///     let _ = machine.capture().await;
+/// }
+/// ```
+///
 /// ```compile_fail,E0308
 /// fn needs_paused(_: vmm::machine::PausedMachine) {}
 /// fn failed(machine: vmm::machine::FailedMachine) {
@@ -309,7 +298,7 @@ pub struct FailedMachine {
 impl FailedMachine {
     /// Stops the CPUs and devices using the same teardown as a live machine.
     /// Memory is returned only after successful cleanup; see [`PausedMachine::teardown`].
-    pub async fn teardown(self) -> Result<MemoryStore, TeardownError> {
+    pub async fn teardown(self) -> Result<MemoryStore, (PendingCleanup, TeardownError)> {
         self.parts.teardown().await
     }
 }
@@ -318,24 +307,16 @@ impl FailedMachine {
 /// they answered.
 #[derive(Debug)]
 pub struct PausedMachine {
-    parts: Box<Parts>,
+    pub(super) parts: Box<Parts>,
     quiesced: Vec<QuiescedDevice>,
+    platform: PlatformQuiesced,
     blocks: BTreeMap<String, QuiescedBlock>,
 }
 
 impl PausedMachine {
     /// A machine just built: vCPU threads and device tasks all started parked.
-    pub(super) fn built(parts: Box<Parts>) -> Self {
-        let quiesced = parts
-            .platform
-            .devices()
-            .iter()
-            .map(|device| QuiescedDevice {
-                name: device.name().into(),
-                response: Response::Replied(()),
-            })
-            .collect();
-        // Cold assembly alone uses this: no guest has had access to an activator.
+    pub(super) fn built(parts: Box<Parts>, platform: PlatformQuiesced) -> Self {
+        let quiesced = platform_diagnostics(&platform);
         let blocks = parts
             .blocks
             .keys()
@@ -352,8 +333,23 @@ impl PausedMachine {
         Self {
             parts,
             quiesced,
+            platform,
             blocks,
         }
+    }
+
+    pub(super) fn record_quiesced(
+        &mut self,
+        platform: PlatformQuiesced,
+        blocks: BTreeMap<String, QuiescedBlock>,
+    ) {
+        self.quiesced = platform_diagnostics(&platform);
+        self.platform = platform;
+        self.blocks = blocks;
+    }
+
+    pub(super) fn into_cleanup(self) -> PendingCleanup {
+        PendingCleanup::from_parts(self.parts)
     }
 
     /// Resumes the devices, then the vCPUs.
@@ -375,6 +371,10 @@ impl PausedMachine {
         &self.quiesced
     }
 
+    pub fn quiesced_platform(&self) -> &PlatformQuiesced {
+        &self.platform
+    }
+
     /// Typed block outcomes, keyed by the normalized configuration ID.
     pub fn quiesced_blocks(&self) -> &BTreeMap<String, QuiescedBlock> {
         &self.blocks
@@ -383,11 +383,8 @@ impl PausedMachine {
     /// Stops the vCPUs and then the devices, closes the VM and hands its
     /// memory back.
     ///
-    /// Each stage waits a bounded time and the later stages run whatever the
-    /// earlier ones did. The memory comes back only if every vCPU thread has
-    /// ended and every device has stopped; otherwise it stays mapped for
-    /// whatever still runs and is released once that ends.
-    pub async fn teardown(self) -> Result<MemoryStore, TeardownError> {
+    /// Cleanup failure retains ownership for a bounded [`PendingCleanup::wait`] retry.
+    pub async fn teardown(self) -> Result<MemoryStore, (PendingCleanup, TeardownError)> {
         self.parts.teardown().await
     }
 

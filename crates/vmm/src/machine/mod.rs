@@ -4,8 +4,11 @@
 mod block;
 mod boot;
 mod build;
+mod cleanup;
+mod kvm_state;
 pub mod plan;
 mod platform;
+mod snapshot;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -13,16 +16,27 @@ mod vcpu;
 
 use tokio::sync::mpsc;
 
-pub use self::block::AttachBlockError;
+pub use self::block::{AttachBlockError, BlockSnapshot, CaptureBlockError, RestoreBlockQueueError};
 pub use self::boot::BootDataError;
 pub use self::build::{BuildError, build};
+pub use self::cleanup::PendingCleanup;
+pub use self::kvm_state::{CaptureVmError, RestoreVmError, VcpuSnapshot, VmKvmState};
 pub use self::plan::{MachinePlan, PlanError};
-pub use self::platform::PlatformError;
+pub use self::platform::{
+    PlatformCaptureError, PlatformError, PlatformQuiesced, PlatformRestoreError, PlatformSnapshot,
+};
+pub use self::snapshot::{
+    CaptureError, DeviceSnapshot, MachineSnapshot, RebuildError, RebuildFailure, RebuildMemory,
+    rebuild,
+};
 pub use self::state::{
     FailedMachine, Machine, PauseError, PausedMachine, QuiescedBlock, QuiescedDevice, ResumeError,
     TeardownError,
 };
-pub use self::vcpu::{ConfigureVcpuError, SetupStep, SpawnVcpuError, VcpuError};
+pub use self::vcpu::{
+    CaptureStep, CaptureVcpuError, ConfigureVcpuError, RestoreStep, RestoreVcpuError, SetupStep,
+    SpawnVcpuError, VcpuError,
+};
 use crate::devices::runtime::DeviceExits;
 
 /// An event from a vCPU thread or a platform device.

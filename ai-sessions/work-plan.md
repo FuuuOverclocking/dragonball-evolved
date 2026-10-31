@@ -404,7 +404,7 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
   - fmt、clippy、API feature matrix、schema 和 KVM workspace 测试通过；Busy 与完成轮次中的复位事件有确定性回归覆盖，补充 `vmm::start` 公开接口的复位/暂停/恢复并发测试，boot 测试连续 10 次通过。
   - 真实 CLI：双 vCPU、512 MiB、shared backing，Linux 7.3 + initramfs 启动，输出 `DBE_LINUX_OK` 后 `reboot -f`，VMM 退出码 0。配置与完整日志位于 `/work/dbe-kernel/pvh-smoke.{toml,stdout,stderr}`。
   - 真实 Linux REST：anonymous backing；GET Running → Pause → GET Paused → 输入串口行（暂停期间不处理）→ Resume → guest 读到原行并重启，VMM 退出码 0。驱动为 `/work/dbe-kernel/drive-control.py`，日志为 `pvh-control.{stdout,stderr}`。验证用 init 在强制重启前调用 `tcdrain`，避免把 guest TTY 未排空误认为 VMM 丢数据。
-- [ ] **P5 virtio-blk 与快照**：
+- [x] **P5 virtio-blk 与同进程快照**：
   - [x] **P5a 设备实现**（`e341726`）：Session/Activation、MMIO 状态机与 SHM 寄存器、中断重采样、协作式 block worker 和 guest-driver 测试已实现。reset 确认在旧队列/RAM 引用释放后发出，停泊状态也能处理 reset。
     - 独立审查发现并修复：`virtio-queue` 的非 fallible pop 会吞掉错误，avail ring 位于 GPA 0 时可能空转；改为 fallible iter 并检测无进展。限速改为保留小数额度。
     - 新增确定性批次上限和聚合磁盘越界测试；去掉批次上限/聚合范围检查后对应测试失败，恢复修复后通过。
@@ -418,11 +418,20 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
     - 主会话实际 CLI 验证：Linux 7.3 从 `rootfs-drained.ext4` 只读启动，连续三次输出完整 `DBE_LINUX_OK rootfs` 并正常退出；另跑通根盘/initramfs 冒烟测试。原始 rootfs/initramfs 的强制重启未排空 TTY 问题在制品中修正，原制品保留。
     - 根盘 REST/串口验证日志证明 Pause/Resume 后仍可读 `/dev/vda` 的 512 字节，位于 `/work/dbe-kernel/p5b-root-control.{stdout,api.log}`。
     - 失败注入覆盖的遗留：注册与任务生成之间的装配失败、卡住 worker 的可重试 RAM 清理，随 P5c 的失败所有权处理补上。
-  - [ ] **P5c 快照与失败资源保留**：
+  - [x] **P5c 快照与失败资源保留**：
     - [x] **P5c1 暂停证明**（`62d75c2`）：CPU 转换失败返回只能拆除的 `FailedMachine`，不再返回未证明的 Running/Paused 状态；主循环直接移交失败资源给拆除流程。Timeout 优先于 Exited，仅 Exited 的失败可由真实 GuestReset 判为正常退出；编译失败测试、混合 ACK 和一次性资源移交测试通过。
-    - [x] **P5c2 transport 状态恢复**：纯数据快照、描述符/队列/状态校验、构造时绑定恢复会话、IRQ 状态恢复与显式补发分离。修正子代理误删的 source/from 属性，补错误链与下转型测试；35 项 block/transport 集成测试通过。
-    - 两组改动合并验收：fmt、clippy、API feature matrix、schema、KVM workspace 共 380 项通过；真实 Linux 根盘只读启动、完整标记和正常退出再次通过。
-    - [ ] **P5c3 整机 capture/rebuild**：平台输入暂存、KVM 状态、逐设备状态、共享停泊装配和可重试失败清理。
+    - [x] **P5c2 transport 状态恢复**（`a44308b`）：纯数据快照、描述符/队列/状态校验、构造时绑定恢复会话、IRQ 状态恢复与显式补发分离。修正子代理误删的 source/from 属性，补错误链与下转型测试；35 项 block/transport 集成测试通过。
+    - 两组前置改动合并验收：fmt、clippy、API feature matrix、schema、KVM workspace 共 380 项通过；真实 Linux 根盘只读启动、完整标记和正常退出再次通过。
+    - [x] **P5c3 整机 capture/rebuild**：
+      - `PausedMachine::capture().await` 重新取得设备静止应答，按设备 → 平台 → vCPU → VM 捕获；快照以 ID 键控，不持有 RAM、fd、任务或会话。平台输入与宿主输出分别持有，UART FIFO 和已读未入 FIFO 的输入一并保存。
+      - `rebuild(snapshot, MemoryStore, context).await` 先检查 plan、布局、宿主、CPU/XSAVE、设备 ID、当前后端描述符及队列；复用已打开的后端及停泊装配路径。VM/vCPU/clock 状态先恢复，设备实际确认静止后补发 pending IRQ，返回暂停机器。
+      - `teardown` 失败交回 `(PendingCleanup, TeardownError)`；重建失败携带 `RebuildMemory::Ready` 或 `Pending`。CPU、设备和 I/O 线程的原等待/加入句柄在超时后保留，完成清理才能交回原 `MemoryStore`。进程终止路径显式丢弃待清理所有者，不宣称已回收。
+      - 实际 Linux 验证发现并修复两个状态遗漏：未恢复 pvclock 注册导致 `KVM_KVMCLOCK_CTRL` 返回 EINVAL；未恢复 XSS/CET 导致恢复后 XRSTORS 异常、FPU 警告及 guest panic。补齐 CPUID 支持的 KVM 注册与 XSS/XFD/CET 状态，使用完整 VM 尺寸的 XSAVE2 FAM；active SSP 使用正式 ONE_REG ABI，不使用内部 synthetic MSR。另修复已请求 reset 必须在块设备 Quiesce 应答前完成，避免恢复已取消队列。
+      - 运行验收：仓库外公开接口驱动器 `/work/dbe-kernel/p5c3-runner`，控制程序 `drive-p5c3.py`；两种 backing、双 CPU、真实 Linux 7.3/ext4 只读根盘，反复 pause/capture/teardown/rebuild/resume，恢复后新扇区读取使队列和 `/sys/block/vda/stat` 一起增长，最终 reboot、退出码 0。非法缺盘/多盘/CPU/平台/队列/描述符状态、真实 KVM SET_SREGS 失败，以及进程局部线程限额导致的部分装配失败均可取回原 RAM 并重试。
+      - 边界探测：公开快照中明确构造 16 字节 UART FIFO、30 字节暂存输入和 VRING pending IRQ，暂停重建后值保持，resume 后 Linux 输出 `DBE_P5C3_PENDING_INPUT`，随后 FIFO/暂存和 IRQ 清零。这是构造恢复数据，不冒称已自然捕获非空输入。独立的真实 I/O 设备任务连续两次清理超时，原 runtime/VM/映射/字节标记保持，发送释放后原等待完成并交还 RAM。
+      - 最终完整日志：`/work/dbe-kernel/p5c3-anonymous-1793450302740458021/`、`p5c3-shared-1793450306881183550/`；普通 CLI 再次输出 `DBE_LINUX_OK rootfs` 并正常 reboot，日志 `p5c3-cli-final.{stdout,stderr}`。
+      - 本阶段遵循 `/verify`，未运行测试、typecheck、clippy 或 API/schema CI；新增确定性回归用例留给 CI。`cargo build --workspace` 和 VMM 格式检查通过。重复读取已缓存的第零扇区不证明后端 I/O；验证改为读取不同扇区并观察真实块计数。
+      - 范围仍为同宿主、同进程、已有 RAM 的停机恢复；不包含持久化、磁盘内容快照、跨宿主迁移，也未启用动态 XSTATE 权限。不支持的 supervisor state 明确拒绝，P7 再处理持久化。
 - [ ] P6 virtio-mem
 - [ ] P7 快照持久化
 

@@ -131,7 +131,13 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
                 drop(server.take());
                 let exit = prefer_exit(stopping.take(), exit);
                 return poll_teardown(
-                    Box::pin(async move { machine.teardown().await.map(drop) }),
+                    Box::pin(async move {
+                        machine
+                            .teardown()
+                            .await
+                            .map(drop)
+                            .map_err(|(_pending, error)| error)
+                    }),
                     events,
                     exit,
                 )
@@ -166,7 +172,11 @@ fn start(spec: MachineSpec, reply: Reply<ApiResult<()>>, ctx: &ProcessCtx) -> St
                             // A failed first resume is retryable, but only after
                             // tearing down its sole failure owner. Never cancel this.
                             warn_unlimited!("failed Start: {}", render_chain(&error));
-                            failed.teardown().await.map_err(StartError::Teardown)?;
+                            failed
+                                .teardown()
+                                .await
+                                .map_err(|(_pending, error)| error)
+                                .map_err(StartError::Teardown)?;
                             Err(StartError::Resume(error))
                         }
                     }
@@ -263,11 +273,23 @@ async fn teardown(state: State, exit: Exit) -> VmmExitStatus {
     let (operation, events): (controller::Operation<_>, _) = match state {
         Controller::NotStarted(_) => return controller::exit_status(exit, Ok(())),
         Controller::Running(Live { machine, events }) => (
-            Box::pin(async move { machine.teardown().await.map(drop) }),
+            Box::pin(async move {
+                machine
+                    .teardown()
+                    .await
+                    .map(drop)
+                    .map_err(|(_pending, error)| error)
+            }),
             events,
         ),
         Controller::Paused(Live { machine, events }) => (
-            Box::pin(async move { machine.teardown().await.map(drop) }),
+            Box::pin(async move {
+                machine
+                    .teardown()
+                    .await
+                    .map(drop)
+                    .map_err(|(_pending, error)| error)
+            }),
             events,
         ),
         Controller::Busy(_) => unreachable!("teardown before the operation finished"),

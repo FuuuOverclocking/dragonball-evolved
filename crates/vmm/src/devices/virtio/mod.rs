@@ -59,6 +59,11 @@ pub fn session_channel() -> (SessionControl, Session) {
 }
 
 impl Session {
+    pub fn reset_requested(&self) -> bool {
+        // A closed control cancels ownership even when the last watch value is false.
+        *self.reset.borrow() || self.reset.has_changed().is_err()
+    }
+
     pub async fn requested(&mut self) {
         loop {
             if *self.reset.borrow_and_update() {

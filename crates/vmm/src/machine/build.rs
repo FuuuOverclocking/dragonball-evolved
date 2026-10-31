@@ -13,15 +13,18 @@ use tokio::sync::mpsc;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryError};
 
 use super::MachineEvents;
-use super::block::{AttachBlockError, AttachedBlock};
+use super::block::{AttachBlockError, PreparedBlock};
 use super::boot::{self, BootDataError};
+use super::cleanup::{CleanupParts, PendingCleanup};
 use super::plan::{MachinePlan, PlanError};
-use super::platform::{ConsoleBackend, Platform, PlatformError};
+use super::platform::{
+    ConsoleBackend, Platform, PlatformError, PlatformQuiesced, PlatformSnapshot,
+};
 use super::state::{Parts, PausedMachine};
 use super::vcpu::{self, Buses, ConfigureVcpuError, SpawnVcpuError, Vcpus};
 use crate::arch::x86_64::layout::HIMEM_START;
 use crate::bus::{BusError, MmioBus, PioBus};
-use crate::devices::runtime::DeviceRuntime;
+use crate::devices::runtime::{DeviceRuntime, Response};
 use crate::kvm_context::KvmContext;
 use crate::memory::policy::HostPolicy;
 use crate::memory::store::{MaterializeError, MemoryStore};
@@ -142,6 +145,17 @@ pub(super) fn build_with(
 
     let host = context.capabilities();
     let memory = MemoryStore::materialize(plan.memory().clone(), policy, host)?;
+    let prepared = plan
+        .devices()
+        .iter()
+        .map(|(id, device)| {
+            PreparedBlock::cold(id, device.block(), memory.view()).map(|block| (id.clone(), block))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let platform = PlatformSnapshot {
+        i8042: Default::default(),
+        serial: plan.has_com1().then(Default::default),
+    };
     let (vm, bindings, memslots) = create_vm(context, memory).map_err(|(memory, error)| {
         // Cold boot allocated this RAM afresh; no captured guest state is lost.
         drop(memory);
@@ -195,7 +209,15 @@ pub(super) fn build_with(
         vcpus.push(vcpu);
     }
 
-    assemble_parked(plan, vm, bindings, memslots, vcpus, console)
+    drop(view);
+    assemble_parked(
+        plan, vm, bindings, memslots, vcpus, prepared, &platform, console,
+    )
+    .map_err(|(pending, error)| {
+        // Fresh cold-boot RAM needs no recovery; dropping cleanup requests stop without waiting.
+        drop(pending);
+        error
+    })
 }
 
 /// CPUs and VM state must already be installed before any device can inject an IRQ.
@@ -205,35 +227,87 @@ pub(super) fn assemble_parked(
     bindings: Vec<Binding>,
     memslots: MemSlots,
     vcpus: Vec<KvmVcpu>,
+    mut prepared: BTreeMap<String, PreparedBlock>,
+    platform: &PlatformSnapshot,
     console: ConsoleBackend,
-) -> Result<(PausedMachine, MachineEvents), BuildError> {
+) -> Result<(PausedMachine, MachineEvents), (PendingCleanup, BuildError)> {
+    let quiesced = PlatformQuiesced {
+        serial: platform
+            .serial
+            .as_ref()
+            .map(|serial| Response::Replied(serial.input.clone())),
+        output: (plan.has_com1() && matches!(&console, ConsoleBackend::Stdio))
+            .then_some(Response::Replied(())),
+    };
     let (events, machine_events) = mpsc::unbounded_channel();
-    let (mut runtime, device_exits) = DeviceRuntime::new();
-    let mut pio = Vec::new();
-    let platform = Platform::attach(
-        plan.has_com1(),
-        console,
-        &vm,
-        &events,
-        &mut runtime,
-        &mut pio,
-    )?;
-    let mut mmio = Vec::new();
-    let mut blocks = BTreeMap::new();
-    for id in plan.probe_order() {
-        let block =
-            AttachedBlock::attach(id, plan.devices()[id].block(), &vm, &mut runtime, &mut mmio)?;
-        blocks.insert(id.clone(), block);
-    }
-    let buses = Arc::new(Buses {
-        pio: PioBus::new(pio)?,
-        mmio: MmioBus::new(mmio)?,
+    let (runtime, device_exits) = DeviceRuntime::new();
+    let mut parts = Box::new(CleanupParts {
+        vcpus: None,
+        runtime,
+        platform: None,
+        blocks: BTreeMap::new(),
+        bindings,
+        memslots,
+        vm,
     });
-    let vcpus = Vcpus::spawn(vcpus, buses, events)?;
-    let parts = Box::new(Parts {
+    let assembled = (|| {
+        let mut pio = Vec::new();
+        parts.platform = Some(Platform::restore(
+            plan.has_com1(),
+            platform,
+            console,
+            &parts.vm,
+            &events,
+            &mut parts.runtime,
+            &mut pio,
+        )?);
+        let mut mmio = Vec::new();
+        for id in plan.probe_order() {
+            let block = prepared
+                .remove(id)
+                .expect("every plan ID was prepared")
+                .attach(
+                    id,
+                    plan.devices()[id].block(),
+                    &parts.vm,
+                    &mut parts.runtime,
+                    &mut mmio,
+                )?;
+            parts.blocks.insert(id.clone(), block);
+        }
+        Ok::<_, BuildError>(Arc::new(Buses {
+            pio: PioBus::new(pio)?,
+            mmio: MmioBus::new(mmio)?,
+        }))
+    })();
+    drop(prepared);
+    let buses = match assembled {
+        Ok(buses) => buses,
+        Err(error) => {
+            drop(vcpus);
+            return Err((PendingCleanup::tasks(parts), error));
+        }
+    };
+    match Vcpus::spawn_retained(vcpus, buses, events) {
+        Ok(vcpus) => parts.vcpus = Some(vcpus),
+        Err((vcpus, error)) => {
+            parts.vcpus = Some(vcpus);
+            return Err((PendingCleanup::tasks(parts), BuildError::Vcpus(error)));
+        }
+    }
+    let CleanupParts {
         vcpus,
         runtime,
         platform,
+        blocks,
+        bindings,
+        memslots,
+        vm,
+    } = *parts;
+    let parts = Box::new(Parts {
+        vcpus: vcpus.expect("the CPU cohort was started"),
+        runtime,
+        platform: platform.expect("the platform was attached"),
         blocks,
         bindings,
         memslots,
@@ -244,5 +318,5 @@ pub(super) fn assemble_parked(
         machine: machine_events,
         devices: device_exits,
     };
-    Ok((PausedMachine::built(parts), events))
+    Ok((PausedMachine::built(parts, quiesced), events))
 }

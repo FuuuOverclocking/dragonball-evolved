@@ -117,10 +117,22 @@ pub struct I8042Device {
 
 impl I8042Device {
     pub fn new(events: mpsc::UnboundedSender<MachineEvent>) -> Self {
+        Self::from_state(I8042State::default(), events)
+    }
+
+    /// Rebind the pure controller state to a new machine's event channel.
+    /// Construction emits no reset or other machine event.
+    pub fn from_state(state: I8042State, events: mpsc::UnboundedSender<MachineEvent>) -> Self {
         Self {
-            state: Mutex::new(I8042State::default()),
+            state: Mutex::new(state),
             events,
         }
+    }
+
+    /// Capture without consuming the data port or changing an expected command.
+    /// The caller must stop vCPUs before composing a platform snapshot.
+    pub fn snapshot(&self) -> I8042State {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn apply<T>(&self, access: impl FnOnce(I8042State) -> (I8042State, T)) -> T {
@@ -192,6 +204,28 @@ mod tests {
         assert_eq!(next, state);
         assert_eq!(effect, Some(I8042Effect::Reset));
         assert_eq!(write(state, DATA, CMD_RESET_CPU).1, None);
+    }
+
+    #[test]
+    fn snapshot_restores_pending_output_and_expected_command_without_events() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let device = I8042Device::new(events.clone());
+        device.write(DATA, &[0xed]);
+        device.write(COMMAND, &[CMD_WRITE_OUTP]);
+        let saved = device.snapshot();
+        let restored = I8042Device::from_state(saved, events);
+        assert_eq!(restored.snapshot(), saved);
+        assert!(receiver.try_recv().is_err());
+
+        restored.write(DATA, &[0x34]);
+        let mut byte = [0];
+        restored.read(DATA, &mut byte);
+        assert_eq!(byte[0], KBD_ACK, "saved output was consumed by capture");
+        restored.write(COMMAND, &[CMD_READ_OUTP]);
+        restored.read(DATA, &mut byte);
+        assert_eq!(byte[0], 0x34, "saved command did not accept its data byte");
+        restored.write(COMMAND, &[CMD_RESET_CPU]);
+        assert_eq!(receiver.try_recv(), Ok(MachineEvent::GuestReset));
     }
 
     #[test]

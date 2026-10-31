@@ -748,6 +748,71 @@ async fn activation_already_queued_when_quiesce_arrives_reports_active_without_i
 }
 
 #[tokio::test(flavor = "local")]
+async fn quiesce_settles_pending_and_abandoned_resets_before_reply() {
+    for queued in [true, false] {
+        for abandoned in [false, true] {
+            let disk = TempDisk::new("quiesce-reset", &[0x33; SECTOR_SIZE]);
+            let block = Block::new(&disk, false, Placement::VmmMain, Start::Running, None);
+            let mut guest = GuestDriver::new();
+            let mut session = Some(activate(&block.handle, &guest));
+            if !queued {
+                assert!(matches!(
+                    block.control.quiesce(WITHIN).await,
+                    Response::Replied(BlockQuiesced::Active(_))
+                ));
+            }
+            let (data, status, _) = request(&mut guest, VIRTIO_BLK_T_OUT, 0, SECTOR_SIZE as u32);
+            guest.write_bytes(data, &[0x5a; SECTOR_SIZE]);
+            block.handle.queue_notifier.write(1).unwrap();
+            let used_len = 6 + 8 * usize::from(QUEUE_SIZE);
+            let used = guest.read_bytes(GuestAddress(USED_RING), used_len);
+            let assert_unchanged = || {
+                assert_eq!(guest.read_bytes(GuestAddress(USED_RING), used_len), used);
+                assert_eq!(guest.read_bytes(status, 1), [0xff]);
+                assert_eq!(disk.contents(), [0x33; SECTOR_SIZE]);
+            };
+
+            // Without a local-runtime yield, Quiesce wins over the queued reset future.
+            if abandoned {
+                drop(session.take());
+            } else {
+                assert_eq!(
+                    session.as_mut().unwrap().reset(Duration::ZERO),
+                    Err(ResetError::TimedOut)
+                );
+            }
+            assert_eq!(
+                block.control.quiesce(WITHIN).await,
+                Response::Replied(BlockQuiesced::Inactive)
+            );
+            if let Some(session) = &mut session {
+                session.reset(Duration::ZERO).unwrap();
+            }
+            assert_eq!(Arc::strong_count(&guest.mem), 1);
+            assert_unchanged();
+            assert_eq!(block.control.resume(WITHIN).await, Response::Replied(()));
+            assert_eq!(
+                block.control.quiesce(WITHIN).await,
+                Response::Replied(BlockQuiesced::Inactive)
+            );
+            assert_unchanged();
+            block.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "local")]
+async fn a_consumed_watch_notification_does_not_clear_the_reset_request() {
+    let (mut control, mut session) = session_channel();
+    assert!(!session.reset_requested());
+    assert_eq!(control.reset(Duration::ZERO), Err(ResetError::TimedOut));
+    session.requested().await;
+    assert!(session.reset_requested());
+    drop(session);
+    control.reset(Duration::ZERO).unwrap();
+}
+
+#[tokio::test(flavor = "local")]
 async fn reset_while_quiesced_releases_the_session_without_resuming_io() {
     let disk = TempDisk::new("parked-reset", &[0xab; SECTOR_SIZE]);
     let block = Block::new(&disk, false, Placement::Io, Start::Running, None);

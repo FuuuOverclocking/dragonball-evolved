@@ -548,6 +548,119 @@ async fn an_unresponsive_task_is_reported_not_awaited() {
 }
 
 #[tokio::test(flavor = "local")]
+async fn shutdown_wait_retains_device_resources_until_released_on_each_placement() {
+    for placement in PLACEMENTS {
+        let (mut runtime, exits) = DeviceRuntime::new();
+        let resource = Arc::new(());
+        let held = Arc::downgrade(&resource);
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let handle = runtime
+            .spawn_on(
+                "pending-cleanup",
+                placement,
+                Start::Running,
+                move |control: Control<()>| async move {
+                    let _resource = resource;
+                    idle(control).await?;
+                    stopped_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok::<_, io::Error>(())
+                },
+            )
+            .unwrap();
+
+        let result = runtime.shutdown_wait(Duration::ZERO).await;
+        assert!(
+            matches!(result, Err(ShutdownError::Unresponsive(ref names))
+                if names == &[Arc::<str>::from("pending-cleanup")]),
+            "{result:?}"
+        );
+        assert!(held.upgrade().is_some());
+        assert!(!handle.has_exited());
+        time::timeout(TIMEOUT, stopped_rx).await.unwrap().unwrap();
+        let result = runtime.shutdown_wait(Duration::ZERO).await;
+        assert!(matches!(result, Err(ShutdownError::Unresponsive(_))));
+        assert!(held.upgrade().is_some());
+        assert!(!handle.has_exited());
+        assert_eq!(runtime.running(), 1);
+        assert_eq!(runtime.tasks.len(), 1);
+        assert_eq!(runtime.io_thread.is_some(), placement == Placement::Io);
+
+        release_tx.send(()).unwrap();
+        runtime.shutdown_wait(TIMEOUT).await.unwrap();
+        assert!(held.upgrade().is_none());
+        assert!(handle.has_exited());
+        assert!(runtime.tasks.is_empty());
+        assert!(runtime.io_thread.is_none());
+        runtime.shutdown_wait(Duration::ZERO).await.unwrap();
+        shutdown_quietly(runtime, exits).await;
+    }
+}
+
+#[tokio::test(flavor = "local")]
+async fn shutdown_wait_retains_a_pending_io_join_and_consumes_completed_errors() {
+    for panics in [false, true] {
+        let (mut runtime, exits) = DeviceRuntime::new();
+        let handle = runtime
+            .spawn_on("io", Placement::Io, Start::Running, idle::<()>)
+            .unwrap();
+        handle.stop();
+        time::timeout(TIMEOUT, handle.finished()).await.unwrap();
+
+        let resource = Arc::new(());
+        let held = Arc::downgrade(&resource);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        runtime
+            .io_thread
+            .as_ref()
+            .unwrap()
+            .run(Box::new(move || {
+                let _resource = resource;
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                if panics {
+                    panic!("I/O thread cleanup panic");
+                }
+            }))
+            .unwrap();
+        time::timeout(TIMEOUT, ready_rx).await.unwrap().unwrap();
+
+        for _ in 0..2 {
+            let result = runtime.shutdown_wait(Duration::ZERO).await;
+            assert!(
+                matches!(result, Err(ShutdownError::IoJoinTimeout(_))),
+                "{result:?}"
+            );
+            assert!(held.upgrade().is_some());
+            assert_eq!(runtime.tasks.len(), 1);
+            assert!(handle.has_exited());
+            assert!(matches!(
+                runtime.io_thread.as_ref().unwrap().run(Box::new(|| {})),
+                Err(IoThreadError::Closed)
+            ));
+        }
+
+        release_tx.send(()).unwrap();
+        let result = runtime.shutdown_wait(TIMEOUT).await;
+        if panics {
+            assert!(matches!(
+                result,
+                Err(ShutdownError::IoThread(IoThreadError::Panicked))
+            ));
+        } else {
+            result.unwrap();
+        }
+        assert!(held.upgrade().is_none());
+        assert!(runtime.tasks.is_empty());
+        assert!(runtime.io_thread.is_none());
+        runtime.shutdown_wait(Duration::ZERO).await.unwrap();
+        shutdown_quietly(runtime, exits).await;
+    }
+}
+
+#[tokio::test(flavor = "local")]
 async fn the_exit_stream_can_be_owned_elsewhere() {
     let (mut runtime, mut exits) = DeviceRuntime::new();
     let (seen_tx, seen_rx) = oneshot::channel();

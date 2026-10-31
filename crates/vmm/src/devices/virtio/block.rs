@@ -201,6 +201,12 @@ impl BlockDevice {
                             limiter = self.iops.map(|(capacity, window)| Limiter::new(capacity, window));
                             resume_at = Some(Instant::now());
                         }
+                        // Capture must not revive a queue whose reset already requested its release.
+                        if active.as_ref().is_some_and(|active| active.session.reset_requested()) {
+                            release(&mut active);
+                            limiter = None;
+                            resume_at = None;
+                        }
                         parked = true;
                         ack.send(quiesced(&active));
                     }

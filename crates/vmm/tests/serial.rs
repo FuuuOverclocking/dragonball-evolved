@@ -8,7 +8,10 @@ use std::time::Duration;
 use tokio::time;
 use vmm::bus::BusDevice;
 use vmm::devices::async_fd::AsyncEventFd;
-use vmm::devices::legacy::serial::{FIFO_SIZE, SerialDevice, SerialPort};
+use vmm::devices::legacy::serial::{
+    FIFO_SIZE, SerialDevice, SerialError, SerialInputState, SerialPort, SerialSnapshot,
+    SerialSnapshotError,
+};
 use vmm::devices::runtime::{DeviceExits, DeviceHandle, DeviceRuntime, Response, Start};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -18,22 +21,37 @@ const LSR: u16 = 5;
 const LSR_DATA_READY: u8 = 1;
 const IER_RX_AVAILABLE: u8 = 1;
 
-/// Polls `condition` while letting the device task run, until it holds.
+/// Observe actual FIFO progress, yielding to the device rather than sleeping.
 async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    for _ in 0..2000 {
-        if condition() {
-            return;
+    time::timeout(TIMEOUT, async {
+        while !condition() {
+            tokio::task::yield_now().await;
         }
-        time::sleep(Duration::from_millis(1)).await;
-    }
-    panic!("timed out waiting for {what}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
-/// Lets other tasks run without waiting for anything in particular.
-async fn settle() {
-    for _ in 0..20 {
-        time::sleep(Duration::from_millis(1)).await;
-    }
+/// Wait for an acknowledged pending-byte boundary, leaving the task parked.
+/// Repeated quiesces cannot race FIFO capture once the desired reply arrives.
+async fn quiesce_with_pending(
+    handle: &DeviceHandle<SerialInputState>,
+    expected: &[u8],
+) -> SerialInputState {
+    time::timeout(TIMEOUT, async {
+        loop {
+            let Response::Replied(input) = handle.quiesce(TIMEOUT).await else {
+                panic!("serial input did not quiesce");
+            };
+            if input.pending == expected {
+                return input;
+            }
+            assert_eq!(handle.resume(TIMEOUT).await, Response::Replied(()));
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("serial did not reach the expected pending-byte boundary")
 }
 
 /// Reads the receive FIFO empty the way a guest driver does. Emptying it is
@@ -54,7 +72,7 @@ fn drain<W: Write + Send>(port: &SerialPort<W>) -> Vec<u8> {
 struct Console {
     runtime: DeviceRuntime,
     exits: DeviceExits,
-    handle: DeviceHandle<()>,
+    handle: DeviceHandle<SerialInputState>,
     port: SerialPort<io::Sink>,
     host: PipeWriter,
 }
@@ -92,10 +110,11 @@ async fn input_stops_at_the_fifo_boundary_and_resumes_once_the_guest_reads() {
 
     let port = &console.port;
     wait_until("the fifo to fill", || port.queued_input() == FIFO_SIZE).await;
-    settle().await;
+    quiesce_with_pending(&console.handle, &[b'b'; 10]).await;
     assert_eq!(port.queued_input(), FIFO_SIZE, "device overran the fifo");
 
     assert_eq!(drain(port), vec![b'a'; FIFO_SIZE]);
+    assert_eq!(console.handle.resume(TIMEOUT).await, Response::Replied(()));
     wait_until("the remainder to arrive", || port.queued_input() == 10).await;
     assert_eq!(drain(port), vec![b'b'; 10]);
     console.shutdown().await;
@@ -143,7 +162,10 @@ async fn guest_output_reaches_the_host_without_input() {
     }
     assert_eq!(output.0.lock().unwrap().as_slice(), b"ok");
     // Without host input the task only answers its control.
-    assert_eq!(handle.quiesce(TIMEOUT).await, Response::Replied(()));
+    assert_eq!(
+        handle.quiesce(TIMEOUT).await,
+        Response::Replied(SerialInputState::default())
+    );
     assert_eq!(handle.resume(TIMEOUT).await, Response::Replied(()));
     runtime.shutdown(TIMEOUT).await.unwrap();
 }
@@ -151,7 +173,7 @@ async fn guest_output_reaches_the_host_without_input() {
 #[tokio::test(flavor = "local")]
 async fn closing_the_host_side_ends_the_device() {
     let mut console = console(Start::Running);
-    settle().await;
+    assert_eq!(console.handle.resume(TIMEOUT).await, Response::Replied(()));
     assert_eq!(console.runtime.running(), 1);
 
     drop(console.host);
@@ -182,9 +204,12 @@ async fn a_quiesced_device_leaves_the_fifo_alone_until_resumed() {
     wait_until("initial data", || port.queued_input() == 6).await;
     assert_eq!(drain(port), b"before");
 
-    assert_eq!(console.handle.quiesce(TIMEOUT).await, Response::Replied(()));
+    let quiesced = quiesce_with_pending(&console.handle, &[]).await;
     console.host.write_all(b"during").unwrap();
-    settle().await;
+    assert_eq!(
+        console.handle.quiesce(TIMEOUT).await,
+        Response::Replied(quiesced)
+    );
     assert_eq!(
         port.queued_input(),
         0,
@@ -205,9 +230,12 @@ async fn a_quiesced_back_pressured_device_ignores_the_guest_draining() {
     let port = &console.port;
     wait_until("the fifo to fill", || port.queued_input() == FIFO_SIZE).await;
 
-    assert_eq!(console.handle.quiesce(TIMEOUT).await, Response::Replied(()));
+    let quiesced = quiesce_with_pending(&console.handle, b"rest").await;
     assert_eq!(drain(port), vec![b'a'; FIFO_SIZE]);
-    settle().await;
+    assert_eq!(
+        console.handle.quiesce(TIMEOUT).await,
+        Response::Replied(quiesced)
+    );
     assert_eq!(
         port.queued_input(),
         0,
@@ -224,7 +252,10 @@ async fn a_quiesced_back_pressured_device_ignores_the_guest_draining() {
 async fn a_device_spawned_parked_reads_nothing_until_resumed() {
     let mut console = console(Start::Parked);
     console.host.write_all(b"early").unwrap();
-    settle().await;
+    assert_eq!(
+        console.handle.quiesce(TIMEOUT).await,
+        Response::Replied(SerialInputState::default())
+    );
     assert_eq!(console.port.queued_input(), 0, "a parked device read input");
 
     assert_eq!(console.handle.resume(TIMEOUT).await, Response::Replied(()));
@@ -232,4 +263,198 @@ async fn a_device_spawned_parked_reads_nothing_until_resumed() {
     wait_until("input after resume", || port.queued_input() == 5).await;
     assert_eq!(drain(port), b"early");
     console.shutdown().await;
+}
+
+#[tokio::test(flavor = "local")]
+async fn snapshot_restores_fifo_and_partial_host_chunk_even_without_new_host_input() {
+    let mut console = console(Start::Running);
+    // Also leave THRE pending: from_state would signal both enabled causes.
+    console.port.write(IER, &[IER_RX_AVAILABLE | 2]);
+    console.port.write(7, &[0x5a]);
+    let prefix = vec![b'a'; FIFO_SIZE - 5];
+    console.host.write_all(&prefix).unwrap();
+    wait_until("initial FIFO prefix", || {
+        console.port.queued_input() == prefix.len()
+    })
+    .await;
+    let chunk: Vec<u8> = (0..SerialInputState::CAPACITY as u8).collect();
+    console.host.write_all(&chunk).unwrap();
+    let input = quiesce_with_pending(&console.handle, &chunk[5..]).await;
+    let saved = SerialSnapshot {
+        uart: console.port.capture_uart().unwrap(),
+        input,
+    };
+    let mut fifo = prefix;
+    fifo.extend_from_slice(&chunk[..5]);
+    assert_eq!(saved.uart.in_buffer, fifo);
+    assert_eq!(saved.uart.scratch, 0x5a);
+    saved.validate().unwrap();
+    console.shutdown().await;
+
+    let output = Captured::default();
+    let (device, port) = SerialDevice::restore(&saved, None, output.clone()).unwrap();
+    assert_eq!(port.capture_uart().unwrap(), saved.uart);
+    assert_eq!(
+        port.irq_fd().read().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let (mut runtime, _exits) = DeviceRuntime::new();
+    let handle = runtime
+        .spawn("restored-serial", Start::Parked, move |control| {
+            device.run(control)
+        })
+        .unwrap();
+    assert_eq!(
+        handle.quiesce(TIMEOUT).await,
+        Response::Replied(saved.input.clone())
+    );
+    // Stand in for the integrator's CPU/LAPIC/clock restore ordering boundary.
+    port.reraise_pending().unwrap();
+    assert_eq!(port.irq_fd().read().unwrap(), 1);
+    assert_eq!(
+        port.capture_uart().unwrap(),
+        saved.uart,
+        "reraise acknowledged the UART"
+    );
+    assert_eq!(drain(&port), fifo);
+    assert_eq!(
+        handle.quiesce(TIMEOUT).await,
+        Response::Replied(saved.input.clone())
+    );
+    assert_eq!(
+        port.queued_input(),
+        0,
+        "parked restored input entered the FIFO"
+    );
+
+    assert_eq!(handle.resume(TIMEOUT).await, Response::Replied(()));
+    wait_until("saved pending bytes without host input", || {
+        port.queued_input() == chunk.len() - 5
+    })
+    .await;
+    assert_eq!(drain(&port), chunk[5..]);
+    assert_eq!(
+        handle.quiesce(TIMEOUT).await,
+        Response::Replied(SerialInputState::default()),
+        "no-host task did not drain pending input before becoming inert"
+    );
+    for byte in b"new output" {
+        port.write(DATA, &[*byte]);
+    }
+    assert_eq!(output.0.lock().unwrap().as_slice(), b"new output");
+    assert_eq!(handle.resume(TIMEOUT).await, Response::Replied(()));
+    runtime.shutdown(TIMEOUT).await.unwrap();
+}
+
+#[tokio::test(flavor = "local")]
+async fn restored_pending_bytes_precede_input_from_the_new_host_endpoint() {
+    let saved = SerialSnapshot {
+        input: SerialInputState {
+            pending: b"saved ".to_vec(),
+        },
+        ..SerialSnapshot::default()
+    };
+    let (reader, mut host) = io::pipe().unwrap();
+    host.write_all(b"new").unwrap();
+    let (device, port) = SerialDevice::restore(&saved, Some(reader.into()), io::sink()).unwrap();
+    let (mut runtime, _exits) = DeviceRuntime::new();
+    let handle = runtime
+        .spawn("restored-serial", Start::Parked, move |control| {
+            device.run(control)
+        })
+        .unwrap();
+    assert_eq!(
+        handle.quiesce(TIMEOUT).await,
+        Response::Replied(saved.input)
+    );
+    assert_eq!(port.queued_input(), 0);
+    assert_eq!(handle.resume(TIMEOUT).await, Response::Replied(()));
+    wait_until("saved then newly bound input", || port.queued_input() == 9).await;
+    assert_eq!(drain(&port), b"saved new");
+    runtime.shutdown(TIMEOUT).await.unwrap();
+}
+
+#[tokio::test(flavor = "local")]
+async fn restored_loopback_keeps_pending_input_and_still_answers_control() {
+    let mut saved = SerialSnapshot::default();
+    saved.uart.modem_control |= 0x10;
+    saved.input.pending = b"saved".to_vec();
+    let (device, port) = SerialDevice::restore(&saved, None, io::sink()).unwrap();
+    let (mut runtime, _exits) = DeviceRuntime::new();
+    let handle = runtime
+        .spawn("restored-serial", Start::Running, move |control| {
+            device.run(control)
+        })
+        .unwrap();
+    assert_eq!(
+        handle.quiesce(TIMEOUT).await,
+        Response::Replied(saved.input.clone())
+    );
+    assert_eq!(handle.resume(TIMEOUT).await, Response::Replied(()));
+    assert_eq!(
+        handle.quiesce(TIMEOUT).await,
+        Response::Replied(saved.input.clone())
+    );
+    assert_eq!(port.queued_input(), 0);
+    port.write(4, &[saved.uart.modem_control & !0x10]);
+    assert_eq!(handle.resume(TIMEOUT).await, Response::Replied(()));
+    wait_until("saved input after leaving loopback", || {
+        port.queued_input() == 5
+    })
+    .await;
+    assert_eq!(drain(&port), b"saved");
+    runtime.shutdown(TIMEOUT).await.unwrap();
+}
+
+#[test]
+fn restore_is_irq_silent_and_explicit_reraise_respects_pending_enabled_causes() {
+    for (enabled, pending, expected) in [
+        (1, 4, true),
+        (2, 2, true),
+        (3, 6, true),
+        (0, 6, false),
+        (3, 1, false),
+    ] {
+        let mut saved = SerialSnapshot::default();
+        saved.uart.interrupt_enable = enabled;
+        saved.uart.interrupt_identification = pending;
+        let (_device, port) = SerialDevice::restore(&saved, None, io::sink()).unwrap();
+        assert_eq!(
+            port.irq_fd().read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(port.capture_uart().unwrap(), saved.uart);
+        port.reraise_pending().unwrap();
+        if expected {
+            assert_eq!(port.irq_fd().read().unwrap(), 1);
+        } else {
+            assert_eq!(
+                port.irq_fd().read().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        assert_eq!(port.capture_uart().unwrap(), saved.uart);
+    }
+}
+
+#[test]
+fn invalid_fifo_or_pending_lengths_are_rejected_before_registering_host_input() {
+    let mut fifo = SerialSnapshot::default();
+    fifo.uart.in_buffer = vec![0; FIFO_SIZE + 1];
+    let mut pending = SerialSnapshot::default();
+    pending.input.pending = vec![0; SerialInputState::CAPACITY + 1];
+    for saved in [fifo, pending] {
+        let (reader, _host) = io::pipe().unwrap();
+        let input: std::os::fd::OwnedFd = reader.into();
+        let observer = input.try_clone().unwrap();
+        let before = rustix::fs::fcntl_getfl(&observer).unwrap();
+        // No reactor exists here. Reaching AsyncInput::new would be a bug.
+        let error = SerialDevice::restore(&saved, Some(input), io::sink()).unwrap_err();
+        assert!(matches!(
+            error,
+            SerialError::Snapshot(SerialSnapshotError::FifoLength(_))
+                | SerialError::Snapshot(SerialSnapshotError::PendingLength(_))
+        ));
+        assert_eq!(rustix::fs::fcntl_getfl(&observer).unwrap(), before);
+    }
 }

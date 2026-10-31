@@ -54,6 +54,8 @@ pub enum SpawnError {
 pub enum ShutdownError {
     /// device tasks {0:?} did not stop in time
     Unresponsive(Vec<Arc<str>>),
+    /// device I/O thread did not join in time
+    IoJoinTimeout(#[source] time::error::Elapsed),
     /// stop the device I/O thread
     IoThread(#[source] IoThreadError),
 }
@@ -336,10 +338,38 @@ impl DeviceRuntime {
     /// joins the I/O thread. Tasks still running after `grace` are reported
     /// and left behind, and so is the I/O thread.
     pub async fn shutdown(mut self, grace: Duration) -> Result<(), ShutdownError> {
+        self.stop_and_wait(Instant::now() + grace).await?;
+        match self.io_thread.take() {
+            Some(io_thread) => io_thread.join().await.map_err(ShutdownError::IoThread),
+            None => Ok(()),
+        }
+    }
+
+    /// Stops tasks and joins the I/O thread within one grace period, retaining
+    /// completion receivers and the pending join across timeouts or cancellation.
+    pub async fn shutdown_wait(&mut self, grace: Duration) -> Result<(), ShutdownError> {
+        let deadline = Instant::now() + grace;
+        self.stop_and_wait(deadline).await?;
+        if let Some(io_thread) = &mut self.io_thread {
+            match io_thread.join_wait(deadline).await {
+                Err(IoThreadError::JoinTimeout(error)) => {
+                    return Err(ShutdownError::IoJoinTimeout(error));
+                }
+                result => {
+                    self.io_thread = None;
+                    self.tasks.clear();
+                    return result.map_err(ShutdownError::IoThread);
+                }
+            }
+        }
+        self.tasks.clear();
+        Ok(())
+    }
+
+    async fn stop_and_wait(&mut self, deadline: Instant) -> Result<(), ShutdownError> {
         for task in &self.tasks {
             (task.stop)();
         }
-        let deadline = Instant::now() + grace;
         let mut unresponsive = Vec::new();
         for task in &mut self.tasks {
             if time::timeout_at(deadline, task.finished.wait())
@@ -349,12 +379,10 @@ impl DeviceRuntime {
                 unresponsive.push(Arc::clone(&task.name));
             }
         }
-        if !unresponsive.is_empty() {
-            return Err(ShutdownError::Unresponsive(unresponsive));
-        }
-        match self.io_thread.take() {
-            Some(io_thread) => io_thread.join().await.map_err(ShutdownError::IoThread),
-            None => Ok(()),
+        if unresponsive.is_empty() {
+            Ok(())
+        } else {
+            Err(ShutdownError::Unresponsive(unresponsive))
         }
     }
 
