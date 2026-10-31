@@ -278,12 +278,17 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
 
 ### P5 virtio-blk 与快照：追平 vmm.old
 
-- **transport**：virtio-mmio，SHM 寄存器返回 ~0；reset 握手；中断与 resample。
-- **virtio-blk**：放在 io 线程，按 P3 的控制协议协作 quiesce。
-- **快照**：`capture(&PausedMachine)` 与同进程 rebuild。
-  - 设备快照与 plan 按 id 键控，对应关系进入类型；
-  - cmdline 中的 virtio-mmio 片段由 grant 派生；
-  - 快照测试不用固定 sleep。
+分三步实施，各步独立验证：
+
+- **P5a 设备**：virtio-mmio（SHM 不存在时 length 返回 ~0）、reset/session 握手、irqfd resample、io 线程上的 virtio-blk，使用 `Control<BlockQuiesced>`。reset 确认必须晚于旧队列与 RAM 引用释放；quiesce 不得漏掉已排队的激活。
+- **P5b 接线**：按 id 记录设备 plan，同时显式保存 guest 探测顺序（根盘优先）；grant 记录并 replay 校验；cmdline 从基础文本、grant、根盘选择一次派生。挂设备与创建停泊 vCPU 线程的装配路径供冷启动与 rebuild 共用。
+- **P5c 快照**：`capture(&PausedMachine)` 与同进程 rebuild。
+  - 捕获必须有实际 vCPU 暂停确认；resume 失败后的补偿 pause 也失败时，不能仅凭原类型宣称可捕获。
+  - guest 可见 worker 必须已确认静止且仍存活；控制台输出排空任务不属于 guest 状态，不因其退出拒绝快照。
+  - 设备快照与 plan 按 id/kind 对齐，拒绝缺失、重复、多余；内存不由快照持有。
+  - 恢复先安装 VM/vCPU/LAPIC/clock 状态，再装配设备；恢复态队列在首次 Resume 前不处理请求。
+  - rebuild 的失败路径必须交代 RAM 去向：能完成清理才归还 MemoryStore；未完成的清理保留资源所有权，不能只返回字符串然后丢失 RAM。
+  - 快照测试使用 guest 握手而非固定 sleep。
 - 追平后，由你确认是否删除 vmm.old。
 
 **验收**：A1–A7 全部通过。
@@ -399,7 +404,13 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
   - fmt、clippy、API feature matrix、schema 和 KVM workspace 测试通过；Busy 与完成轮次中的复位事件有确定性回归覆盖，补充 `vmm::start` 公开接口的复位/暂停/恢复并发测试，boot 测试连续 10 次通过。
   - 真实 CLI：双 vCPU、512 MiB、shared backing，Linux 7.3 + initramfs 启动，输出 `DBE_LINUX_OK` 后 `reboot -f`，VMM 退出码 0。配置与完整日志位于 `/work/dbe-kernel/pvh-smoke.{toml,stdout,stderr}`。
   - 真实 Linux REST：anonymous backing；GET Running → Pause → GET Paused → 输入串口行（暂停期间不处理）→ Resume → guest 读到原行并重启，VMM 退出码 0。驱动为 `/work/dbe-kernel/drive-control.py`，日志为 `pvh-control.{stdout,stderr}`。验证用 init 在强制重启前调用 `tcdrain`，避免把 guest TTY 未排空误认为 VMM 丢数据。
-- [ ] P5 virtio-blk 与快照
+- [ ] **P5 virtio-blk 与快照**：
+  - [x] **P5a 设备实现**：Session/Activation、MMIO 状态机与 SHM 寄存器、中断重采样、协作式 block worker 和 guest-driver 测试已实现。reset 确认在旧队列/RAM 引用释放后发出，停泊状态也能处理 reset。
+    - 独立审查发现并修复：`virtio-queue` 的非 fallible pop 会吞掉错误，avail ring 位于 GPA 0 时可能空转；改为 fallible iter 并检测无进展。限速改为保留小数额度。
+    - 新增确定性批次上限和聚合磁盘越界测试；去掉批次上限/聚合范围检查后对应测试失败，恢复修复后通过。
+    - 全量 fmt、clippy、API feature matrix、schema、KVM 测试通过；block 集成测试 25 项。
+  - [ ] **P5b 设备 plan 与机器接线**。
+  - [ ] **P5c 快照与失败资源保留**。
 - [ ] P6 virtio-mem
 - [ ] P7 快照持久化
 

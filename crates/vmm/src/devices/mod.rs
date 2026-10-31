@@ -12,3 +12,4 @@ pub mod control;
 mod io_thread;
 pub mod legacy;
 pub mod runtime;
+pub mod virtio;

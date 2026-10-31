@@ -17,6 +17,7 @@ oneshot.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+virtio-queue.workspace = true
 vm-memory.workspace = true
 vm-superio.workspace = true
 vmm-sys-util.workspace = true
