@@ -133,7 +133,11 @@ pub(super) fn build_with(
 
     let host = context.capabilities();
     let memory = MemoryStore::materialize(plan.memory().clone(), policy, host)?;
-    let (vm, bindings, memslots) = create_vm(context, memory)?;
+    let (vm, bindings, memslots) = create_vm(context, memory).map_err(|(memory, error)| {
+        // Cold boot allocated this RAM afresh; no captured guest state is lost.
+        drop(memory);
+        BuildError::Vm(error)
+    })?;
     let view = Arc::clone(vm.memory().view());
 
     // The kernel is the one thing written straight from its file.

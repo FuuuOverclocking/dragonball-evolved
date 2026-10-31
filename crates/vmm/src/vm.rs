@@ -96,21 +96,31 @@ pub struct KvmVm {
 impl KvmVm {
     /// Creates a VM, with its irqchip and PIT, that owns `memory` but binds
     /// none of it. The memslots come out once, as the only right to bind.
+    /// On failure, closes any temporary VM fd before returning `memory`.
     pub fn new(
         context: &KvmContext,
         memory: MemoryStore,
-    ) -> Result<(Arc<Self>, MemSlots), KvmVmError> {
+    ) -> Result<(Arc<Self>, MemSlots), (MemoryStore, KvmVmError)> {
+        Self::new_with_setup(context, memory, setup_vm)
+    }
+
+    fn new_with_setup(
+        context: &KvmContext,
+        memory: MemoryStore,
+        setup: impl FnOnce(&mut VmFd) -> Result<(), KvmVmError>,
+    ) -> Result<(Arc<Self>, MemSlots), (MemoryStore, KvmVmError)> {
         let max_memslots = context.capabilities().max_memslots;
-        let pool = memslot_pool(max_memslots).ok_or(KvmVmError::Memslots(max_memslots))?;
-        let fd = context.kvm().create_vm().map_err(KvmVmError::Create)?;
-        fd.set_tss_address(TSS_START.0 as usize)
-            .map_err(KvmVmError::TssAddress)?;
-        fd.create_irq_chip().map_err(KvmVmError::Irqchip)?;
-        fd.create_pit2(kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        })
-        .map_err(KvmVmError::Pit)?;
+        let Some(pool) = memslot_pool(max_memslots) else {
+            return Err((memory, KvmVmError::Memslots(max_memslots)));
+        };
+        let mut fd = match context.kvm().create_vm() {
+            Ok(fd) => fd,
+            Err(error) => return Err((memory, KvmVmError::Create(error))),
+        };
+        if let Err(error) = setup(&mut fd) {
+            drop(fd);
+            return Err((memory, error));
+        }
         let vm = Arc::new(Self { fd, memory });
         let slots = MemSlots {
             vm: Arc::clone(&vm),
@@ -187,6 +197,17 @@ impl KvmVm {
     }
 }
 
+fn setup_vm(fd: &mut VmFd) -> Result<(), KvmVmError> {
+    fd.set_tss_address(TSS_START.0 as usize)
+        .map_err(KvmVmError::TssAddress)?;
+    fd.create_irq_chip().map_err(KvmVmError::Irqchip)?;
+    fd.create_pit2(kvm_pit_config {
+        flags: KVM_PIT_SPEAKER_DUMMY,
+        ..Default::default()
+    })
+    .map_err(KvmVmError::Pit)
+}
+
 /// Slots `0..max_memslots`; `None` if slot ids cannot name them all.
 fn memslot_pool(max_memslots: usize) -> Option<IdPool<MemSlot>> {
     let slots = Range::new(MemSlot(0), u32::try_from(max_memslots).ok()?)?;
@@ -194,19 +215,54 @@ fn memslot_pool(max_memslots: usize) -> Option<IdPool<MemSlot>> {
 }
 
 /// Creates a VM owning `memory` and binds its boot windows; hands back the VM,
-/// the bindings and the memslots still free.
+/// the bindings and the memslots still free. On failure, releases every binding
+/// and permit and closes the VM before returning `memory`.
+#[allow(clippy::type_complexity)] // Keep the owned success and failure resources explicit.
 pub fn create_vm(
     context: &KvmContext,
     memory: MemoryStore,
-) -> Result<(Arc<KvmVm>, Vec<Binding>, MemSlots), CreateVmError> {
+) -> Result<(Arc<KvmVm>, Vec<Binding>, MemSlots), (MemoryStore, CreateVmError)> {
     let boot: Vec<_> = memory.layout().boot_windows().map(|(id, _)| id).collect();
-    let (vm, mut slots) = KvmVm::new(context, memory)?;
-    let bindings = slots
-        .allocate(boot.len())?
-        .into_iter()
-        .zip(boot)
-        .map(|(permit, window)| permit.bind(window).map_err(|(_, error)| error))
-        .collect::<Result<_, _>>()?;
+    let (vm, slots) =
+        KvmVm::new(context, memory).map_err(|(memory, error)| (memory, error.into()))?;
+    bind_boot(vm, slots, boot)
+}
+
+#[allow(clippy::type_complexity)] // The same per-stage ownership contract as `create_vm`.
+fn bind_boot(
+    vm: Arc<KvmVm>,
+    mut slots: MemSlots,
+    boot: Vec<WindowId>,
+) -> Result<(Arc<KvmVm>, Vec<Binding>, MemSlots), (MemoryStore, CreateVmError)> {
+    // This private build stage exposes no VM Arc and creates no vCPU. Once its
+    // bindings, permits and slots are dropped, only `vm` can own the VM, so the
+    // uniqueness assertion cannot fail. An invariant violation must not silently
+    // discard the RAM as an ordinary build error.
+    let into_memory = |vm: Arc<KvmVm>| {
+        vm.into_memory()
+            .expect("boot binding cleanup leaves the VM uniquely owned")
+    };
+    let mut permits = match slots.allocate(boot.len()) {
+        Ok(permits) => permits.into_iter(),
+        Err(error) => {
+            drop(slots);
+            return Err((into_memory(vm), error.into()));
+        }
+    };
+    let mut bindings = Vec::new();
+    for window in boot {
+        let permit = permits.next().expect("one permit reserved per boot window");
+        match permit.bind(window) {
+            Ok(binding) => bindings.push(binding),
+            Err((permit, error)) => {
+                drop(bindings);
+                drop(permit);
+                drop(permits);
+                drop(slots);
+                return Err((into_memory(vm), error.into()));
+            }
+        }
+    }
     Ok((vm, bindings, slots))
 }
 
@@ -383,7 +439,9 @@ impl DerefMut for KvmVcpu {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::RawFd;
     use std::path::Path;
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     use vm_memory::{Bytes, GuestAddress};
 
@@ -450,6 +508,178 @@ mod tests {
         let extra = permits.pop().unwrap();
         let boot = permits.pop().unwrap().bind(BOOT).unwrap();
         (vm, boot, extra)
+    }
+
+    /// Move the sole VM fd above ordinary allocations, with a fresh number for
+    /// each observation, so parallel tests cannot reuse it before the close check.
+    fn observe_fd(context: &KvmContext, fd: &mut VmFd) -> RawFd {
+        static NEXT: AtomicI32 = AtomicI32::new(0x1_0000);
+        // SAFETY: `fd` is live; fcntl returns a new, independently owned fd.
+        let raw = unsafe {
+            libc::fcntl(
+                fd.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            )
+        };
+        assert!(raw >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: `raw` is a fresh duplicate of this VM fd, owned by nothing else.
+        let observed = unsafe { context.kvm().create_vmfd_from_rawfd(raw) }.unwrap();
+        *fd = observed; // Close the original; do not keep the VM alive via a duplicate.
+        raw
+    }
+
+    fn assert_fd_closed(fd: RawFd) {
+        // SAFETY: F_GETFD only checks the descriptor, whether open or closed.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    fn observed_vm(context: &KvmContext, memory: MemoryStore) -> (Arc<KvmVm>, MemSlots, RawFd) {
+        let mut fd = -1;
+        let (vm, slots) = KvmVm::new_with_setup(context, memory, |vm_fd| {
+            fd = observe_fd(context, vm_fd);
+            setup_vm(vm_fd)
+        })
+        .unwrap();
+        (vm, slots, fd)
+    }
+
+    fn check_memory_return(
+        context: &KvmContext,
+        kind: BackingKind,
+        fail: impl FnOnce(MemoryStore) -> MemoryStore,
+    ) {
+        let memory = store(context, runtime_layout(), kind);
+        let layout = memory.layout().clone();
+        let policy = *memory.policy();
+        let view = Arc::downgrade(memory.view());
+        let mappings: Vec<_> = layout
+            .windows()
+            .map(|(id, _)| (id, Arc::downgrade(memory.mapping(id).unwrap())))
+            .collect();
+        let markers = [
+            (GuestAddress(0x1000), 0x5a_u8),
+            (GuestAddress(EXTRA_START.0 + 0x1000), 0xa5),
+        ];
+        for (address, byte) in markers {
+            memory.view().write_obj(byte, address).unwrap();
+        }
+
+        let memory = fail(memory);
+        assert_eq!(memory.layout(), &layout);
+        assert_eq!(memory.policy(), &policy);
+        assert!(Arc::ptr_eq(memory.view(), &view.upgrade().unwrap()));
+        for (id, mapping) in &mappings {
+            assert!(Arc::ptr_eq(
+                memory.mapping(*id).unwrap(),
+                &mapping.upgrade().unwrap()
+            ));
+        }
+        for (address, byte) in markers {
+            assert_eq!(memory.view().read_obj::<u8>(address).unwrap(), byte);
+        }
+
+        let (vm, bindings, slots) = create_vm(context, memory).unwrap();
+        assert_eq!(bindings.len(), layout.boot_windows().count());
+        for (address, byte) in markers {
+            assert_eq!(vm.memory().view().read_obj::<u8>(address).unwrap(), byte);
+        }
+        drop((bindings, slots));
+        drop(vm.into_memory().unwrap());
+        assert!(view.upgrade().is_none());
+        assert!(
+            mappings
+                .iter()
+                .all(|(_, mapping)| mapping.upgrade().is_none())
+        );
+    }
+
+    #[test]
+    fn failed_fd_setup_closes_vm_before_returning_memory_on_kvm() {
+        let Some(context) = kvm() else { return };
+        for kind in KINDS {
+            for stage in 0..3 {
+                check_memory_return(&context, kind, |memory| {
+                    let mut fd = -1;
+                    let (memory, error) = KvmVm::new_with_setup(&context, memory, |vm_fd| {
+                        fd = observe_fd(&context, vm_fd);
+                        match stage {
+                            0 => vm_fd
+                                .set_tss_address(usize::MAX)
+                                .map_err(KvmVmError::TssAddress),
+                            1 => {
+                                vm_fd.create_irq_chip().unwrap();
+                                setup_vm(vm_fd)
+                            }
+                            _ => {
+                                setup_vm(vm_fd).unwrap();
+                                vm_fd
+                                    .create_pit2(kvm_pit_config::default())
+                                    .map_err(KvmVmError::Pit)
+                            }
+                        }
+                    })
+                    .unwrap_err();
+                    match (stage, error) {
+                        (0, KvmVmError::TssAddress(source)) => {
+                            assert_eq!(source.errno(), libc::EINVAL)
+                        }
+                        (1, KvmVmError::Irqchip(source)) | (2, KvmVmError::Pit(source)) => {
+                            assert_eq!(source.errno(), libc::EEXIST);
+                        }
+                        (_, error) => panic!("unexpected setup failure: {error}"),
+                    }
+                    assert_fd_closed(fd);
+                    memory
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn partial_boot_binding_failure_returns_memory_on_kvm() {
+        let Some(context) = kvm() else { return };
+        for kind in KINDS {
+            check_memory_return(&context, kind, |memory| {
+                let (vm, slots, fd) = observed_vm(&context, memory);
+                let live_vm = Arc::downgrade(&vm);
+                // The first binding succeeds; the second collides with it, with
+                // a third permit still unconsumed when cleanup starts.
+                let (memory, error) = bind_boot(vm, slots, vec![BOOT, BOOT, EXTRA]).unwrap_err();
+                assert!(matches!(
+                    error,
+                    CreateVmError::Bind(BindError::Kvm { slot: MemSlot(1), window: BOOT, source })
+                        if source.errno() == libc::EEXIST
+                ));
+                assert!(live_vm.upgrade().is_none());
+                assert_fd_closed(fd);
+                memory
+            });
+        }
+    }
+
+    #[test]
+    fn incomplete_boot_permit_reservation_returns_memory_on_kvm() {
+        let Some(context) = kvm() else { return };
+        for kind in KINDS {
+            check_memory_return(&context, kind, |memory| {
+                let (vm, mut slots, fd) = observed_vm(&context, memory);
+                let live_vm = Arc::downgrade(&vm);
+                // Allocate one permit, then exhaust before reserving the second.
+                slots.pool = memslot_pool(1).unwrap();
+                let (memory, error) = bind_boot(vm, slots, vec![BOOT, EXTRA]).unwrap_err();
+                assert!(matches!(
+                    error,
+                    CreateVmError::Memslots(IdPoolError::Exhausted {
+                        pool: "KVM memslot"
+                    })
+                ));
+                assert!(live_vm.upgrade().is_none());
+                assert_fd_closed(fd);
+                memory
+            });
+        }
     }
 
     #[test]

@@ -381,7 +381,7 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
   遗留：
   - 内容契约暂缺（只有一个变体，没有消费者）；
   - 16 MiB 的 PVH 下限放到 P3b 的 plan；
-  - `KvmVm::new` / `create_vm` 失败时会丢掉 `MemoryStore`，P5 的 rebuild 需要把它交回。
+  - 已在 P5 前置修复中解决 RAM 归还：`KvmVm::new` / `create_vm` 失败返回 `(MemoryStore, Error)`。临时 VM fd 先关闭；部分绑定失败先释放绑定/凭据/分配权再关闭 VM。两种 backing 的真实 KVM 测试证明 fd 已关闭、原内容/映射身份保留且可重新建 VM。冷启动调用方显式丢弃新分配的 RAM。
 - [x] **P3a 设备运行时与平台设备**：
   - `devices::control`：协作式控制协议 `Command { Quiesce(Ack<Q>), Resume, Stop }`；`Control::handle` / `park`；任务可以停泊启动。
   - `devices::runtime`：`DeviceRuntime` 只负责放置、监督与 io 线程；持有方拿着类型化的 `DeviceHandle<Q>`，应答为 `Replied` / `Exited` / `TimedOut`；意外退出走可单独持有的 `DeviceExits`；`shutdown(grace)` 按每个任务的完成信号等待。
