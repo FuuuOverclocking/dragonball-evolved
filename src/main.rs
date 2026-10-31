@@ -44,10 +44,13 @@ async fn main() -> Result<()> {
     };
 
     // Wait for the VMM thread to finish.
-    let exit_result = vmm_client.async_join_vmm_thread().await;
+    let exit_result = vmm_client
+        .async_join_vmm_thread()
+        .await
+        .context("join vmm thread");
     match &exit_result {
         Ok(exit_status) => exit_status.print_log(),
-        Err(e) => error_unlimited!("failed to join vmm thread: {e:?}"),
+        Err(error) => error_unlimited!("{error:#}"),
     }
 
     // Gracefully shutdown the API server if it was started.
@@ -91,8 +94,7 @@ fn make_process_ctx(cfg: &api::config::Config) -> Result<ProcessCtx> {
         version: VERSION.to_owned(),
         kvm_ctx: KvmContext::from_dev_path(cfg.kvm_dev()).context("init kvm context")?,
         update_logger: |cfg| {
-            logger_backend::update(logger_backend::Config::from_api(cfg, None))
-                .map_err(api::ApiError::from)
+            logger_backend::update(logger_backend::Config::from_api(cfg, None)).map_err(Into::into)
         },
     })
 }

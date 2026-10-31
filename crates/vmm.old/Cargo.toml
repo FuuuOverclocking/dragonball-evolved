@@ -1,0 +1,31 @@
+[package]
+name = "vmm"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version = "1.96"
+
+[dependencies]
+anyhow.workspace = true
+api = { workspace = true, features = ["request"] }
+bon.workspace = true
+displaydoc.workspace = true
+kvm-bindings.workspace = true
+kvm-ioctls.workspace = true
+libc.workspace = true
+linux-loader.workspace = true
+logger.workspace = true
+oneshot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+vm-superio.workspace = true
+vmm-sys-util.workspace = true
+
+[dev-dependencies]
+api.workspace = true
+libc.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+vmm-sys-util.workspace = true

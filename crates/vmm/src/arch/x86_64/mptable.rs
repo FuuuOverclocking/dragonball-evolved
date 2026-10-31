@@ -1,7 +1,6 @@
-use thiserror::Error;
-
-use super::layout::{IOAPIC_START, LAPIC_START, SYSTEM_MEM_END, SYSTEM_MEM_START};
+use super::layout::{IOAPIC_START, LAPIC_START, SYSTEM_MEM};
 use super::pvh::GuestBlob;
+use crate::space::Range;
 
 const MAX_CPUS: u8 = 254;
 const APIC_VERSION: u8 = 0x14;
@@ -12,13 +11,13 @@ const LEGACY_IRQS: u8 = 24;
 const HEADER_LEN: usize = 44;
 const FLOATING_POINTER_LEN: usize = 16;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, displaydoc::Display, thiserror::Error)]
 pub enum MpTableError {
-    #[error("MP table needs at least one vCPU")]
+    /// MP table needs at least one vCPU
     NoCpus,
-    #[error("MP table supports at most 254 vCPUs")]
+    /// MP table supports at most 254 vCPUs
     TooManyCpus,
-    #[error("MP table does not fit in the system data area")]
+    /// MP table does not fit in the system data area
     TooLarge,
 }
 
@@ -44,7 +43,7 @@ pub fn build(num_cpus: u8) -> Result<GuestBlob, MpTableError> {
     table.extend_from_slice(&[1, 0]);
     table.extend_from_slice(b"ISA   ");
     table.extend_from_slice(&[2, ioapic_id, APIC_VERSION, 1]);
-    push_u32(&mut table, IOAPIC_START as u32);
+    push_u32(&mut table, IOAPIC_START.0 as u32);
     for irq in 0..LEGACY_IRQS {
         table.extend_from_slice(&[3, 0]);
         push_u16(&mut table, 0);
@@ -65,10 +64,10 @@ pub fn build(num_cpus: u8) -> Result<GuestBlob, MpTableError> {
     table[16..28].copy_from_slice(b"MICROVM     ");
     let entry_count = u16::from(num_cpus) + 1 + 1 + u16::from(LEGACY_IRQS) + 2;
     table[34..36].copy_from_slice(&entry_count.to_le_bytes());
-    table[36..40].copy_from_slice(&(LAPIC_START as u32).to_le_bytes());
+    table[36..40].copy_from_slice(&(LAPIC_START.0 as u32).to_le_bytes());
     table[7] = checksum(&table);
 
-    let table_address = SYSTEM_MEM_START + FLOATING_POINTER_LEN as u64;
+    let table_address = SYSTEM_MEM.start().0 + FLOATING_POINTER_LEN as u64;
     let mut floating = Vec::with_capacity(FLOATING_POINTER_LEN);
     floating.extend_from_slice(b"_MP_");
     push_u32(&mut floating, table_address as u32);
@@ -76,11 +75,13 @@ pub fn build(num_cpus: u8) -> Result<GuestBlob, MpTableError> {
     floating[10] = checksum(&floating);
 
     floating.extend_from_slice(&table);
-    if SYSTEM_MEM_START + floating.len() as u64 > SYSTEM_MEM_END {
+    let fits = Range::new(SYSTEM_MEM.start(), floating.len() as u64)
+        .is_some_and(|blob| SYSTEM_MEM.contains_range(blob));
+    if !fits {
         return Err(MpTableError::TooLarge);
     }
     Ok(GuestBlob {
-        address: SYSTEM_MEM_START,
+        address: SYSTEM_MEM.start(),
         bytes: floating,
     })
 }
@@ -100,11 +101,12 @@ fn checksum(bytes: &[u8]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::space::Gpa;
 
     #[test]
     fn table_has_valid_headers_counts_and_checksums() {
         let blob = build(4).unwrap();
-        assert_eq!(blob.address, SYSTEM_MEM_START);
+        assert_eq!(blob.address, Gpa(0x9_fc00));
         let floating = &blob.bytes[..FLOATING_POINTER_LEN];
         let table = &blob.bytes[FLOATING_POINTER_LEN..];
         assert_eq!(&floating[..4], b"_MP_");
@@ -146,5 +148,12 @@ mod tests {
     fn invalid_cpu_counts_are_rejected() {
         assert_eq!(build(0), Err(MpTableError::NoCpus));
         assert_eq!(build(255), Err(MpTableError::TooManyCpus));
+    }
+
+    #[test]
+    fn the_largest_table_fits_in_the_system_data_area() {
+        let blob = build(MAX_CPUS).unwrap();
+        let range = Range::new(blob.address, blob.bytes.len() as u64).unwrap();
+        assert!(SYSTEM_MEM.contains_range(range));
     }
 }

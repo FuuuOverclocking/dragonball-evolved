@@ -1,7 +1,7 @@
 use logger::{Level, log_unlimited};
 
 /// Why the vmm thread stopped.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmmExitStatus {
     /// The vmm shut down as asked.
     Ok,

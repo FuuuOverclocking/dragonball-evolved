@@ -1,5 +1,4 @@
 use kvm_bindings::{CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, kvm_cpuid_entry2};
-use thiserror::Error;
 use vmm_sys_util::fam;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,15 +33,15 @@ pub struct HostCpuid {
     pub amd_processor_topology: CpuidRegisters,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub enum CpuidError {
-    #[error("CPUID configuration needs 1 to 254 vCPUs, got {0}")]
+    /// CPUID configuration needs 1 to 254 vCPUs, got {0}
     InvalidVcpuCount(u8),
-    #[error("vCPU index {index} is outside a {count}-vCPU topology")]
+    /// vCPU index {index} is outside a {count}-vCPU topology
     InvalidVcpuIndex { index: u8, count: u8 },
-    #[error("required CPUID leaf {function:#x}, subleaf {index:#x} is missing")]
+    /// required CPUID leaf {function:#x}, subleaf {index:#x} is missing
     Missing { function: u32, index: u32 },
-    #[error("failed to construct KVM CPUID: {0}")]
+    /// construct KVM CPUID
     Build(#[from] fam::Error),
 }
 

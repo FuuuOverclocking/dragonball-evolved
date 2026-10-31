@@ -1,102 +1,52 @@
+pub mod align;
 pub mod arch;
-pub mod devices;
+mod error;
 mod exit_status;
 mod kvm_context;
-mod lifecycle;
-pub mod machine;
+mod main_loop;
+pub mod memory;
 mod process_ctx;
 pub mod resources;
+pub mod space;
 pub mod spec;
+pub mod vm;
 mod vmm_server;
 
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{io, thread};
 
-use anyhow::{Context, Result};
-use tokio::select;
+use tokio::runtime::{Builder, LocalOptions};
 use tokio::sync::mpsc;
 
 pub use crate::exit_status::VmmExitStatus;
-pub use crate::kvm_context::{HostCapabilities, KvmContext};
-use crate::lifecycle::{BusyCtx, BusyEvent, Controller, Event, Step, Vm, handle_busy, handle_idle};
+pub use crate::kvm_context::{HostCapabilities, KvmContext, KvmContextError};
 pub use crate::process_ctx::ProcessCtx;
-use crate::spec::MachineSpec;
-pub use crate::vmm_server::VmmClient;
-use crate::vmm_server::{Inbound, VmmServer};
+use crate::vmm_server::VmmServer;
+pub use crate::vmm_server::{CallError, JoinError, ServerStopped, VmmClient};
 
-pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
+/// spawn the vmm-main thread
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
+pub struct StartError(#[source] io::Error);
+
+/// build the vmm-main runtime
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
+struct RuntimeError(#[source] io::Error);
+
+pub fn start(ctx: ProcessCtx) -> Result<VmmClient, StartError> {
     let (tx, rx) = mpsc::unbounded_channel();
-
-    let thread_handle = thread::Builder::new()
+    let server = VmmServer::new(rx);
+    let thread = thread::Builder::new()
         .name("vmm-main".into())
-        .spawn(move || vmm_main(VmmServer::new(rx), ctx))
-        .context("spawn vmm-main thread")?;
-
-    Ok(VmmClient {
-        thread_handle: Arc::new(Mutex::new(Some(thread_handle))),
-        tx,
-    })
+        .spawn(move || vmm_main(server, ctx))
+        .map_err(StartError)?;
+    Ok(VmmClient::new(tx, Some(thread)))
 }
 
-#[tokio::main(flavor = "local")]
-async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
-    let mut controller = Controller::new(MachineSpec::default());
-
-    let mut status = loop {
-        match controller {
-            Controller::Idle(mut vm) => {
-                // A Start that failed after every client left: nobody can start it again.
-                if server.is_detached() && matches!(vm, Vm::NotStarted(_)) {
-                    controller = Controller::Idle(vm);
-                    break VmmExitStatus::Ok;
-                }
-                // IDLE: select machine/device events (biased) and requests.
-                let event = select! {
-                    biased;
-                    event = vm.next_event() => event,
-                    inbound = server.next_inbound() => match inbound {
-                        Inbound::Request(request) => Event::Request(request),
-                        Inbound::Detached => Event::Detached,
-                    },
-                };
-                let (next, step) = handle_idle(vm, event, &ctx).await;
-                match step {
-                    Step::Continue => controller = next,
-                    Step::Stop(s) => {
-                        controller = next;
-                        break s;
-                    }
-                }
-            }
-            Controller::Busy {
-                stable,
-                mut operation,
-            } => {
-                let event = select! {
-                    biased;
-                    completion = &mut operation.future => BusyEvent::Completion(Box::new(completion)),
-                    inbound = server.next_inbound() => match inbound {
-                        Inbound::Request(request) => BusyEvent::Request(request),
-                        Inbound::Detached => BusyEvent::Detached,
-                    },
-                };
-                let (next, step) =
-                    handle_busy(stable, operation, event, &BusyCtx::from(&ctx)).await;
-                match step {
-                    Step::Continue => controller = next,
-                    Step::Stop(s) => {
-                        controller = next;
-                        break s;
-                    }
-                }
-            }
-        }
-    };
-
-    drop(server);
-
-    if let Err(error) = controller.teardown().await {
-        status = VmmExitStatus::Error(format!("teardown: {error:#}"));
+fn vmm_main(server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
+    match Builder::new_current_thread()
+        .enable_all()
+        .build_local(LocalOptions::default())
+    {
+        Ok(runtime) => runtime.block_on(main_loop::run(server, &ctx)),
+        Err(error) => VmmExitStatus::Error(error::render_chain(&RuntimeError(error))),
     }
-    status
 }

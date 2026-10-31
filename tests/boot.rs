@@ -58,6 +58,7 @@ fn run_config(config: &Path, limit: Duration) -> Output {
 }
 
 #[test]
+#[ignore = "P4: machine start is being rebuilt in crates/vmm"]
 fn configuration_autostarts_pvh_serial_and_virtio_block() {
     if !Path::new("/dev/kvm").exists() {
         return;
@@ -83,6 +84,7 @@ fn configuration_autostarts_pvh_serial_and_virtio_block() {
 }
 
 #[test]
+#[ignore = "P4: machine start is being rebuilt in crates/vmm"]
 fn pvh_module_list_points_to_loaded_initrd() {
     if !Path::new("/dev/kvm").exists() {
         return;
@@ -110,6 +112,7 @@ fn pvh_module_list_points_to_loaded_initrd() {
 }
 
 #[test]
+#[ignore = "P4: machine start is being rebuilt in crates/vmm"]
 fn configuration_boots_a_guest_on_shared_memory() {
     if !Path::new("/dev/kvm").exists() {
         return;
@@ -133,7 +136,7 @@ fn configuration_boots_a_guest_on_shared_memory() {
 }
 
 #[test]
-#[ignore = "requires DBE_KERNEL and optionally DBE_INITRD/DBE_ROOTFS"]
+#[ignore = "requires DBE_KERNEL and optionally DBE_INITRD/DBE_ROOTFS; unavailable until P5 rebuilds machine start and virtio-blk"]
 fn linux_pvh_smoke_boot() {
     let kernel = std::env::var_os("DBE_KERNEL").expect("set DBE_KERNEL to a PVH vmlinux");
     let mut machine = serde_json::json!({ "memory_mib": 512, "kernel": { "path": std::path::PathBuf::from(kernel), "cmdline": std::env::var("DBE_CMDLINE").ok(), "initrd": std::env::var_os("DBE_INITRD").map(std::path::PathBuf::from) } });
@@ -157,39 +160,158 @@ fn linux_pvh_smoke_boot() {
     );
 }
 
+struct ApiProcess {
+    child: ChildGuard,
+    client: hyper_uds::Client,
+    socket: std::path::PathBuf,
+    _marker: elf::TempFile,
+}
+
+impl ApiProcess {
+    async fn spawn() -> Self {
+        let marker = elf::TempFile::new(b"");
+        let socket = marker.path().with_extension("sock");
+        let child = Command::new(env!("CARGO_BIN_EXE_dragonball-evolved"))
+            .args(["--api-sock", socket.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(child);
+        let client = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match hyper_uds::Client::connect(&socket).await {
+                    Ok(client) => break client,
+                    Err(_) => {
+                        assert!(
+                            child.0.try_wait().unwrap().is_none(),
+                            "API process exited before binding"
+                        );
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        Self {
+            child,
+            client,
+            socket,
+            _marker: marker,
+        }
+    }
+
+    async fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (hyper_uds::StatusCode, serde_json::Value) {
+        let request = hyper_uds::Request::builder()
+            .method(method)
+            .uri(path)
+            .body(hyper_uds::Body::json(&body).unwrap())
+            .unwrap();
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), self.client.send_request(request))
+                .await
+                .unwrap()
+                .unwrap();
+        let body = serde_json::from_slice(response.body().as_bytes()).unwrap();
+        (response.status(), body)
+    }
+
+    /// Hangs up, then waits for the process to exit and remove its socket.
+    async fn wait_for_exit(self) -> std::process::ExitStatus {
+        let Self {
+            mut child,
+            client,
+            socket,
+            _marker,
+        } = self;
+        drop(client);
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!socket.exists());
+        status
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
+async fn rest_api_configures_and_shuts_down_before_start() {
+    use hyper_uds::StatusCode;
+    use serde_json::{Value, json};
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let mut api = ApiProcess::spawn().await;
+    let disk = json!({ "path": "/test/disk", "root": true });
+    for (method, path, body, status) in [
+        ("PUT", "/v1/machine/console", json!("none"), StatusCode::OK),
+        ("PUT", "/v1/machine/memory-mib", json!(16), StatusCode::OK),
+        (
+            "PUT",
+            "/v1/machine/cpus",
+            json!(0),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            "PUT",
+            "/v1/machine/kernel",
+            json!({ "path": "/test/kernel" }),
+            StatusCode::OK,
+        ),
+        ("PUT", "/v1/disks", disk.clone(), StatusCode::OK),
+        ("PUT", "/v1/disks", disk, StatusCode::INTERNAL_SERVER_ERROR),
+        (
+            "PUT",
+            "/v1/actions/pause",
+            Value::Null,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let (actual, reply) = api.request(method, path, body).await;
+        assert_eq!(actual, status, "{method} {path}: {reply}");
+    }
+
+    let (status, reply) = api.request("PUT", "/v1/actions/start", Value::Null).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("not supported yet"),
+        "{reply}"
+    );
+    let (status, info) = api.request("GET", "/v1/", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["state"], "not_started");
+    let (status, reply) = api
+        .request("PUT", "/v1/actions/shutdown", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert!(api.wait_for_exit().await.success());
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "P4: machine start is being rebuilt in crates/vmm"]
 async fn rest_api_configures_pauses_and_shuts_down_a_real_vm() {
-    use hyper_uds::{Body, Client, Request, StatusCode};
+    use hyper_uds::StatusCode;
     if !Path::new("/dev/kvm").exists() {
         return;
     }
     let kernel = elf::TempFile::new(&elf::image(&[0xeb, 0xfe], true));
-    let marker = elf::TempFile::new(b"");
-    let socket = marker.path().with_extension("sock");
-    let child = Command::new(env!("CARGO_BIN_EXE_dragonball-evolved"))
-        .args(["--api-sock", socket.to_str().unwrap()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut child = ChildGuard(child);
-    let mut client = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match Client::connect(&socket).await {
-                Ok(client) => break client,
-                Err(_) => {
-                    assert!(
-                        child.0.try_wait().unwrap().is_none(),
-                        "API process exited before binding"
-                    );
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            }
-        }
-    })
-    .await
-    .unwrap();
+    let mut api = ApiProcess::spawn().await;
     for (method, path, body, status) in [
         ("GET", "/v1/", serde_json::Value::Null, StatusCode::OK),
         (
@@ -242,37 +364,14 @@ async fn rest_api_configures_pauses_and_shuts_down_a_real_vm() {
             StatusCode::OK,
         ),
     ] {
-        let request = Request::builder()
-            .method(method)
-            .uri(path)
-            .body(Body::json(&body).unwrap())
-            .unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(5), client.send_request(request))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            status,
-            "{path}: {:?}",
-            response.body().as_bytes()
-        );
+        let (actual, reply) = api.request(method, path, body).await;
+        assert_eq!(actual, status, "{path}: {reply}");
         if method == "GET" {
-            let info: serde_json::Value =
-                serde_json::from_slice(response.body().as_bytes()).unwrap();
             assert!(matches!(
-                info["state"].as_str(),
+                reply["state"].as_str(),
                 Some("not_started" | "paused")
             ));
         }
     }
-    drop(client);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while child.0.try_wait().unwrap().is_none() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(!socket.exists());
+    api.wait_for_exit().await;
 }

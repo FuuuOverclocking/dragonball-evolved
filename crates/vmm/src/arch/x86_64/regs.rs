@@ -4,14 +4,15 @@ use kvm_bindings::{kvm_fpu, kvm_regs, kvm_segment, kvm_sregs};
 
 use super::layout::{GDT_START, IDT_START, PVH_INFO_START};
 use super::pvh::GuestBlob;
+use crate::space::Gpa;
 
 const CR0_PE: u64 = 1;
 const CR0_ET: u64 = 1 << 4;
 
-pub fn boot_regs(entry: u64) -> kvm_regs {
+pub fn boot_regs(entry: Gpa) -> kvm_regs {
     kvm_regs {
-        rip: entry,
-        rbx: PVH_INFO_START,
+        rip: entry.0,
+        rbx: PVH_INFO_START.0,
         rflags: 2,
         ..Default::default()
     }
@@ -32,9 +33,9 @@ pub fn boot_sregs(mut sregs: kvm_sregs) -> (kvm_sregs, [GuestBlob; 2]) {
         gdt_entry(0xc093, 0, u32::MAX),
         gdt_entry(0x008b, 0, 0x67),
     ];
-    sregs.gdt.base = GDT_START;
+    sregs.gdt.base = GDT_START.0;
     sregs.gdt.limit = (mem::size_of_val(&gdt) - 1) as u16;
-    sregs.idt.base = IDT_START;
+    sregs.idt.base = IDT_START.0;
     sregs.idt.limit = 7;
     sregs.cs = segment(gdt[1], 1);
     let data = segment(gdt[2], 2);
@@ -78,6 +79,7 @@ fn segment(entry: u64, index: u8) -> kvm_segment {
     let limit = (((entry >> 32) & 0xf_0000) | (entry & 0xffff)) as u32;
     kvm_segment {
         base: ((entry >> 16) & 0xff_ffff) | ((entry >> 32) & 0xff00_0000),
+        // KVM takes the limit in bytes: with G=1, a 20-bit limit of pages.
         limit: if granularity == 0 {
             limit
         } else {
@@ -103,9 +105,9 @@ mod tests {
 
     #[test]
     fn registers_enter_the_pvh_entry_contract() {
-        let regs = boot_regs(0x10_0000);
+        let regs = boot_regs(Gpa(0x10_0000));
         assert_eq!(regs.rip, 0x10_0000);
-        assert_eq!(regs.rbx, PVH_INFO_START);
+        assert_eq!(regs.rbx, PVH_INFO_START.0);
         assert_eq!(regs.rflags, 2);
         let fpu = boot_fpu();
         assert_eq!(fpu.fcw, 0x37f);
