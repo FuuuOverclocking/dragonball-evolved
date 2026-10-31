@@ -186,8 +186,15 @@ struct Report {
 
 impl Report {
     fn exit(self, result: Result<(), DeviceFailure>) {
-        let name = &self.name;
-        let expected = self.stop_requested.load(Ordering::SeqCst);
+        let Self {
+            name,
+            stop_requested,
+            exits,
+            _finished: finished,
+        } = self;
+        // Finished before reported, so whoever reads the exit sees the task ended.
+        drop(finished);
+        let expected = stop_requested.load(Ordering::SeqCst);
         match (&result, expected) {
             (Ok(()), true) => info_unlimited!("device {name} stopped"),
             (Ok(()), false) => info_unlimited!("device {name} exited"),
@@ -202,10 +209,7 @@ impl Report {
             }
         }
         if !expected {
-            let _ = self.exits.send(DeviceExit {
-                name: Arc::clone(&self.name),
-                result,
-            });
+            let _ = exits.send(DeviceExit { name, result });
         }
     }
 }

@@ -154,6 +154,13 @@ impl MachineSpec {
         Ok(next)
     }
 
+    /// Adds `device` without the rules `apply` enforces.
+    #[cfg(test)]
+    pub(crate) fn with_device_unchecked(mut self, device: DeviceSpec) -> Self {
+        self.devices.push(device);
+        self
+    }
+
     fn block(&self, disk: BlockDevConfig) -> Result<BlockSpec, SpecError> {
         if disk.path.as_os_str().is_empty() {
             return Err(SpecError::EmptyDiskPath);
