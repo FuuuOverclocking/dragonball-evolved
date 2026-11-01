@@ -433,9 +433,18 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
       - 本阶段遵循 `/verify`，未运行测试、typecheck、clippy 或 API/schema CI；新增确定性回归用例留给 CI。`cargo build --workspace` 和 VMM 格式检查通过。重复读取已缓存的第零扇区不证明后端 I/O；验证改为读取不同扇区并观察真实块计数。
       - 范围仍为同宿主、同进程、已有 RAM 的停机恢复；不包含持久化、磁盘内容快照、跨宿主迁移，也未启用动态 XSTATE 权限。不支持的 supervisor state 明确拒绝，P7 再处理持久化。
 - [ ] **P6 virtio-mem（执行中）**：阶段计划见 `ai-sessions/p6-plan.md`。
-  - [ ] P6a：固定 Window、Population、chunk slice 注册/discard 与协议纯核。
-  - [ ] P6b：I/O LocalRuntime 上的内存服务，独占 Population、注册及未完成变更。
-  - [ ] P6c：virtio-mem worker、动态配置/generation 和 pending 操作排空。
+  - [x] P6a：固定 Window、Population、chunk slice 注册/discard 与协议纯核。
+    - 已实现并审查：VirtioMem Window/kind、对象坐标切片绑定、纯 Population proposals、内部 discard 入口与 24/10/56 字节报文编码。BootRam/e820 过滤不变；整机 slot 预算及 aperture grant 留给 P6d。
+    - 公共 KVM 驱动器实际 vCPU 验证 anonymous/shared 两种 backing 的非零对象偏移、非法切片归还 permit、同 permit 重绑定、CPU 读值和原 RAM 回收；日志 `/work/dbe-kernel/p6a-slice.{stdout,stderr}`。P6b/c 驱动器进一步观察精确 discard：移除块 mincore 不驻留、回读零，邻块标记保留；shared 的对象偏移 pread 同时验证空洞与保留内容。
+  - [x] P6b：I/O LocalRuntime 上的内存服务，独占 Population、注册及未完成变更。
+    - 公开库真实 KVM 路径验证跨 chunk PLUG/UNPLUG、重复/混合请求拒绝、目标上限 NACK；额外注册阻挡后续 chunk 产生真实 bind 失败，已绑定前缀完整回滚后 BUSY，解除阻挡后再次成功。
+    - mlock 阻止两种 backing 的 discard：保留原操作/Population/revision，used.idx 不提前推进，设备与服务 quiesce 超时且 resize 未发布；munlock 后显式 retry 完成原请求、目标发布及暂停。各 32 个在途 quiesce 全部 Replied，取消等待不撤回操作。停止不 discard 仍插入的内容，真实 VM/CPU/permit 所有者释放前不能取回 RAM。
+  - [x] P6c：virtio-mem worker、动态配置/generation 和 pending 操作排空。
+    - guest CPU 独立生成 MMIO 协商、descriptor/avail/request：STATE 三态、ERROR/NACK/BUSY、无效方向与缺失 descriptor（used len 0）、CONFIG/VRING IRQ 与 generation 均有运行证据。丢弃 ResizeReply 后目标仍发布；reset 后 Population/目标/内容保持，重新协商可继续处理；停泊时新队列请求不被消费。
+    - 同一 VM/RAM 的服务及 backend 重建：错误保存游标返回 MemError::QueuePosition，不写队列/response/config；正确恢复精确配置与 ACK，Resume 前无活动或提前 IRQ，Resume 后原 pending STATE 只完成一次。此处不是整机 Machine::rebuild，也不是 vCPU 快照持久化。
+    - 最终审查后前台复跑 anonymous/shared 都 PASS，日志 `/work/dbe-kernel/p6bc-lifecycle-reviewed.{stdout,stderr}`（stderr 空）；驱动器 `/work/dbe-kernel/p6bc-protocol-runner`。普通双 CPU、只读 ext4、无 initrd 的 CLI 再次输出 `DBE_LINUX_OK rootfs` 并正常 reboot（退出 0），日志 `p6bc-cli-root.{stdout,stderr}`。
+    - 发现驱动器最初假定 used.idx 就绪时 IRQ 已到达；本地 split-ring 规范要求先写 used 再通知，故改为 guest 等待 VRING 位，仍严格检查 IRQ 位与次数，未改设备顺序。部分 chunk 的 unplugged block 仍可被 CPU 访问，已明确观察，不宣称完全拦截非法访问。
+    - workspace 构建、格式和 diff 空白检查通过；遵循 `/verify` 未运行测试/typecheck/clippy/API CI。失败解绑、补偿失败与清理重试的确定性规格留给 CI，本次未人为破坏 VM fd 来模拟这些失败。
   - [ ] P6d：配置/ResizeMemory API、按 kind 装配及生命周期。
   - [ ] P6e：Population 快照和真实 Linux grow/shrink/zero/regrow 验收。
   - 启动方式：先提交计划，再由不重叠子代理编写 P6a，主会话检查实际 diff 和公共 KVM 运行结果；保持没有 hotplug 配置的 VMM 可启动。

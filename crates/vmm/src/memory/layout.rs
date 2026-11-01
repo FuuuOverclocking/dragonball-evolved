@@ -44,6 +44,7 @@ pub struct Object {
 pub enum WindowOwner {
     /// The machine's boot memory, bound before the guest runs.
     Boot,
+    VirtioMem,
 }
 
 /// What a window holds for the guest.
@@ -51,6 +52,7 @@ pub enum WindowOwner {
 pub enum WindowKind {
     /// RAM the guest finds in its boot memory map.
     BootRam,
+    VirtioMemRam,
 }
 
 /// A slice of an object, placed in the guest. The slice's length is the
@@ -489,6 +491,34 @@ mod tests {
                 WindowKind::BootRam,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn virtio_mem_is_one_fixed_window_outside_boot_memory() {
+        let hot = Window::new(
+            ObjectId(1),
+            slice(0x2000..0x4000),
+            Gpa(1 << 40),
+            WindowOwner::VirtioMem,
+            WindowKind::VirtioMemRam,
+        )
+        .unwrap();
+        let boot = window(OBJECT, 0..0x1000, 0);
+        let layout = layout(&[(0, 0x1000), (1, 0x4000)], &[boot, hot]).unwrap();
+        assert_eq!(layout.objects().count(), 2);
+        assert_eq!(layout.windows().count(), 2);
+        assert_eq!(
+            layout.boot_windows().collect::<Vec<_>>(),
+            [(WindowId(0), &boot)]
+        );
+        assert_eq!(layout.window(WindowId(1)), Some(&hot));
+        assert_eq!(
+            MemoryLayout::new(
+                [(ObjectId(1), Object { capacity: 0x4000 })],
+                [(WindowId(1), hot)]
+            ),
+            Err(MemoryLayoutError::NoBootRam)
         );
     }
 

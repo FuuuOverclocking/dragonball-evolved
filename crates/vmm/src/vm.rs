@@ -14,15 +14,16 @@ use std::{io, mem};
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config, kvm_userspace_memory_region};
 use kvm_ioctls::{VcpuFd, VmFd};
 use logger::error_unlimited;
-use vm_memory::{Address, GuestMemoryRegion};
 
+use crate::align::HostPageSize;
 use crate::arch::x86_64::layout::TSS_START;
 use crate::error::render_chain;
 use crate::kvm_context::KvmContext;
 use crate::memory::layout::WindowId;
+use crate::memory::policy::SliceError;
 use crate::memory::store::{MemoryStore, WindowMapping};
 use crate::resources::{IdPool, IdPoolError};
-use crate::space::{MemSlot, Range};
+use crate::space::{Gpa, MemSlot, ObjectOffset, Range};
 
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub enum KvmVmError {
@@ -58,6 +59,8 @@ pub enum BindError {
     ForeignPermit,
     /// window {0} is not part of this VM's memory
     UnknownWindow(WindowId),
+    /// validate the memslot's object slice
+    Slice(#[source] SliceError),
     /// bind KVM memslot {slot} to window {window}
     Kvm {
         slot: MemSlot,
@@ -91,6 +94,7 @@ pub struct KvmVm {
     // Declared first, so the VM is closed before the memory it maps is released.
     fd: VmFd,
     memory: MemoryStore,
+    host_page: HostPageSize,
 }
 
 impl KvmVm {
@@ -121,7 +125,11 @@ impl KvmVm {
             drop(fd);
             return Err((memory, error));
         }
-        let vm = Arc::new(Self { fd, memory });
+        let vm = Arc::new(Self {
+            fd,
+            memory,
+            host_page: context.capabilities().page_size,
+        });
         let slots = MemSlots {
             vm: Arc::clone(&vm),
             pool,
@@ -139,15 +147,34 @@ impl KvmVm {
         if !Arc::ptr_eq(self, &permit.vm) {
             return Err((permit, BindError::ForeignPermit));
         }
-        let Some(mapping) = self.memory.mapping(window) else {
+        let Some(descriptor) = self.memory.layout().window(window) else {
             return Err((permit, BindError::UnknownWindow(window)));
+        };
+        self.bind_slice(permit, window, descriptor.slice())
+    }
+
+    pub fn bind_slice(
+        self: &Arc<Self>,
+        permit: SlotPermit,
+        window: WindowId,
+        slice: Range<ObjectOffset>,
+    ) -> Result<Binding, (SlotPermit, BindError)> {
+        if !Arc::ptr_eq(self, &permit.vm) {
+            return Err((permit, BindError::ForeignPermit));
+        }
+        if self.memory.layout().window(window).is_none() {
+            return Err((permit, BindError::UnknownWindow(window)));
+        }
+        let checked = match self.memory.checked_slice(window, slice, self.host_page) {
+            Ok(checked) => checked,
+            Err(error) => return Err((permit, BindError::Slice(error))),
         };
         let slot = permit.slot;
         let region = kvm_userspace_memory_region {
             slot: slot.0,
-            guest_phys_addr: mapping.start_addr().raw_value(),
-            memory_size: mapping.len(),
-            userspace_addr: mapping.as_ptr() as u64,
+            guest_phys_addr: checked.placement.start().0,
+            memory_size: checked.len as u64,
+            userspace_addr: checked.address as u64,
             flags: 0,
         };
         // SAFETY: the binding retains this live mapping, and its permit the VM, until the slot is deleted.
@@ -164,7 +191,9 @@ impl KvmVm {
         Ok(Binding {
             permit: Some(permit),
             window,
-            mapping: Arc::clone(mapping),
+            slice,
+            placement: checked.placement,
+            mapping: Arc::clone(checked.mapping),
         })
     }
 
@@ -180,7 +209,7 @@ impl KvmVm {
     /// Closes the VM and hands its memory back, or returns the VM if anything
     /// else, such as a vCPU, a permit or a binding, still holds it.
     pub fn into_memory(self: Arc<Self>) -> Result<MemoryStore, Arc<Self>> {
-        let Self { fd, memory } = Arc::try_unwrap(self)?;
+        let Self { fd, memory, .. } = Arc::try_unwrap(self)?;
         drop(fd);
         Ok(memory)
     }
@@ -331,6 +360,14 @@ impl SlotPermit {
         Arc::clone(&self.vm).bind(self, window)
     }
 
+    pub fn bind_slice(
+        self,
+        window: WindowId,
+        slice: Range<ObjectOffset>,
+    ) -> Result<Binding, (Self, BindError)> {
+        Arc::clone(&self.vm).bind_slice(self, window, slice)
+    }
+
     fn delete(&self) -> Result<(), UnbindError> {
         let region = kvm_userspace_memory_region {
             slot: self.slot.0,
@@ -351,6 +388,8 @@ pub struct Binding {
     // Taken only by `unbind`, which consumes the binding.
     permit: Option<SlotPermit>,
     window: WindowId,
+    slice: Range<ObjectOffset>,
+    placement: Range<Gpa>,
     mapping: WindowMapping,
 }
 
@@ -363,6 +402,14 @@ impl Binding {
 
     pub fn window(&self) -> WindowId {
         self.window
+    }
+
+    pub fn slice(&self) -> Range<ObjectOffset> {
+        self.slice
+    }
+
+    pub fn placement(&self) -> Range<Gpa> {
+        self.placement
     }
 
     /// Deletes the slot, then hands back the permit, free to bind again, and
@@ -443,7 +490,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicI32, Ordering};
 
-    use vm_memory::{Bytes, GuestAddress};
+    use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryRegion};
 
     use super::*;
     use crate::align::BackingPageSize;
@@ -812,6 +859,139 @@ mod tests {
                     .unwrap(),
                 0x5a
             );
+        }
+    }
+
+    fn hot_vm(context: &KvmContext, kind: BackingKind) -> (Arc<KvmVm>, MemSlots, u64) {
+        let page = context.capabilities().page_size.alignment().get();
+        let boot = MemoryLayout::boot(16 << 20).unwrap();
+        let hot = Window::new(
+            ObjectId(1),
+            Range::new(ObjectOffset(2 * page), 4 * page).unwrap(),
+            Gpa(1 << 32),
+            WindowOwner::VirtioMem,
+            WindowKind::VirtioMemRam,
+        )
+        .unwrap();
+        let layout = MemoryLayout::new(
+            boot.objects()
+                .map(|(id, object)| (id, *object))
+                .chain([(ObjectId(1), Object { capacity: 6 * page })]),
+            boot.windows()
+                .map(|(id, window)| (id, *window))
+                .chain([(EXTRA, hot)]),
+        )
+        .unwrap();
+        let (vm, slots) = KvmVm::new(context, store(context, layout, kind)).unwrap();
+        (vm, slots, page)
+    }
+
+    #[test]
+    fn slice_bind_uses_object_offsets_and_preserves_failed_permits_on_kvm() {
+        let Some(context) = kvm() else { return };
+        for kind in KINDS {
+            let (vm, mut slots, page) = hot_vm(&context, kind);
+            let mut permit = slots.allocate(1).unwrap().pop().unwrap();
+            let slot = permit.slot();
+            let invalid = [
+                Range::new(ObjectOffset(2 * page), 0).unwrap(),
+                Range::new(ObjectOffset(2 * page + 1), page).unwrap(),
+                Range::new(ObjectOffset(2 * page), page + 1).unwrap(),
+                Range::new(ObjectOffset(page), page).unwrap(),
+                Range::new(ObjectOffset(5 * page), 2 * page).unwrap(),
+            ];
+            for (index, slice) in invalid.into_iter().enumerate() {
+                let (returned, error) = permit.bind_slice(EXTRA, slice).unwrap_err();
+                assert_eq!(returned.slot(), slot);
+                assert!(Arc::ptr_eq(&returned.vm, &vm));
+                match (index, error) {
+                    (0, BindError::Slice(SliceError::Empty(EXTRA))) => {}
+                    (1 | 2, BindError::Slice(SliceError::HostUnaligned { .. })) => {}
+                    (3 | 4, BindError::Slice(SliceError::OutsideWindow { .. })) => {}
+                    (_, error) => panic!("unexpected validation failure: {error}"),
+                }
+                permit = returned;
+            }
+            let slice = Range::new(ObjectOffset(3 * page), page).unwrap();
+            let (returned, error) = vm.bind_slice(permit, WindowId(99), slice).unwrap_err();
+            assert!(matches!(error, BindError::UnknownWindow(WindowId(99))));
+            permit = returned;
+            let (other, other_slots, _) = hot_vm(&context, kind);
+            let (returned, error) = other.bind_slice(permit, EXTRA, invalid[0]).unwrap_err();
+            assert!(matches!(error, BindError::ForeignPermit));
+            assert_eq!(returned.slot(), slot);
+            assert!(Arc::ptr_eq(&returned.vm, &vm));
+            let expected_mapping = Arc::clone(vm.memory().mapping(EXTRA).unwrap());
+            let checked = vm
+                .memory()
+                .checked_slice(EXTRA, slice, vm.host_page)
+                .unwrap();
+            assert_eq!(
+                checked.address,
+                expected_mapping.as_ptr().wrapping_add(page as usize)
+            );
+            assert_eq!(
+                checked.placement,
+                Range::new(Gpa((1 << 32) + page), page).unwrap()
+            );
+            let binding = returned.bind_slice(EXTRA, slice).unwrap();
+            assert_eq!(binding.slot(), slot);
+            assert_eq!(binding.slice(), slice);
+            assert_eq!(binding.placement(), checked.placement);
+            assert!(Arc::ptr_eq(&binding.mapping, &expected_mapping));
+            let (permit, mapping) = binding.unbind().unwrap();
+            assert_eq!(permit.slot(), slot);
+            assert!(Arc::ptr_eq(&mapping, &expected_mapping));
+            let whole = permit.bind(EXTRA).unwrap();
+            assert_eq!(
+                whole.slice(),
+                vm.memory().layout().window(EXTRA).unwrap().slice()
+            );
+            assert_eq!(
+                whole.placement(),
+                vm.memory().layout().window(EXTRA).unwrap().placement()
+            );
+            whole.unbind().unwrap();
+            drop((slots, other_slots, other));
+            assert!(vm.into_memory().is_ok());
+        }
+    }
+
+    #[test]
+    fn disjoint_chunks_of_one_window_reuse_their_permits_on_kvm() {
+        let Some(context) = kvm() else { return };
+        for kind in KINDS {
+            let (vm, mut slots, page) = hot_vm(&context, kind);
+            let mut permits = slots.allocate(2).unwrap();
+            let first = Range::new(ObjectOffset(2 * page), 2 * page).unwrap();
+            let second = Range::new(ObjectOffset(4 * page), 2 * page).unwrap();
+            let mut left = permits.pop().unwrap().bind_slice(EXTRA, first).unwrap();
+            let right = vm
+                .bind_slice(permits.pop().unwrap(), EXTRA, second)
+                .unwrap();
+            assert_eq!(left.window(), right.window());
+            assert!(!left.placement().overlaps(right.placement()));
+            assert!(Arc::ptr_eq(&left.mapping, &right.mapping));
+            assert_eq!(left.mapping.len(), 4 * page);
+            let slot = left.slot();
+            left.permit.as_mut().unwrap().slot = MemSlot(u32::MAX);
+            let (mut left, error) = left.unbind().unwrap_err();
+            assert_eq!(error.source.errno(), libc::EINVAL);
+            assert_eq!(left.slice(), first);
+            assert_eq!(
+                left.placement(),
+                Range::new(Gpa(1 << 32), 2 * page).unwrap()
+            );
+            assert!(Arc::ptr_eq(&left.mapping, &right.mapping));
+            left.permit.as_mut().unwrap().slot = slot;
+            let (permit, mapping) = left.unbind().unwrap();
+            let rebound = permit.bind_slice(EXTRA, first).unwrap();
+            assert_eq!(rebound.slot(), slot);
+            assert!(Arc::ptr_eq(&mapping, &rebound.mapping));
+            rebound.unbind().unwrap();
+            right.unbind().unwrap();
+            drop((mapping, slots));
+            assert!(vm.into_memory().is_ok());
         }
     }
 

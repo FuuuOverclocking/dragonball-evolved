@@ -16,7 +16,7 @@ use crate::devices::runtime::{
 };
 use crate::devices::virtio::block::{BlockError, BlockHandle, BlockQuiesced, BlockResources};
 use crate::devices::virtio::mmio::{
-    DeviceDesc, MmioTransport, MmioTransportSnapshot, NOTIFY_OFFSET, RestoreError,
+    DeviceDesc, MmioTransport, MmioTransportSnapshot, NOTIFY_OFFSET, RestoreError, TransportError,
 };
 use crate::devices::virtio::{Activation, ActivationError, IrqTrigger, session_channel};
 use crate::memory::store::MemoryView;
@@ -61,6 +61,12 @@ pub enum AttachBlockError {
         id: String,
         #[source]
         source: io::Error,
+    },
+    /// construct the transport for disk {id}
+    Transport {
+        id: String,
+        #[source]
+        source: TransportError,
     },
     /// restore the transport for disk {id}
     Restore {
@@ -138,6 +144,7 @@ impl PreparedBlock {
             queue_notifier,
             interrupt,
             desc,
+            config,
         } = handle;
         let notifier = queue_notifier
             .try_clone()
@@ -147,11 +154,16 @@ impl PreparedBlock {
             })?;
         let mmio = MmioTransport::new(
             desc,
+            config,
             Arc::clone(memory),
             activator,
             Arc::clone(&interrupt),
             vec![notifier],
-        );
+        )
+        .map_err(|source| AttachBlockError::Transport {
+            id: id.into(),
+            source,
+        })?;
         Ok(Self {
             resources,
             queue_notifier,
@@ -176,6 +188,7 @@ impl PreparedBlock {
             queue_notifier,
             interrupt,
             desc,
+            config,
         } = handle;
         let queue = snapshot
             .queue
@@ -195,6 +208,7 @@ impl PreparedBlock {
         let restore_transport = |session| {
             MmioTransport::restore(
                 desc,
+                config,
                 Arc::clone(memory),
                 activator.clone(),
                 Arc::clone(&interrupt),
@@ -558,12 +572,13 @@ mod tests {
         let plan = plan(disk.path());
         let memory = memory();
         let saved = snapshot(&plan, &memory);
-        for field in 0..4 {
+        for field in 0..5 {
             let mut bad = saved.clone();
             match field {
                 0 => bad.transport.desc.device_type = 1,
                 1 => bad.transport.desc.features ^= 1 << 5,
-                2 => bad.transport.desc.queue_max[0] = 128,
+                2 => bad.transport.desc.required_features = 0,
+                3 => bad.transport.desc.queue_max[0] = 128,
                 _ => bad.transport.desc.config = 2u64.to_le_bytes().to_vec(),
             }
             assert!(matches!(
@@ -684,7 +699,7 @@ mod tests {
             pending_read(&memory);
             let mut saved = snapshot(&plan, &memory);
             saved.transport.regs.status = status;
-            saved.interrupt_status = 3;
+            saved.transport.interrupt_status = 3;
             let mut before = vec![0; 0x10000];
             memory.read_slice(&mut before, GuestAddress(0)).unwrap();
             let prepared = PreparedBlock::restore(ID, &plan, &memory, saved.clone()).unwrap();
@@ -716,7 +731,7 @@ mod tests {
             block.transport.write(0x70, &0u32.to_le_bytes());
             let reset = block.capture(&quiesce(&block).await).unwrap();
             assert_eq!(reset.transport.regs.status, 0);
-            assert_eq!(reset.interrupt_status, 0);
+            assert_eq!(reset.transport.interrupt_status, 0);
             assert_eq!(reset.queue, None);
             memory.read_slice(&mut after, GuestAddress(0)).unwrap();
             assert_eq!(after, before);

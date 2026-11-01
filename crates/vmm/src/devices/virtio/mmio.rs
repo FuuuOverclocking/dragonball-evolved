@@ -6,6 +6,7 @@ use logger::warn;
 use virtio_queue::{Queue, QueueT};
 use vmm_sys_util::eventfd::EventFd;
 
+use super::config::{ConfigError, ConfigReader, ConfigSnapshot};
 use super::interrupt::InterruptStatusError;
 use super::{
     Activation, ActivationError, Activator, InterruptKind, IrqTrigger, ResetError, SessionControl,
@@ -29,8 +30,16 @@ const RESET_WAIT: Duration = Duration::from_secs(5);
 pub struct DeviceDesc {
     pub device_type: u32,
     pub features: u64,
+    pub required_features: u64,
     pub queue_max: Vec<u16>,
     pub config: Vec<u8>,
+}
+
+impl DeviceDesc {
+    fn accepts_features(&self, driver_features: u64) -> bool {
+        driver_features & !self.features == 0
+            && driver_features & self.required_features == self.required_features
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +116,7 @@ pub struct MmioRegs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmioTransportSnapshot {
     pub desc: DeviceDesc,
+    pub config: ConfigSnapshot,
     pub regs: MmioRegs,
     pub interrupt_status: u32,
 }
@@ -115,6 +125,8 @@ pub struct MmioTransportSnapshot {
 pub enum RestoreError {
     /// saved virtio device descriptor does not match the current device
     Descriptor,
+    /// restore virtio device configuration
+    Config(#[from] ConfigError),
     /// saved virtio queue count does not match the device
     QueueCount,
     /// queue notifier count does not match the device
@@ -148,10 +160,7 @@ impl MmioTransportSnapshot {
         {
             return Err(RestoreError::Status(status));
         }
-        if status & FEATURES_OK != 0
-            && (self.regs.driver_features & !(desc.features | VERSION_1) != 0
-                || self.regs.driver_features & VERSION_1 == 0)
-        {
+        if status & FEATURES_OK != 0 && !desc.accepts_features(self.regs.driver_features) {
             return Err(RestoreError::Features);
         }
         for (index, (queue, &max)) in self.regs.queues.iter().zip(&desc.queue_max).enumerate() {
@@ -190,9 +199,7 @@ pub fn read(regs: &MmioRegs, desc: &DeviceDesc, irq_status: u32, offset: u64) ->
         0x00 => 0x7472_6976,
         0x04 => 2,
         0x08 => desc.device_type,
-        0x10 if regs.features_sel < 2 => {
-            ((desc.features | VERSION_1) >> (regs.features_sel * 32)) as u32
-        }
+        0x10 if regs.features_sel < 2 => (desc.features >> (regs.features_sel * 32)) as u32,
         0x34 => desc
             .queue_max
             .get(regs.queue_sel as usize)
@@ -229,9 +236,7 @@ pub fn write(
         0x70 if value & FAILED != 0 => regs.status |= FAILED,
         0x70 => {
             let valid = matches!((regs.status, value), (0, 1) | (1, 3) | (3, 11) | (11, 15));
-            let features_valid = regs.driver_features & !(desc.features | VERSION_1) == 0
-                && regs.driver_features & VERSION_1 != 0;
-            if valid && (value != 11 || features_valid) {
+            if valid && (value & FEATURES_OK == 0 || desc.accepts_features(regs.driver_features)) {
                 regs.status = value;
                 if value == 15 {
                     transition = Some(Transition::Activate);
@@ -289,6 +294,10 @@ fn high(address: Gpa, value: u32) -> Gpa {
 pub enum TransportError {
     /// an old virtio session still owns the queues
     Active,
+    /// configure virtio device configuration
+    Config(#[from] ConfigError),
+    /// virtio driver features were not validly negotiated
+    Features,
     /// configure the virtio queues
     Queue(#[from] QueueError),
     /// send the virtio activation
@@ -309,6 +318,7 @@ struct TransportState {
 pub struct MmioTransport {
     state: Mutex<TransportState>,
     desc: DeviceDesc,
+    config: ConfigReader,
     memory: MemoryView,
     activator: Activator,
     interrupt: Arc<IrqTrigger>,
@@ -318,23 +328,26 @@ pub struct MmioTransport {
 impl MmioTransport {
     pub fn new(
         desc: DeviceDesc,
+        config: ConfigReader,
         memory: MemoryView,
         activator: Activator,
         interrupt: Arc<IrqTrigger>,
         queue_notifiers: Vec<EventFd>,
-    ) -> Self {
+    ) -> Result<Self, TransportError> {
+        config.validate(&desc.config)?;
         let regs = MmioRegs::new(&desc);
-        Self {
+        Ok(Self {
             state: Mutex::new(TransportState {
                 regs,
                 session: None,
             }),
             desc,
+            config,
             memory,
             activator,
             interrupt,
             queue_notifiers,
-        }
+        })
     }
 
     /// Capture pure transport state. The caller proves the machine is paused and quiesced.
@@ -342,6 +355,7 @@ impl MmioTransport {
         let state = self.state.lock().unwrap();
         MmioTransportSnapshot {
             desc: self.desc.clone(),
+            config: self.config.snapshot(),
             regs: state.regs.clone(),
             interrupt_status: self.interrupt.status(),
         }
@@ -350,6 +364,7 @@ impl MmioTransport {
     /// Pair reset routing with the backend's restored session, without activation or IRQ injection.
     pub fn restore(
         desc: DeviceDesc,
+        config: ConfigReader,
         memory: MemoryView,
         activator: Activator,
         interrupt: Arc<IrqTrigger>,
@@ -358,6 +373,7 @@ impl MmioTransport {
         session: Option<SessionControl>,
     ) -> Result<Self, RestoreError> {
         snapshot.validate(&desc, &memory)?;
+        config.validate_restore(&desc.config, &snapshot.config)?;
         if queue_notifiers.len() != desc.queue_max.len() {
             return Err(RestoreError::Notifiers);
         }
@@ -370,6 +386,7 @@ impl MmioTransport {
                 session,
             }),
             desc,
+            config,
             memory,
             activator,
             interrupt,
@@ -378,6 +395,9 @@ impl MmioTransport {
     }
 
     fn activate(&self, state: &mut TransportState) -> Result<(), TransportError> {
+        if !self.desc.accepts_features(state.regs.driver_features) {
+            return Err(TransportError::Features);
+        }
         if state.session.is_some() {
             return Err(TransportError::Active);
         }
@@ -426,17 +446,17 @@ impl BusDevice<Gpa> for MmioTransport {
     fn read(&self, offset: u64, data: &mut [u8]) {
         data.fill(0);
         if offset >= 0x100 {
-            if let Ok(start) = usize::try_from(offset - 0x100)
-                && let Some(end) = start.checked_add(data.len())
-                && let Some(config) = self.desc.config.get(start..end)
-            {
-                data.copy_from_slice(config);
+            if let Ok(start) = usize::try_from(offset - 0x100) {
+                self.config.read(start, data);
             }
         } else if data.len() == 4 && offset.is_multiple_of(4) {
-            let state = self.state.lock().unwrap();
-            data.copy_from_slice(
-                &read(&state.regs, &self.desc, self.interrupt.status(), offset).to_le_bytes(),
-            );
+            let value = if offset == 0xfc {
+                self.config.generation()
+            } else {
+                let state = self.state.lock().unwrap();
+                read(&state.regs, &self.desc, self.interrupt.status(), offset)
+            };
+            data.copy_from_slice(&value.to_le_bytes());
         }
     }
 
@@ -473,7 +493,12 @@ impl BusDevice<Gpa> for MmioTransport {
 mod tests {
     use std::error::Error as _;
 
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK};
+
     use super::*;
+    use crate::devices::virtio::config::ConfigPublisher;
+    use crate::devices::virtio::{ActivationRx, activation_channel};
     use crate::error::render_chain;
 
     #[test]
@@ -564,10 +589,255 @@ mod tests {
     fn desc() -> DeviceDesc {
         DeviceDesc {
             device_type: 2,
-            features: 1 << 9,
+            features: VERSION_1 | (1 << 9),
+            required_features: VERSION_1,
             queue_max: vec![256],
             config: vec![0; 8],
         }
+    }
+
+    fn memory() -> MemoryView {
+        Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap())
+    }
+
+    fn transport(desc: DeviceDesc, config: ConfigReader) -> (MmioTransport, ActivationRx) {
+        let (activator, receiver) = activation_channel();
+        let transport = MmioTransport::new(
+            desc,
+            config,
+            memory(),
+            activator,
+            Arc::new(IrqTrigger::new().unwrap()),
+            vec![EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC).unwrap()],
+        )
+        .unwrap();
+        (transport, receiver)
+    }
+
+    fn restore(
+        desc: DeviceDesc,
+        config: ConfigReader,
+        snapshot: MmioTransportSnapshot,
+    ) -> Result<MmioTransport, RestoreError> {
+        let (activator, _receiver) = activation_channel();
+        MmioTransport::restore(
+            desc,
+            config,
+            memory(),
+            activator,
+            Arc::new(IrqTrigger::new().unwrap()),
+            vec![EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC).unwrap()],
+            snapshot,
+            None,
+        )
+    }
+
+    fn reg(transport: &MmioTransport, offset: u64) -> u32 {
+        let mut bytes = [0; 4];
+        transport.read(offset, &mut bytes);
+        u32::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn required_feature_mask_is_enforced_at_negotiation_activation_and_restore() {
+        const EXTRA: u64 = 1 << 33;
+        let mut desc = desc();
+        desc.features |= EXTRA;
+        desc.required_features |= EXTRA;
+        let (transport, mut receiver) =
+            transport(desc.clone(), ConfigReader::fixed(desc.config.clone()));
+        let regs = MmioRegs {
+            features_sel: 1,
+            ..MmioRegs::new(&desc)
+        };
+        assert_eq!(read(&regs, &desc, 0, 0x10), (desc.features >> 32) as u32);
+        for driver_features in [0, VERSION_1, EXTRA, VERSION_1 | EXTRA | (1 << 63)] {
+            for (status, value) in [(3, 11), (11, 15)] {
+                let regs = MmioRegs {
+                    status,
+                    driver_features,
+                    ..MmioRegs::new(&desc)
+                };
+                let (regs, transition) = write(regs, &desc, 0x70, value);
+                assert_eq!(regs.status, status);
+                assert_eq!(transition, None);
+            }
+            for status in [11, 15, 11 | FAILED, 15 | NEEDS_RESET] {
+                let mut snapshot = transport.snapshot();
+                snapshot.regs.status = status;
+                snapshot.regs.driver_features = driver_features;
+                assert!(matches!(
+                    restore(
+                        desc.clone(),
+                        ConfigReader::fixed(desc.config.clone()),
+                        snapshot,
+                    ),
+                    Err(RestoreError::Features)
+                ));
+            }
+            let mut state = transport.state.lock().unwrap();
+            state.regs.driver_features = driver_features;
+            assert!(matches!(
+                transport.activate(&mut state),
+                Err(TransportError::Features)
+            ));
+            assert!(state.session.is_none());
+            assert!(receiver.try_recv().is_none());
+        }
+        for driver_features in [VERSION_1 | EXTRA, desc.features] {
+            let regs = MmioRegs {
+                status: 3,
+                driver_features,
+                ..MmioRegs::new(&desc)
+            };
+            let (regs, _) = write(regs, &desc, 0x70, 11);
+            let (regs, transition) = write(regs, &desc, 0x70, 15);
+            assert_eq!((regs.status, transition), (15, Some(Transition::Activate)));
+        }
+    }
+
+    #[test]
+    fn fixed_configuration_restore_rejects_image_generation_and_length_changes() {
+        let desc = desc();
+        let reader = ConfigReader::fixed(desc.config.clone());
+        let (transport, _receiver) = transport(desc.clone(), reader.clone());
+        let saved = transport.snapshot();
+        assert_eq!(saved.config.bytes, desc.config);
+        assert_eq!(reg(&transport, 0xfc), 0);
+        for mutation in 0..3 {
+            let mut bad = saved.clone();
+            match mutation {
+                0 => bad.config.bytes[0] = 1,
+                1 => bad.config.generation = 1,
+                _ => bad.config.bytes.push(0),
+            }
+            assert!(matches!(
+                restore(desc.clone(), reader.clone(), bad),
+                Err(RestoreError::Config(_))
+            ));
+        }
+        assert!(matches!(
+            restore(desc, ConfigReader::fixed(vec![1; 8]), saved),
+            Err(RestoreError::Config(ConfigError::Image))
+        ));
+    }
+
+    #[test]
+    fn dynamic_configuration_restores_generation_without_activation_or_irq() {
+        let desc = desc();
+        let (mut publisher, reader) = ConfigPublisher::new(desc.config.clone());
+        let (transport, mut receiver) = transport(desc.clone(), reader.clone());
+        let image = [7; 8];
+        assert_eq!(publisher.publish(&image), Ok(true));
+        assert_eq!(reg(&transport, 0xfc), 1);
+        let mut bytes = [0; 8];
+        transport.read(0x100, &mut bytes);
+        assert_eq!(bytes, image);
+        assert_eq!(publisher.publish(&image), Ok(false));
+        assert_eq!(reg(&transport, 0xfc), 1);
+        assert!(receiver.try_recv().is_none());
+        assert_eq!(transport.interrupt.status(), 0);
+        assert_eq!(
+            transport.interrupt.irq_fd().read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let mut saved = transport.snapshot();
+        assert_eq!(saved.desc.config, vec![0; 8]);
+        assert_eq!(saved.config.bytes, image);
+        saved.interrupt_status = 2;
+        let (mut restored_publisher, restored_reader) =
+            ConfigPublisher::restore(saved.config.clone(), &image).unwrap();
+        let (activator, mut restored_receiver) = activation_channel();
+        let interrupt = Arc::new(IrqTrigger::new().unwrap());
+        let restored = MmioTransport::restore(
+            desc,
+            restored_reader,
+            memory(),
+            activator,
+            Arc::clone(&interrupt),
+            vec![EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC).unwrap()],
+            saved.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot(), saved);
+        assert_eq!(reg(&restored, 0xfc), 1);
+        restored.read(0x100, &mut bytes);
+        assert_eq!(bytes, image);
+        assert!(restored_receiver.try_recv().is_none());
+        assert_eq!(interrupt.status(), 2);
+        assert_eq!(
+            interrupt.irq_fd().read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(restored_publisher.publish(&image), Ok(false));
+        assert_eq!(restored_publisher.publish(&[9; 8]), Ok(true));
+        assert_eq!(reg(&restored, 0xfc), 2);
+        restored.read(0x100, &mut bytes);
+        assert_eq!(bytes, [9; 8]);
+        assert_eq!(interrupt.status(), 2);
+        assert_eq!(
+            interrupt.irq_fd().read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn dynamic_restore_requires_an_already_matching_reader_and_baseline_length() {
+        let desc = desc();
+        let (mut publisher, reader) = ConfigPublisher::new(desc.config.clone());
+        let (transport, _receiver) = transport(desc.clone(), reader.clone());
+        publisher.publish(&[1; 8]).unwrap();
+        let saved = transport.snapshot();
+        let (_publisher, initial_reader) = ConfigPublisher::new(desc.config.clone());
+        assert!(matches!(
+            restore(desc.clone(), initial_reader, saved.clone()),
+            Err(RestoreError::Config(ConfigError::Snapshot))
+        ));
+        let (_publisher, reset_generation_reader) =
+            ConfigPublisher::new(saved.config.bytes.clone());
+        assert!(matches!(
+            restore(desc.clone(), reset_generation_reader, saved.clone()),
+            Err(RestoreError::Config(ConfigError::Snapshot))
+        ));
+        publisher.publish(&[2; 8]).unwrap();
+        assert!(matches!(
+            restore(desc.clone(), reader, saved.clone()),
+            Err(RestoreError::Config(ConfigError::Snapshot))
+        ));
+        let mut short = saved;
+        short.config.bytes.pop();
+        let (_publisher, short_reader) =
+            ConfigPublisher::restore(short.config.clone(), &short.config.bytes).unwrap();
+        assert!(matches!(
+            restore(desc, short_reader, short),
+            Err(RestoreError::Config(ConfigError::Length {
+                expected: 8,
+                actual: 7,
+            }))
+        ));
+    }
+
+    #[test]
+    fn configuration_errors_preserve_typed_transport_sources() {
+        let error = TransportError::from(ConfigError::Image);
+        assert_eq!(
+            error.source().unwrap().downcast_ref::<ConfigError>(),
+            Some(&ConfigError::Image)
+        );
+        assert_eq!(
+            render_chain(&error),
+            "configure virtio device configuration: virtio configuration image does not match the expected bytes"
+        );
+        let error = RestoreError::from(ConfigError::Snapshot);
+        assert_eq!(
+            error.source().unwrap().downcast_ref::<ConfigError>(),
+            Some(&ConfigError::Snapshot)
+        );
+        assert_eq!(
+            render_chain(&error),
+            "restore virtio device configuration: virtio configuration reader does not match the saved state"
+        );
     }
 
     #[test]

@@ -436,7 +436,8 @@ mod tests {
 
     use super::*;
     use crate::align::BackingPageSize;
-    use crate::devices::virtio::mmio::{DeviceDesc, MmioRegs, MmioTransportSnapshot};
+    use crate::devices::virtio::config::ConfigSnapshot;
+    use crate::devices::virtio::mmio::{DeviceDesc, MmioRegs, MmioTransportSnapshot, VERSION_1};
     use crate::memory::layout::MemoryLayout;
     use crate::memory::policy::{BackingKind, HostPolicy};
     use crate::spec::MachineSpec;
@@ -528,13 +529,18 @@ mod tests {
         };
         let desc = DeviceDesc {
             device_type: 2,
-            features: 0,
+            features: VERSION_1,
+            required_features: VERSION_1,
             queue_max: vec![16],
             config: vec![],
         };
         let block = DeviceSnapshot::Block(BlockSnapshot {
             transport: MmioTransportSnapshot {
                 regs: MmioRegs::new(&desc),
+                config: ConfigSnapshot {
+                    bytes: desc.config.clone(),
+                    generation: 0,
+                },
                 desc,
                 interrupt_status: 0,
             },

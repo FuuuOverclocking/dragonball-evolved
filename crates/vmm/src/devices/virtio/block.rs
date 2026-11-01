@@ -12,6 +12,7 @@ use virtio_queue::{DescriptorChain, Queue, QueueOwnedT, QueueState, QueueT};
 use vm_memory::{Address, ByteValued, Bytes, GuestMemoryBackend, GuestMemoryMmap};
 use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 
+use super::config::ConfigReader;
 use super::mmio::{DeviceDesc, VERSION_1};
 use super::{
     Activation, ActivationRx, Activator, InterruptKind, IrqTrigger, Session, activation_channel,
@@ -99,6 +100,7 @@ pub struct BlockHandle {
     pub queue_notifier: EventFd,
     pub interrupt: Arc<IrqTrigger>,
     pub desc: DeviceDesc,
+    pub config: ConfigReader,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,9 +138,11 @@ impl BlockResources {
         let desc = DeviceDesc {
             device_type: 2,
             features: VERSION_1 | (1 << 9) | if read_only { 1 << 5 } else { 0 },
+            required_features: VERSION_1,
             queue_max: vec![QUEUE_MAX],
             config: disk.sectors.to_le_bytes().to_vec(),
         };
+        let config = ConfigReader::fixed(desc.config.clone());
         let mut disk_id = [0; ID_LEN];
         let copied = id.len().min(ID_LEN);
         disk_id[..copied].copy_from_slice(&id.as_bytes()[..copied]);
@@ -155,6 +159,7 @@ impl BlockResources {
                 queue_notifier,
                 interrupt,
                 desc,
+                config,
             },
         ))
     }

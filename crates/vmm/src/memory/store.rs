@@ -13,9 +13,11 @@ use vm_memory::{
     GuestRegionMmap,
 };
 
+use crate::align::HostPageSize;
 use crate::kvm_context::HostCapabilities;
-use crate::memory::layout::{MemoryLayout, ObjectId, Window, WindowId};
-use crate::memory::policy::{BackingKind, HostPolicy, HostPolicyError};
+use crate::memory::layout::{MemoryLayout, ObjectId, Window, WindowId, WindowKind, WindowOwner};
+use crate::memory::policy::{BackingKind, HostPolicy, HostPolicyError, SliceError};
+use crate::space::{Gpa, ObjectOffset, Range};
 
 /// A view of the bytes of guest memory. Cloning it is cheap, and it keeps the
 /// bytes mapped, but it cannot bind them to a VM.
@@ -62,6 +64,28 @@ pub enum MaterializeError {
     View(#[source] GuestRegionCollectionError),
 }
 
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
+pub(crate) enum DiscardError {
+    /// window {0} is not virtio-mem RAM
+    NotVirtioMem(WindowId),
+    /// validate the discarded object slice
+    Slice(#[from] SliceError),
+    /// discard object slice {slice} of window {window}
+    Advise {
+        window: WindowId,
+        slice: Range<ObjectOffset>,
+        #[source]
+        source: io::Error,
+    },
+}
+
+pub(crate) struct CheckedSlice<'a> {
+    pub mapping: &'a WindowMapping,
+    pub placement: Range<Gpa>,
+    pub address: *mut u8,
+    pub len: usize,
+}
+
 /// Guest memory as the host holds it: a layout, materialized under a host
 /// policy with one mapping per window.
 ///
@@ -77,6 +101,7 @@ pub enum MaterializeError {
 pub struct MemoryStore {
     layout: MemoryLayout,
     policy: HostPolicy,
+    host_page: HostPageSize,
     view: MemoryView,
     mappings: BTreeMap<WindowId, WindowMapping>,
 }
@@ -108,6 +133,7 @@ impl MemoryStore {
         Ok(Self {
             layout,
             policy,
+            host_page: host.page_size,
             view: Arc::new(view),
             mappings,
         })
@@ -130,6 +156,79 @@ impl MemoryStore {
     /// The host mapping of `window`, which a KVM binding keeps alive.
     pub fn mapping(&self, window: WindowId) -> Option<&WindowMapping> {
         self.mappings.get(&window)
+    }
+
+    pub(crate) fn checked_slice(
+        &self,
+        id: WindowId,
+        slice: Range<ObjectOffset>,
+        host_page: HostPageSize,
+    ) -> Result<CheckedSlice<'_>, SliceError> {
+        let window = self
+            .layout
+            .window(id)
+            .ok_or(SliceError::UnknownWindow(id))?;
+        let placement = self.policy.check_slice(id, window, slice, host_page)?;
+        let mapping = self
+            .mappings
+            .get(&id)
+            .ok_or(SliceError::UnknownWindow(id))?;
+        let overflow = SliceError::AddressOverflow(id);
+        let offset = slice
+            .start()
+            .0
+            .checked_sub(window.slice().start().0)
+            .ok_or(overflow)?;
+        let len = usize::try_from(slice.len()).map_err(|_| overflow)?;
+        let offset = usize::try_from(offset).map_err(|_| overflow)?;
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end as u64 > mapping.len())
+        {
+            return Err(overflow);
+        }
+        let address = (mapping.as_ptr() as usize)
+            .checked_add(offset)
+            .ok_or(overflow)?;
+        address.checked_add(len).ok_or(overflow)?;
+        let page = host_page.alignment().get();
+        if address as u64 % page != 0 {
+            return Err(SliceError::HostAddressUnaligned { window: id, page });
+        }
+        Ok(CheckedSlice {
+            mapping,
+            placement,
+            address: mapping.as_ptr().wrapping_add(offset),
+            len,
+        })
+    }
+
+    pub(crate) fn discard(
+        &self,
+        id: WindowId,
+        slice: Range<ObjectOffset>,
+    ) -> Result<(), DiscardError> {
+        let window = self
+            .layout
+            .window(id)
+            .ok_or(SliceError::UnknownWindow(id))?;
+        if window.owner() != WindowOwner::VirtioMem || window.kind() != WindowKind::VirtioMemRam {
+            return Err(DiscardError::NotVirtioMem(id));
+        }
+        let checked = self.checked_slice(id, slice, self.host_page)?;
+        let advice = match self.policy.kind {
+            BackingKind::AnonymousPrivate => libc::MADV_DONTNEED,
+            BackingKind::SharedMemfd => libc::MADV_REMOVE,
+        };
+        // SAFETY: checked bounds lie in a live, page-aligned mapping; caller owns accepted unplug with newly empty chunks unbound.
+        if unsafe { libc::madvise(checked.address.cast(), checked.len, advice) } != 0 {
+            return Err(DiscardError::Advise {
+                window: id,
+                slice,
+                source: io::Error::last_os_error(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -204,6 +303,7 @@ mod tests {
 
     use super::*;
     use crate::align::BackingPageSize;
+    use crate::memory::hotplug::{MemGeometry, MemoryEffect, Population};
     use crate::memory::layout::{Object, WindowKind, WindowOwner};
     use crate::space::{Gpa, ObjectOffset, Range};
 
@@ -383,6 +483,198 @@ mod tests {
             "memory layout does not fit the host: 2 boot windows need more than the 1 \
              memslots KVM provides"
         );
+    }
+
+    fn hot_store(kind: BackingKind) -> (MemoryStore, u64) {
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let host = HostCapabilities::fake(46, 32, page);
+        let boot = MemoryLayout::boot(page).unwrap();
+        let hot = Window::new(
+            ObjectId(1),
+            Range::new(ObjectOffset(2 * page), 4 * page).unwrap(),
+            Gpa(1 << 40),
+            WindowOwner::VirtioMem,
+            WindowKind::VirtioMemRam,
+        )
+        .unwrap();
+        let layout = MemoryLayout::new(
+            boot.objects()
+                .map(|(id, object)| (id, *object))
+                .chain([(ObjectId(1), Object { capacity: 6 * page })]),
+            boot.windows()
+                .map(|(id, window)| (id, *window))
+                .chain([(WindowId(1), hot)]),
+        )
+        .unwrap();
+        let policy = HostPolicy {
+            kind,
+            page_size: BackingPageSize::base(host.page_size),
+        };
+        (
+            MemoryStore::materialize(layout, policy, &host).unwrap(),
+            page,
+        )
+    }
+
+    #[test]
+    fn slice_addresses_are_derived_from_nonzero_object_coordinates() {
+        for kind in KINDS {
+            let (store, page) = hot_store(kind);
+            let slice = Range::new(ObjectOffset(3 * page), page).unwrap();
+            let checked = store
+                .checked_slice(WindowId(1), slice, store.host_page)
+                .unwrap();
+            let mapping = store.mapping(WindowId(1)).unwrap();
+            assert!(Arc::ptr_eq(checked.mapping, mapping));
+            assert_eq!(
+                checked.address,
+                mapping.as_ptr().wrapping_add(page as usize)
+            );
+            assert_eq!(
+                checked.placement,
+                Range::new(Gpa((1 << 40) + page), page).unwrap()
+            );
+            assert_eq!(checked.len, page as usize);
+            assert!(matches!(
+                store.checked_slice(
+                    WindowId(1),
+                    Range::new(ObjectOffset(0), page).unwrap(),
+                    store.host_page
+                ),
+                Err(SliceError::OutsideWindow { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn both_backings_discard_only_removed_blocks_without_changing_the_fixed_view() {
+        for kind in KINDS {
+            let (store, page) = hot_store(kind);
+            let geometry = MemGeometry::new(
+                store.layout(),
+                WindowId(1),
+                page,
+                2 * page,
+                store.policy().page_size,
+            )
+            .unwrap();
+            let empty = Population::new(geometry);
+            assert_eq!(empty.plugged_size(), 0);
+            assert_eq!(store.view().num_regions(), 2);
+            assert_eq!(store.mapping(WindowId(1)).unwrap().len(), 4 * page);
+            let view = Arc::clone(store.view());
+            let mapping = Arc::clone(store.mapping(WindowId(1)).unwrap());
+            let mut bytes = Vec::new();
+            for byte in [0x11, 0x22, 0x33, 0x44] {
+                bytes.extend(std::iter::repeat_n(byte, page as usize));
+            }
+            view.write_slice(&bytes, GuestAddress(geometry.region().start().0))
+                .unwrap();
+            if kind == BackingKind::SharedMemfd {
+                file(&store, 1)
+                    .write_all_at(&vec![0x55; (2 * page) as usize], 0)
+                    .unwrap();
+            }
+            let populated = Population::restore(geometry, [geometry.region()]).unwrap();
+            let removed = Range::new(Gpa(geometry.region().start().0 + page), page).unwrap();
+            let proposal = populated.unplug(removed).unwrap();
+            assert_eq!(proposal.effects().len(), 2);
+            for effect in proposal.effects() {
+                match *effect {
+                    MemoryEffect::Discard(slice) => {
+                        store.discard(slice.window(), slice.slice()).unwrap()
+                    }
+                    MemoryEffect::CommitPopulation => {}
+                    _ => panic!("a partially populated chunk must remain bound"),
+                }
+            }
+            let mut resident = [0_u8; 4];
+            assert_eq!(
+                unsafe {
+                    libc::mincore(
+                        mapping.as_ptr().cast(),
+                        (4 * page) as usize,
+                        resident.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            assert_eq!(resident.map(|byte| byte & 1), [1, 0, 1, 1]);
+            bytes[page as usize..(2 * page) as usize].fill(0);
+            let mut observed = vec![0; bytes.len()];
+            view.read_slice(&mut observed, GuestAddress(geometry.region().start().0))
+                .unwrap();
+            assert_eq!(observed, bytes);
+            assert!(Arc::ptr_eq(store.view(), &view));
+            assert!(Arc::ptr_eq(store.mapping(WindowId(1)).unwrap(), &mapping));
+            assert_eq!(proposal.population().plugged_size(), 3 * page);
+            if kind == BackingKind::SharedMemfd {
+                let mut prefix = vec![0; (2 * page) as usize];
+                file(&store, 1).read_exact_at(&mut prefix, 0).unwrap();
+                assert_eq!(prefix, vec![0x55; (2 * page) as usize]);
+                let mut removed = vec![0xff; page as usize];
+                file(&store, 1)
+                    .read_exact_at(&mut removed, 3 * page)
+                    .unwrap();
+                assert_eq!(removed, vec![0; page as usize]);
+                assert_eq!(file(&store, 1).metadata().unwrap().len(), 6 * page);
+            }
+        }
+    }
+
+    #[test]
+    fn discard_rejects_invalid_boundaries_before_touching_bytes() {
+        for kind in KINDS {
+            let (store, page) = hot_store(kind);
+            let window = *store.layout().window(WindowId(1)).unwrap();
+            store
+                .view()
+                .write_slice(
+                    &vec![0x5a; (4 * page) as usize],
+                    GuestAddress(window.placement().start().0),
+                )
+                .unwrap();
+            assert!(matches!(
+                store.discard(WindowId(0), Range::new(ObjectOffset(0), page).unwrap()),
+                Err(DiscardError::NotVirtioMem(WindowId(0)))
+            ));
+            assert!(matches!(
+                store.discard(WindowId(9), window.slice()),
+                Err(DiscardError::Slice(SliceError::UnknownWindow(WindowId(9))))
+            ));
+            for slice in [
+                Range::new(ObjectOffset(page), page).unwrap(),
+                Range::new(ObjectOffset(5 * page), 2 * page).unwrap(),
+            ] {
+                assert!(matches!(
+                    store.discard(WindowId(1), slice),
+                    Err(DiscardError::Slice(SliceError::OutsideWindow { .. }))
+                ));
+            }
+            assert!(matches!(
+                store.discard(WindowId(1), Range::new(ObjectOffset(2 * page), 0).unwrap()),
+                Err(DiscardError::Slice(SliceError::Empty(WindowId(1))))
+            ));
+            for slice in [
+                Range::new(ObjectOffset(2 * page + 1), page).unwrap(),
+                Range::new(ObjectOffset(2 * page), page + 1).unwrap(),
+            ] {
+                assert!(matches!(
+                    store.discard(WindowId(1), slice),
+                    Err(DiscardError::Slice(SliceError::HostUnaligned { .. }))
+                ));
+            }
+            let mut observed = vec![0; (4 * page) as usize];
+            store
+                .view()
+                .read_slice(&mut observed, GuestAddress(window.placement().start().0))
+                .unwrap();
+            assert_eq!(observed, vec![0x5a; (4 * page) as usize]);
+            let error = store
+                .discard(WindowId(1), Range::new(ObjectOffset(0), page).unwrap())
+                .unwrap_err();
+            assert!(std::error::Error::source(&error).is_some());
+        }
     }
 
     #[test]

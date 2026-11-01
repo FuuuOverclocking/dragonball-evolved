@@ -1,5 +1,7 @@
 pub mod block;
+pub mod config;
 pub mod interrupt;
+pub mod mem;
 pub mod mmio;
 
 use std::sync::Arc;

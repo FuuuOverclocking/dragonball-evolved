@@ -5,10 +5,10 @@
 
 use api::machine::MemoryBacking;
 
-use crate::align::BackingPageSize;
+use crate::align::{BackingPageSize, HostPageSize};
 use crate::kvm_context::HostCapabilities;
 use crate::memory::layout::{MemoryLayout, Window, WindowId};
-use crate::space::Gpa;
+use crate::space::{Gpa, ObjectOffset, Range};
 
 /// What holds guest memory on the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +60,81 @@ pub enum HostPolicyError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, displaydoc::Display, thiserror::Error)]
+pub enum SliceError {
+    /// window {0} is not part of the memory store
+    UnknownWindow(WindowId),
+    /// object slice of window {0} is empty
+    Empty(WindowId),
+    /// object slice {slice} is outside window {window}
+    OutsideWindow {
+        window: WindowId,
+        slice: Range<ObjectOffset>,
+    },
+    /// object slice {slice} of window {window} is not aligned to the {page:#x}-byte host page
+    HostUnaligned {
+        window: WindowId,
+        slice: Range<ObjectOffset>,
+        page: u64,
+    },
+    /// object slice {slice} of window {window} is not aligned to the {page:#x}-byte backing page
+    BackingUnaligned {
+        window: WindowId,
+        slice: Range<ObjectOffset>,
+        page: u64,
+    },
+    /// derive the host or guest address of the object slice of window {0}
+    AddressOverflow(WindowId),
+    /// host address of the object slice of window {window} is not aligned to the {page:#x}-byte host page
+    HostAddressUnaligned { window: WindowId, page: u64 },
+}
+
 impl HostPolicy {
+    pub(crate) fn check_slice(
+        &self,
+        id: WindowId,
+        window: &Window,
+        slice: Range<ObjectOffset>,
+        host_page: HostPageSize,
+    ) -> Result<Range<Gpa>, SliceError> {
+        if slice.is_empty() {
+            return Err(SliceError::Empty(id));
+        }
+        if !window.slice().contains_range(slice) {
+            return Err(SliceError::OutsideWindow { window: id, slice });
+        }
+        let offset = slice
+            .start()
+            .0
+            .checked_sub(window.slice().start().0)
+            .ok_or(SliceError::AddressOverflow(id))?;
+        let start = window
+            .placement()
+            .start()
+            .0
+            .checked_add(offset)
+            .ok_or(SliceError::AddressOverflow(id))?;
+        let placement =
+            Range::new(Gpa(start), slice.len()).ok_or(SliceError::AddressOverflow(id))?;
+        let host = host_page.alignment();
+        if !slice.is_aligned(host) || !placement.is_aligned(host) {
+            return Err(SliceError::HostUnaligned {
+                window: id,
+                slice,
+                page: host.get(),
+            });
+        }
+        let backing = self.page_size.alignment();
+        if !slice.is_aligned(backing) || !placement.is_aligned(backing) {
+            return Err(SliceError::BackingUnaligned {
+                window: id,
+                slice,
+                page: backing.get(),
+            });
+        }
+        Ok(placement)
+    }
+
     /// Checks that `layout` can be materialized under this policy and bound on
     /// `host`: a memslot's address, size and host mapping are whole host pages,
     /// and a mapping is made of whole backing pages.
@@ -230,6 +304,33 @@ mod tests {
             policy.check(&small, &small_pages).unwrap_err().to_string(),
             "window 0 (0x0..=0xfff of object 0 at 0x1000..=0x1fff) is not aligned to the \
              0x10000-byte backing page"
+        );
+    }
+
+    #[test]
+    fn slices_use_the_saved_host_page_and_current_backing_page() {
+        let (layout, window) = single(0x1_0000, 0x2_0000);
+        let host = HostCapabilities::fake(46, 8, 0x1_0000);
+        let policy = base(BackingKind::AnonymousPrivate, &host);
+        policy.check(&layout, &host).unwrap();
+        let slice = Range::new(ObjectOffset(0), 0x1000).unwrap();
+        assert!(matches!(
+            policy.check_slice(WindowId(0), &window, slice, host.page_size),
+            Err(SliceError::HostUnaligned { page: 0x1_0000, .. })
+        ));
+        let small = HostCapabilities::fake(46, 8, 0x1000);
+        assert!(matches!(
+            policy.check_slice(WindowId(0), &window, slice, small.page_size),
+            Err(SliceError::BackingUnaligned { page: 0x1_0000, .. })
+        ));
+        assert_eq!(
+            policy.check_slice(
+                WindowId(0),
+                &window,
+                Range::new(ObjectOffset(0x1_0000), 0x1_0000).unwrap(),
+                host.page_size,
+            ),
+            Ok(Range::new(Gpa(0x2_0000), 0x1_0000).unwrap())
         );
     }
 

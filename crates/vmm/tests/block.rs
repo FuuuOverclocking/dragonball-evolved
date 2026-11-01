@@ -12,6 +12,7 @@ use vmm::bus::BusDevice;
 use vmm::devices::async_fd::AsyncEventFd;
 use vmm::devices::runtime::{DeviceExits, DeviceHandle, DeviceRuntime, Placement, Response, Start};
 use vmm::devices::virtio::block::{BlockError, BlockHandle, BlockQuiesced, BlockResources};
+use vmm::devices::virtio::config::ConfigReader;
 use vmm::devices::virtio::mmio::{
     DeviceDesc, MmioRegs, MmioTransport, MmioTransportSnapshot, NEEDS_RESET, QueueError, QueueRegs,
     RestoreError, VERSION_1,
@@ -42,6 +43,7 @@ impl TransportFixture {
             desc: DeviceDesc {
                 device_type: 2,
                 features: VERSION_1 | (1 << 9),
+                required_features: VERSION_1,
                 queue_max: vec![256],
                 config: 8u64.to_le_bytes().to_vec(),
             },
@@ -55,6 +57,7 @@ impl TransportFixture {
     fn snapshot(&self) -> MmioTransportSnapshot {
         MmioTransportSnapshot {
             desc: self.desc.clone(),
+            config: ConfigReader::fixed(self.desc.config.clone()).snapshot(),
             regs: MmioRegs::new(&self.desc),
             interrupt_status: 0,
         }
@@ -81,6 +84,7 @@ impl TransportFixture {
     ) -> Result<MmioTransport, RestoreError> {
         MmioTransport::restore(
             self.desc.clone(),
+            ConfigReader::fixed(self.desc.config.clone()),
             self.guest.mem.clone(),
             self.activator.clone(),
             self.interrupt.clone(),
@@ -132,13 +136,17 @@ impl Block {
     }
 
     fn transport(&self, guest: &GuestDriver) -> Arc<MmioTransport> {
-        Arc::new(MmioTransport::new(
-            self.handle.desc.clone(),
-            guest.mem.clone(),
-            self.handle.activator.clone(),
-            self.handle.interrupt.clone(),
-            vec![self.handle.queue_notifier.try_clone().unwrap()],
-        ))
+        Arc::new(
+            MmioTransport::new(
+                self.handle.desc.clone(),
+                self.handle.config.clone(),
+                guest.mem.clone(),
+                self.handle.activator.clone(),
+                self.handle.interrupt.clone(),
+                vec![self.handle.queue_notifier.try_clone().unwrap()],
+            )
+            .unwrap(),
+        )
     }
 
     fn restored_transport(
@@ -161,6 +169,7 @@ impl Block {
         Arc::new(
             MmioTransport::restore(
                 self.handle.desc.clone(),
+                self.handle.config.clone(),
                 guest.mem.clone(),
                 self.handle.activator.clone(),
                 self.handle.interrupt.clone(),
@@ -659,11 +668,13 @@ async fn queue_alignment_geometry_and_bounds_fail_before_activation() {
     let guest = GuestDriver::new();
     let transport = MmioTransport::new(
         handle.desc,
+        handle.config,
         guest.mem,
         handle.activator,
         handle.interrupt,
         vec![handle.queue_notifier],
-    );
+    )
+    .unwrap();
     for (used, size) in [
         (1, 16),
         (USED_RING as u32, 0),
@@ -1035,14 +1046,15 @@ async fn invalid_status_descriptor_and_non_sector_payload_do_not_mutate_disk() {
 
 #[test]
 fn transport_restore_rejects_descriptor_changes() {
-    for field in 0..4 {
+    for field in 0..5 {
         let mut fixture = TransportFixture::new();
         let snapshot = fixture.snapshot();
         match field {
             0 => fixture.desc.device_type += 1,
             1 => fixture.desc.features ^= 1 << 5,
-            2 => fixture.desc.queue_max[0] /= 2,
-            3 => fixture.desc.config = 9u64.to_le_bytes().to_vec(),
+            2 => fixture.desc.required_features = 0,
+            3 => fixture.desc.queue_max[0] /= 2,
+            4 => fixture.desc.config = 9u64.to_le_bytes().to_vec(),
             _ => unreachable!(),
         }
         assert!(matches!(
@@ -1068,6 +1080,7 @@ fn transport_restore_rejects_queue_and_notifier_counts() {
         assert!(matches!(
             MmioTransport::restore(
                 fixture.desc.clone(),
+                ConfigReader::fixed(fixture.desc.config.clone()),
                 fixture.guest.mem.clone(),
                 fixture.activator.clone(),
                 fixture.interrupt.clone(),
