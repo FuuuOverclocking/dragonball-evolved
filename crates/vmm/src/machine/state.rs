@@ -23,7 +23,7 @@ use crate::devices::runtime::{DeviceRuntime, Response, ShutdownError};
 use crate::devices::virtio::block::BlockQuiesced;
 use crate::devices::virtio::mem::{MemQuiesced, ResizeReply};
 use crate::memory::layout::WindowId;
-use crate::memory::service::{MemoryHandle, MemoryQuiesced};
+use crate::memory::service::{MemoryHandle, MemoryQuiesced, MemoryReleaseError};
 use crate::memory::store::{MemoryStore, MemoryView};
 use crate::vm::{Binding, KvmVm, MemSlots};
 
@@ -57,6 +57,12 @@ pub enum TeardownError {
     MemoryServiceTimedOut(WindowId),
     /// memory service for window {0} exited without proving registration cleanup
     MemoryServiceExited(WindowId),
+    /// release unstarted memory resources for window {window}
+    MemoryRelease {
+        window: WindowId,
+        #[source]
+        source: MemoryReleaseError,
+    },
     /// stop the devices
     Devices(#[source] ShutdownError),
     /// the VM is still held after teardown
@@ -350,7 +356,6 @@ mod tests {
     use crate::kvm_context::KvmContext;
     use crate::machine::build::build_with;
     use crate::machine::platform::{Captured, ConsoleBackend};
-    use crate::machine::snapshot::CaptureError;
     use crate::memory::service::MemoryPhase;
     use crate::spec::{MachineSpec, VIRTIO_MEM_ID};
     use crate::test_guest::{self, TempFile};
@@ -592,8 +597,11 @@ mod tests {
                                 ack.send(());
                             }
                             Command::Quiesce(ack) => {
-                                assert!(matches!(status.snapshot().phase, MemoryPhase::Running));
-                                observed_tx.send("quiesce").unwrap();
+                                match status.snapshot().phase {
+                                    MemoryPhase::Running => observed_tx.send("quiesce").unwrap(),
+                                    MemoryPhase::Quiesced => {}
+                                    phase => panic!("unexpected memory phase: {phase:?}"),
+                                }
                                 ack.send(());
                             }
                             Command::Stop => return Ok::<(), std::io::Error>(()),
@@ -641,10 +649,14 @@ mod tests {
         };
         assert_eq!(service.population.plugged_size(), 0);
         assert_eq!(service.revision, mem.memory_revision);
-        assert!(matches!(
-            paused.capture().await,
-            Err(CaptureError::MemoryHotplugUnsupported)
-        ));
+        let snapshot = paused.capture().await.unwrap();
+        assert_eq!(snapshot.memory[&window].population, *service.population);
+        assert_eq!(snapshot.memory[&window].revision, service.revision);
+        let super::super::snapshot::DeviceSnapshot::Mem(saved) = &snapshot.devices[VIRTIO_MEM_ID]
+        else {
+            panic!("memory snapshot has the wrong device kind")
+        };
+        assert_eq!(saved.state, mem);
         let running = paused.resume().await.map_err(|(_, error)| error).unwrap();
         assert_eq!(observed_rx.recv().await.unwrap(), "resume");
         running.teardown().await.unwrap();

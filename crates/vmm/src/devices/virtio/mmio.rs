@@ -7,7 +7,7 @@ use virtio_queue::{Queue, QueueT};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::config::{ConfigError, ConfigReader, ConfigSnapshot};
-use super::interrupt::InterruptStatusError;
+use super::interrupt::{InterruptStatusError, VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING};
 use super::{
     Activation, ActivationError, Activator, InterruptKind, IrqTrigger, ResetError, SessionControl,
     session_channel,
@@ -146,7 +146,16 @@ pub enum RestoreError {
 }
 
 impl MmioTransportSnapshot {
-    fn validate(&self, desc: &DeviceDesc, memory: &MemoryView) -> Result<(), RestoreError> {
+    pub(crate) fn validate(
+        &self,
+        desc: &DeviceDesc,
+        memory: &MemoryView,
+    ) -> Result<(), RestoreError> {
+        if self.interrupt_status & !(VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG) != 0 {
+            return Err(RestoreError::Interrupt(InterruptStatusError(
+                self.interrupt_status,
+            )));
+        }
         if &self.desc != desc {
             return Err(RestoreError::Descriptor);
         }

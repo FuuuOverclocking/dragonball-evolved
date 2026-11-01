@@ -11,7 +11,7 @@ use super::state::{Parts, TeardownError};
 use super::vcpu::Vcpus;
 use crate::devices::runtime::{DeviceRuntime, Response};
 use crate::memory::layout::WindowId;
-use crate::memory::service::{MemoryHandle, MemoryPhase, WindowStatus};
+use crate::memory::service::{MemoryHandle, MemoryPhase, MemoryResources, WindowStatus};
 use crate::memory::store::MemoryStore;
 use crate::vm::{Binding, KvmVm, MemSlots};
 
@@ -24,6 +24,7 @@ pub(super) struct CleanupParts {
     pub(super) mems: BTreeMap<String, AttachedMem>,
     pub(super) memory_services: BTreeMap<WindowId, MemoryHandle>,
     pub(super) memory_statuses: BTreeMap<WindowId, WindowStatus>,
+    pub(super) unstarted_memory: BTreeMap<WindowId, MemoryResources>,
     pub(super) bindings: Vec<Binding>,
     pub(super) memslots: MemSlots,
     pub(super) vm: Arc<KvmVm>,
@@ -32,6 +33,12 @@ pub(super) struct CleanupParts {
 #[derive(Debug)]
 enum Stage {
     Tasks(Box<CleanupParts>),
+    Unstarted {
+        memory: BTreeMap<WindowId, MemoryResources>,
+        bindings: Vec<Binding>,
+        memslots: MemSlots,
+        vm: Arc<KvmVm>,
+    },
     Vm(Arc<KvmVm>),
 }
 
@@ -77,10 +84,25 @@ impl PendingCleanup {
             mems,
             memory_services,
             memory_statuses,
+            unstarted_memory: BTreeMap::new(),
             bindings,
             memslots,
             vm,
         }))
+    }
+
+    pub(super) fn unstarted(
+        vm: Arc<KvmVm>,
+        bindings: Vec<Binding>,
+        memslots: MemSlots,
+        memory: BTreeMap<WindowId, MemoryResources>,
+    ) -> Self {
+        Self(Stage::Unstarted {
+            memory,
+            bindings,
+            memslots,
+            vm,
+        })
     }
 
     pub(super) fn vm(vm: Arc<KvmVm>) -> Self {
@@ -138,9 +160,34 @@ impl PendingCleanup {
             {
                 return Err((self, TeardownError::Devices(error)));
             }
+            drop(parts.vcpus.take());
+        }
+        let memory = match &mut self.0 {
+            Stage::Tasks(parts) => Some(&mut parts.unstarted_memory),
+            Stage::Unstarted { memory, .. } => Some(memory),
+            Stage::Vm(_) => None,
+        };
+        if let Some(memory) = memory {
+            while let Some((window, resources)) = memory.pop_first() {
+                if let Err((resources, source)) = resources.release() {
+                    memory.insert(window, resources);
+                    return Err((self, TeardownError::MemoryRelease { window, source }));
+                }
+            }
         }
         let vm = match self.0 {
             Stage::Vm(vm) => vm,
+            Stage::Unstarted {
+                memory,
+                bindings,
+                memslots,
+                vm,
+            } => {
+                drop(memory);
+                drop(bindings);
+                drop(memslots);
+                vm
+            }
             Stage::Tasks(parts) => {
                 let CleanupParts {
                     vcpus,
@@ -150,6 +197,7 @@ impl PendingCleanup {
                     mems,
                     memory_services,
                     memory_statuses,
+                    unstarted_memory,
                     bindings,
                     memslots,
                     vm,
@@ -161,6 +209,7 @@ impl PendingCleanup {
                 drop(mems);
                 drop(memory_services);
                 drop(memory_statuses);
+                drop(unstarted_memory);
                 drop(bindings);
                 drop(memslots);
                 vm
@@ -245,6 +294,7 @@ mod tests {
                     mems: BTreeMap::new(),
                     memory_services: BTreeMap::new(),
                     memory_statuses: BTreeMap::new(),
+                    unstarted_memory: BTreeMap::new(),
                     bindings,
                     memslots,
                     vm,
@@ -392,6 +442,7 @@ mod tests {
                 mems: BTreeMap::new(),
                 memory_services: BTreeMap::new(),
                 memory_statuses: BTreeMap::new(),
+                unstarted_memory: BTreeMap::new(),
                 bindings,
                 memslots,
                 vm,

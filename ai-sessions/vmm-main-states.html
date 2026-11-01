@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vmm-main 状态模型 · 状态图</title>
+<style>
+:root{
+  --bg:#0d131d;--panel:#131c2a;--panel2:#18243a;--chip:#1c283d;--line:#26344c;--line2:#3a4d70;
+  --text:#dce4f0;--muted:#8d9bb2;--faint:#5c6b84;
+  --stable:#3cc8a8;--busy:#f2b445;--term:#ff7a6b;--proto:#f38fb9;--noauth:#e3c450;--export:#86d97f;--ext:#6b7a93;
+  --req:#b69cff;--done:#6fa8ff;--fail:#ff6b6b;--stop:#ff9a57;--fact:#4fd1e8;--auth:#e3c450;--msg:#97a5bb;
+  --mono:"JetBrains Mono","Cascadia Code","Fira Code","SFMono-Regular",Menlo,Consolas,monospace;
+  --sans:"Inter","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Microsoft YaHei",system-ui,sans-serif;
+  color-scheme:dark;
+}
+[data-theme=light]{
+  --bg:#f6f3ec;--panel:#fffdf8;--panel2:#f3efe5;--chip:#ece6d8;--line:#ddd5c4;--line2:#c4b9a2;
+  --text:#1c2230;--muted:#5d6574;--faint:#9ba1ab;
+  --stable:#0f8a6c;--busy:#b0700a;--term:#c43d2f;--proto:#b8326e;--noauth:#9a7a05;--export:#3d8a34;--ext:#8a93a3;
+  --req:#6f45bd;--done:#2a5bcc;--fail:#c8312a;--stop:#c45a14;--fact:#08809a;--auth:#9a7a05;--msg:#6d7686;
+  color-scheme:light;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14.5px/1.65 var(--sans)}
+h1,h2,h3,h4,p{margin:0}
+code{font-family:var(--mono);font-size:.86em;background:var(--chip);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+button{font:inherit;color:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--busy);outline-offset:3px}
+.wrap{max-width:1500px;margin:0 auto;padding:0 22px}
+header{padding:28px 0 14px;display:flex;align-items:flex-end;gap:20px;flex-wrap:wrap}
+header .kicker{font:700 11.5px var(--mono);letter-spacing:.14em;color:var(--stable);text-transform:uppercase}
+header h1{font-size:26px;letter-spacing:-.01em;margin-top:6px}
+header p{color:var(--muted);font-size:13.5px;margin-top:6px;max-width:900px}
+.theme{margin-left:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:4px 11px;font-size:12px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;border-bottom:1px solid var(--line);margin-bottom:14px}
+.tabs button{background:none;border:0;border-bottom:2px solid transparent;padding:9px 14px;color:var(--muted);font-size:13.5px}
+.tabs button[aria-selected=true]{color:var(--text);border-bottom-color:var(--busy);font-weight:600}
+.tabs button .n{font:700 12px var(--mono);color:var(--busy);margin-right:6px}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;align-items:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px}
+.stage{padding:10px}
+.stage svg{width:100%;height:auto;display:block;user-select:none}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;padding:8px 10px 2px;font-size:12px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{display:inline-block;width:22px;height:0;border-top:2px solid}
+.legend i.box{width:16px;height:11px;border:2px solid;border-radius:3px}
+.note{font-size:12.5px;color:var(--muted);padding:8px 10px 4px;border-top:1px dashed var(--line);margin-top:6px}
+.side{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto;padding:16px 18px}
+.side h4{font:600 13.5px var(--mono);margin-bottom:8px;overflow-wrap:anywhere}
+.side .sub{color:var(--muted);font-size:12px;margin-bottom:8px}
+.side p{font-size:13.5px}
+.side p+p{margin-top:6px}
+dl.kv{display:grid;grid-template-columns:58px 1fr;gap:6px 10px;margin:0;font-size:13px}
+dl.kv dt{color:var(--muted);font-size:12px;padding-top:1px}
+dl.kv dd{margin:0}
+.ref{font:11.5px/1.5 var(--mono);color:var(--muted);margin-top:12px}
+.go{margin-top:12px;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:4px 11px;font-size:12.5px}
+.go:hover{border-color:var(--busy)}
+footer{color:var(--faint);font-size:12px;padding:22px 0 40px}
+
+/* svg */
+svg .region rect{fill:color-mix(in srgb,var(--panel2) 45%,transparent);stroke:var(--line2);stroke-width:1.2;stroke-dasharray:3 4}
+svg .region text{font:600 12px var(--mono);fill:var(--muted)}
+svg .region.hot rect{cursor:pointer}
+svg .node rect{fill:var(--panel2);stroke-width:2}
+svg .node.stable rect{stroke:var(--stable)}
+svg .node.busy rect{stroke:var(--busy);stroke-dasharray:7 4}
+svg .node.term rect{stroke:var(--term)}
+svg .node.stall rect{stroke:var(--fail);stroke-dasharray:7 4}
+svg .node.proto rect{stroke:var(--proto);stroke-dasharray:2 4;stroke-linecap:round}
+svg .node.noauth rect{stroke:var(--noauth)}
+svg .node.export rect{stroke:var(--export)}
+svg .node.ext rect{stroke:var(--ext);stroke-dasharray:4 4;fill:transparent}
+svg .node.end rect{stroke:var(--line2);fill:var(--chip)}
+svg .node{cursor:pointer;transition:opacity .2s}
+svg .node:hover rect,svg .node.sel rect{stroke-width:3.2}
+svg .node .n-t{font:600 13px var(--mono);fill:var(--text);text-anchor:middle}
+svg .node .n-s{font:11px var(--sans);fill:var(--muted);text-anchor:middle}
+svg .edge{cursor:pointer;transition:opacity .2s}
+svg .edge .line{fill:none;stroke-width:1.8}
+svg .edge .hit{fill:none;stroke:transparent;stroke-width:14}
+svg .edge:hover .line,svg .edge.sel .line{stroke-width:3.2}
+svg .elabel{font:11.5px var(--mono);paint-order:stroke;stroke:var(--panel);stroke-width:5px;stroke-linejoin:round}
+svg .edge.req .line{stroke:var(--req)}svg .edge.req .elabel{fill:var(--req)}svg .m-req{fill:var(--req)}
+svg .edge.done .line{stroke:var(--done)}svg .edge.done .elabel{fill:var(--done)}svg .m-done{fill:var(--done)}
+svg .edge.fail .line{stroke:var(--fail)}svg .edge.fail .elabel{fill:var(--fail)}svg .m-fail{fill:var(--fail)}
+svg .edge.stop .line{stroke:var(--stop);stroke-dasharray:6 5}svg .edge.stop .elabel{fill:var(--stop)}svg .m-stop{fill:var(--stop)}
+svg .edge.fact .line{stroke:var(--fact)}svg .edge.fact .elabel{fill:var(--fact)}svg .m-fact{fill:var(--fact)}
+svg .edge.auth .line{stroke:var(--auth);stroke-width:2.6}svg .edge.auth .elabel{fill:var(--auth)}svg .m-auth{fill:var(--auth)}
+svg .edge.msg .line{stroke:var(--msg);stroke-dasharray:2 5;stroke-linecap:round}svg .edge.msg .elabel{fill:var(--msg)}svg .m-msg{fill:var(--msg)}
+svg .anno{font:12px var(--sans);fill:var(--muted)}
+svg.focus .node:not(.hl),svg.focus .region:not(.hl){opacity:.28}
+svg.focus .edge:not(.hl){opacity:.1}
+svg.focus .edge.hl .line{stroke-width:3.2}
+
+@media (max-width:1100px){
+  .layout{grid-template-columns:1fr}
+  .side{position:static;max-height:none}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="kicker">Dragonball Evolved · vmm-main 状态模型</div>
+      <h1>状态图</h1>
+      <p>对应 <code>ai-sessions/vmm-main-states.rs</code> 与 <code>.md</code>。整机状态由几个独立维度组成，这里分四张图：总览（准入 × Guest × 退出阶段）、<code>Owned</code> 内部的 <code>Exec</code>、拓扑槽位与作用域变更、运行权移交。点击节点或连线查看说明。</p>
+    </div>
+    <button class="theme" id="theme">切换明暗</button>
+  </header>
+
+  <nav class="tabs" role="tablist" id="tabs"></nav>
+
+  <div class="layout">
+    <section class="card stage">
+      <svg id="svg" role="img" aria-label="状态图"></svg>
+      <div class="legend" id="legend"></div>
+      <p class="note" id="note"></p>
+    </section>
+    <aside class="card side" id="side" aria-live="polite"></aside>
+  </div>
+
+  <footer>伪代码中的 [新] / [改] 类型均未实现；本图描述的是目标模型，不是当前代码。章节号指 <code>vmm-main-states.rs</code> 的 §0–§9。</footer>
+</div>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// `x` in prose becomes <code>x</code>
+const fmt = s => esc(s).replace(/`([^`]+)`/g, '<code>$1</code>');
+
+// edge: id, from, to, kind, svg path, labels [[x, y, anchor, text]], title, description, source ref
+const E = (id, from, to, k, d, labels, t, x, code) => ({ id, from, to, k, d, labels, t, x, code });
+
+const NODE_LEGEND = {
+  stable: ['solid', '稳定状态'],
+  busy: ['dashed', '进行中：迁移 / 变更 / 导入'],
+  export: ['solid', '带导出会话'],
+  noauth: ['solid', '有机器、无运行权'],
+  proto: ['dotted', '设备协议状态（不在 Topology）'],
+  stall: ['dashed', '卡住，可重试'],
+  term: ['solid', '退出阶段 / 故障'],
+  ext: ['dashed', '另一张图或进程外'],
+};
+const EDGE_LEGEND = {
+  req: '请求', done: '落地 / 提交', fact: '事实（guest 或机器报告）', fail: '失败',
+  stop: '退出路径', auth: '运行权', msg: '跨进程数据',
+};
+const DIAGRAMS = [];
+let cur = null;
+
+function renderDiagram(D) {
+  const svg = $('#svg');
+  svg.setAttribute('viewBox', `0 0 ${D.w} ${D.h}`);
+  const kinds = [...new Set(D.edges.map(e => e.k))];
+  let h = '<defs>' + kinds.map(k =>
+    `<marker id="ar-${k}" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="m-${k}"/></marker>`).join('') + '</defs>';
+  for (const r of D.regions || []) {
+    h += `<g class="region${r.info ? ' hot' : ''}" data-id="${r.id}"${r.info ? ' tabindex="0" role="button"' : ''}>`
+      + `<rect x="${r.x}" y="${r.y}" width="${r.w}" height="${r.h}" rx="14"/>`
+      + `<text x="${r.x + 14}" y="${r.top ? r.y + 22 : r.y + r.h - 12}">${esc(r.label)}</text></g>`;
+  }
+  for (const e of D.edges) {
+    h += `<g class="edge ${e.k}" data-id="${e.id}" tabindex="0" role="button" aria-label="${esc(e.t)}">`
+      + `<path class="hit" d="${e.d}"/><path class="line" d="${e.d}" marker-end="url(#ar-${e.k})"/>`
+      + (e.labels || []).map(([x, y, a, t]) => `<text class="elabel" x="${x}" y="${y}" text-anchor="${a}">${esc(t)}</text>`).join('')
+      + '</g>';
+  }
+  for (const [id, n] of Object.entries(D.nodes)) {
+    const w = n.w || 160, hh = n.h || 54;
+    h += `<g class="node ${n.k}" data-id="${id}" tabindex="0" role="button" aria-label="${esc(n.t)}" transform="translate(${n.x},${n.y})">`
+      + `<rect x="${-w / 2}" y="${-hh / 2}" width="${w}" height="${hh}" rx="10"/>`
+      + `<text class="n-t" y="${n.s ? -2 : 5}">${esc(n.t)}</text>`
+      + (n.s ? `<text class="n-s" y="16">${esc(n.s)}</text>` : '') + '</g>';
+  }
+  for (const [x, y, a, t] of D.annos || []) h += `<text class="anno" x="${x}" y="${y}" text-anchor="${a}">${esc(t)}</text>`;
+  svg.innerHTML = h;
+
+  const nodeKinds = [...new Set(Object.values(D.nodes).map(n => n.k))].filter(k => NODE_LEGEND[k]);
+  $('#legend').innerHTML = nodeKinds.map(k => {
+    const [style, text] = NODE_LEGEND[k];
+    return `<span><i class="box" style="border-color:var(--${k});border-style:${style}"></i>${text}</span>`;
+  }).join('') + kinds.map(k =>
+    `<span><i style="border-color:var(--${k});border-top-style:${k === 'stop' ? 'dashed' : k === 'msg' ? 'dotted' : 'solid'}"></i>${EDGE_LEGEND[k]}</span>`).join('');
+  $('#note').innerHTML = fmt(D.note || '');
+}
+
+function focusGraph(nodes = [], edges = [], sel = null) {
+  const svg = $('#svg');
+  svg.classList.toggle('focus', nodes.length + edges.length > 0);
+  $$('.node,.region', svg).forEach(g => {
+    g.classList.toggle('hl', nodes.includes(g.dataset.id));
+    g.classList.toggle('sel', g.dataset.id === sel);
+  });
+  $$('.edge', svg).forEach(g => {
+    g.classList.toggle('hl', edges.includes(g.dataset.id));
+    g.classList.toggle('sel', g.dataset.id === sel);
+  });
+}
+
+const nameOf = id => cur.nodes[id]?.t || (cur.regions || []).find(r => r.id === id)?.label || id;
+const goButton = go => go ? `<button class="go" data-go="${go}">打开「${esc(DIAGRAMS.find(d => d.id === go).tab)}」图 →</button>` : '';
+
+function showIntro() {
+  $('#side').innerHTML = `<h4>${esc(cur.title)}</h4>` + cur.intro.map(p => `<p>${fmt(p)}</p>`).join('')
+    + '<p class="sub" style="margin-top:12px">点击节点或连线查看说明；点击空白处返回此处。</p>';
+  focusGraph();
+}
+
+function showNode(id) {
+  const n = cur.nodes[id] || (cur.regions || []).find(r => r.id === id);
+  if (!n || !n.info) return;
+  const edges = cur.edges.filter(e => e.from === id || e.to === id);
+  const nodes = [...new Set([id, ...edges.flatMap(e => [e.from, e.to])])];
+  const { rows = [], d, code, go } = n.info;
+  $('#side').innerHTML = `<h4>${esc(n.t || n.label)}</h4>`
+    + (d ? `<p>${fmt(d)}</p>` : '')
+    + (rows.length ? `<dl class="kv"${d ? ' style="margin-top:10px"' : ''}>` + rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${fmt(v)}</dd>`).join('') + '</dl>' : '')
+    + (code ? `<p class="ref">${esc(code)}</p>` : '') + goButton(go);
+  focusGraph(nodes, edges.map(e => e.id), id);
+}
+
+function showEdge(id) {
+  const e = cur.edges.find(x => x.id === id);
+  $('#side').innerHTML = `<h4>${fmt(e.t)}</h4><p class="sub">${esc(nameOf(e.from))} → ${esc(nameOf(e.to))}</p>`
+    + `<p>${fmt(e.x || '')}</p>` + (e.code ? `<p class="ref">${esc(e.code)}</p>` : '');
+  focusGraph([e.from, e.to], [id], id);
+}
+
+function openDiagram(id) {
+  cur = DIAGRAMS.find(d => d.id === id) || DIAGRAMS[0];
+  $$('#tabs button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.id === cur.id)));
+  renderDiagram(cur);
+  showIntro();
+  if (location.hash.slice(1) !== cur.id) history.replaceState(null, '', '#' + cur.id);
+}
+DIAGRAMS.push({
+  id: 'overview', tab: '总览', title: '总览：准入 × Guest × 退出阶段', w: 1160, h: 650,
+  intro: [
+    '整机状态 = `Vmm`（准入开着还是已关闭）× `Guest`（本进程与这台 guest 的关系）× 退出阶段 `Leaving`。',
+    '`Stopping` 里没有请求接收端，所以“停止中不再收请求”由类型保证，而不是约定。',
+    '`Owned` 内部的执行状态、拓扑与运行权移交分别见另外三张图。',
+  ],
+  regions: [
+    { id: 'SV', x: 20, y: 30, w: 680, h: 500, label: 'Vmm::Serving { admission: Open(server) | Detached, guest }',
+      info: { d: '准入开着（或所有客户端已离开）时的全部状态。`Admission::Detached` 只报告一次：有运行权的 guest 继续运行；没有运行权（Absent、Standby）时没人能再推进，于是退出。它取代了现在的 `Starting.detached` 标记。', code: 'rs §5 Vmm / Serving / Admission' } },
+    { id: 'SP', x: 720, y: 30, w: 420, h: 500, top: true, label: 'Vmm::Stopping { leaving, exit: ExitFacts }',
+      info: { d: '准入已关闭：`Stopping` 没有 server 字段。各阶段只持有自己需要的东西，事实在每个阶段都继续并入 `ExitFacts`。现在的 `teardown()`、`poll_teardown()`、`shutdown_resize()`、`Next::StartTeardown` 四条路径合并到这里。', code: 'rs §5 Stopping / Leaving' } },
+  ],
+  nodes: {
+    AB: { x: 130, y: 130, t: 'Guest::Absent', s: 'MachineSpec', k: 'stable', info: { rows: [
+      ['持有', '只有 `MachineSpec`；没有机器，也没有事实来源。'],
+      ['离开', 'Start：外壳同步 plan + build，成功后铸造 `RunAuthority(Booted)`。Restore / Receive / Adopt：进入 Importing。'],
+      ['现在', '`Controller::NotStarted`'],
+    ], code: 'rs §5 Guest::Absent · §7 Next::Start' } },
+    OW: { x: 470, y: 130, w: 180, t: 'Guest::Owned', s: '持有运行权 · 内含 Exec', k: 'stable', info: {
+      d: '持有运行权的机器。执行状态（Running / Paused / Moving 与导出会话）见「Exec」图，拓扑与在途变更见「拓扑」图。',
+      rows: [
+        ['字段', '`authority` · `exec: Exec` · `topology` · `changes` · `views` · `facts`'],
+        ['事实', '`facts` 挂在整机上，不挂在操作上；现在每个 Busy 变体各存一份 events。'],
+        ['现在', '`Controller::{Running, Paused, Busy}`'],
+      ], code: 'rs §5 Owned<X = Exec>', go: 'exec' } },
+    IM: { x: 130, y: 340, w: 170, t: 'Guest::Importing', s: 'Restore · Receive · Adopt', k: 'busy', info: { rows: [
+      ['Restore', '本地快照（现有同进程 `rebuild` 的推广）；成功即得到运行权 `Origin::Restored`。'],
+      ['Receive', '迁移目标：先收 Plan + Topology 建 parked 机器，再收内存轮次与最终状态。'],
+      ['Adopt', '热升级目标：接管 memfd 与设备后端 fd，按快照重建 VM——KVM fd 不能跨进程使用。'],
+      ['失败', '进入 Stopping；清理未证明完成时保留 `PendingCleanup`。'],
+    ], code: 'rs §4.2 Import', go: 'authority' } },
+    SB: { x: 340, y: 340, t: 'Guest::Standby', s: '有机器 · 无运行权', k: 'noauth', info: {
+      d: '机器已就绪（parked），但没有运行权：只能等授予，或被放弃。',
+      rows: [
+        ['授予', '`AcceptGrant(Grant)`：校验会话与 epoch → `RunAuthority(Granted)` → Owned{Paused}。'],
+        ['放弃', '对端失败、编排者放弃或 Detached → 本地 teardown；guest 从未在此运行。'],
+      ], code: 'rs §4.2 Standby', go: 'authority' } },
+    HD: { x: 560, y: 430, t: 'Guest::Held', s: '运行权扣押 · 保留现场', k: 'term', info: {
+      d: '可选的故障策略 `FaultPolicy::Hold`：继续运行会破坏正确性时暂停并保留现场，而不是直接退出（design.new-mem §10.2）。',
+      rows: [
+        ['运行权', '扣押（`suspended`）：之后只能退出，不能 Resume。'],
+        ['允许', '查询；诊断性捕获（仅 `HeldMachine::Paused`）；Shutdown。'],
+        ['默认', '策略为 Exit（现状）时不进入此状态，直接 Stopping。'],
+      ], code: 'rs §5 Held · §7 FaultPolicy' } },
+    SE: { x: 840, y: 200, w: 180, t: 'Leaving::Settling', s: '中止导出 · 等 Moving 落地', k: 'term', info: {
+      d: '中止导出会话，等 `Exec::Moving` 落地（有界）。Guest 保持原形，只是不再接受请求。',
+      rows: [['之后', '有机器 → TearingDown；无机器 → Done。']], code: 'rs §5 Leaving::Settling' } },
+    TD: { x: 840, y: 330, w: 180, t: 'Leaving::TearingDown', s: 'teardown ∥ 在途变更', k: 'term', info: {
+      d: 'teardown 与仍在途的作用域变更并行推进：卡住的发布或回收往往要靠 teardown 释放内存才能结算，而它的回复不能丢。',
+      rows: [
+        ['推广自', '现在的 `shutdown_resize`。'],
+        ['失败', 'teardown 到期返回 `PendingCleanup`，保留到 Done；`ExitFacts.cleanup` 记一条。'],
+      ], code: 'rs §5 Leaving::TearingDown' } },
+    RL: { x: 1045, y: 110, w: 170, t: 'Leaving::Releasing', s: '只做本地释放', k: 'term', info: {
+      d: '运行权已交出：停线程、关 fd、解除映射，但不对共享 backing 做破坏性操作（discard、截断、清零）——对端可能正在用同一个 memfd。',
+      rows: [
+        ['前提', '`&Relinquishment`，只由 `grant` 产生。'],
+        ['原因', '`Handoff::{Migrated, Upgraded}` 与 `GrantDelivery::{Acknowledged, Unknown}`。'],
+      ], code: 'rs §2 release_local · §5 Leaving::Releasing' } },
+    DN: { x: 900, y: 470, w: 200, t: 'Leaving::Done', s: '保留未证实可释放的所有者', k: 'term', info: {
+      d: '结束。尚未证明可释放的 `PendingCleanup` 保留到线程返回之后才 drop——drop 只请求停止，不证明清理完成。',
+      code: 'rs §5 Leaving::Done' } },
+    END: { x: 930, y: 600, w: 400, t: 'return VmmExitStatus', s: 'ExitFacts::verdict()：与事实到达顺序无关', k: 'end', info: {
+      d: '`join` 是逐字段并集（交换、结合、幂等），终点一次裁决：',
+      rows: [
+        ['1', '清理失败 → Error（资源可能仍被持有，压过一切）。'],
+        ['2', 'CPU 故障、失去 RAM 依赖、不安全的 resume → Error。'],
+        ['3', 'CPU 超时、panic、join 失败 → Error。'],
+        ['4', '`TransitionExited(cpu)`：同一 CPU 有结束事实则已解释，否则 Error。'],
+        ['5', '其余 → Ok；原因按 handoff > reset > 请求报告。'],
+      ], code: 'rs §8 ExitFacts' } },
+  },
+  edges: [
+    E('a_cfg', 'AB', 'AB', 'req', 'M108 103 C 94 50, 166 50, 152 103', [[130, 46, 'middle', 'Configure · Start 同步失败']],
+      'Configure · Start 同步失败', 'Configure 用 `spec.apply` 产生新 spec。Start 的同步阶段（plan，或 build 失败且无需清理）失败时直接回复错误、留在 Absent，可立即重试——它根本不进入 Moving。', 'rs §7 Next::Start'),
+    E('a_start', 'AB', 'OW', 'req', 'M210 120 L377 120', [[294, 112, 'middle', 'Start']],
+      'Start', '外壳同步 plan + build（vmm-main 上唯一的阻塞例外）。成功后才有 Owned 的全部材料：铸造 `RunAuthority(Booted)`、`Topology::initial(plan)`、build 交出的 `FactSources`，以 `Exec::Moving(Starting)` 装配。回复在首次 resume 落地时发出。', 'rs §7 Next::Start'),
+    E('a_vacant', 'OW', 'AB', 'fail', 'M380 142 L213 142', [[296, 160, 'middle', 'Landed::Vacant']],
+      'Landed::Vacant', 'Start 的首次 resume 失败，且操作内部已清理干净：回复错误，运行权随 Owned 一起丢弃，spec 放回 Absent，可重试。若准入已是 Detached，没人能重试 → Stopping。', 'rs §3.1 Landed'),
+    E('a_import', 'AB', 'IM', 'req', 'M130 157 L130 310', [[122, 238, 'end', '导入请求']],
+      '导入请求', '`RestoreSnapshot`、`ReceiveMigration`、`AdoptState` 只在 Absent 接受。', 'rs §6 Request'),
+    E('a_restored', 'IM', 'OW', 'done', 'M195 313 L392 160', [[282, 222, 'end', '本地恢复']],
+      '本地恢复成功', '`Import::Restore` 落地即得到运行权（`Origin::Restored`）：本地快照可以恢复多次，得到的是相互独立的克隆而不是脑裂；但身份相同，需要更新 VMGenID（依赖 A5）。结果是 Owned{Paused}。', 'rs §4 Origin'),
+    E('a_ready', 'IM', 'SB', 'done', 'M215 340 L257 340', [[236, 331, 'middle', '就绪']],
+      '就绪', '迁移目标收完最终状态，或升级目标重建完 VM：机器 parked，没有运行权。', 'rs §4.2'),
+    E('a_accept', 'SB', 'OW', 'auth', 'M360 313 L445 160', [[404, 250, 'start', 'AcceptGrant']],
+      'AcceptGrant', '`accept(&Standby, Grant)` 校验会话与 epoch（拒绝过期或重放的授予消息），产生 `RunAuthority(Granted)` → Owned{Paused}；之后 Resume 才合法。', 'rs §4 accept'),
+    E('a_hold', 'OW', 'HD', 'fact', 'M530 157 L555 400', [[522, 300, 'end', '致命事实 · Hold 策略']],
+      '致命事实 · FaultPolicy::Hold', '例如 `ChangeOutcome::Fatal`（guest 已接受的映射或内容无法恢复）。策略为 Exit（现状）时改走 Stopping。', 'rs §3.2 ChangeOutcome · §7 FaultPolicy'),
+    E('a_reboot', 'OW', 'OW', 'fact', 'M445 103 C 431 50, 509 50, 495 103', [[470, 46, 'middle', '复位 · Reboot 策略']],
+      '复位 · ResetPolicy::Reboot', 'E8：guest 复位后在本进程内重建——`Exec::Moving(Rebooting)`，teardown 后按 plan + topology 重建，热插进来的 CPU、DIMM 保留。策略为 Exit（现状）时改走 Stopping。', 'rs §7 ResetPolicy'),
+    E('a_stop', 'SV', 'SE', 'stop', 'M700 200 L747 200', [[752, 134, 'start', 'Shutdown · Detached（无运行权）'], [752, 150, 'start', '致命事实 / 复位（Exit 策略）'], [752, 166, 'start', '导入失败']],
+      '进入 Stopping', '任一 Serving 状态：Shutdown（立即回复“已接受”）；没有运行权时所有客户端离开；致命事实或复位且策略为 Exit；导入失败。外壳只需丢弃 `VmmServer`。', 'rs §7 Next::Stop'),
+    E('a_grant', 'OW', 'RL', 'auth', 'M560 118 L957 108', [[758, 100, 'middle', 'grant：CommitHandover / StopCopy 对端就绪']],
+      'grant', '`grant(RunAuthority) -> (Grant, Relinquishment)` 消耗运行权：`Paused{StopCopy}` 时对端就绪，或 `Paused{Handover}` 时收到 CommitHandover。交出之后进程不再接受任何请求，直接进入 Releasing。', 'rs §4 grant'),
+    E('a_failed', 'OW', 'TD', 'fail', 'M560 150 C 640 180, 690 300, 747 322', [[712, 288, 'start', 'Landed::Failed']],
+      'Landed::Failed', 'CPU 迁移失败，CPU 状态未知：`FailedMachine` 只能 teardown，绝不回到出发状态。', 'rs §3.1 Landed'),
+    E('a_stuck', 'OW', 'DN', 'fail', 'M545 157 C 650 380, 700 470, 797 470', [[700, 418, 'start', 'Landed::Stuck']],
+      'Landed::Stuck', '清理没能证明完成（例如 Start 失败后 teardown 失败）：已经没有完整机器可 teardown，带着 `PendingCleanup` 直接到 Done，保留到线程返回。', 'rs §3.1 Landed'),
+    E('a_settle_td', 'SE', 'TD', 'stop', 'M840 227 L840 300', [[848, 268, 'start', '有机器']],
+      '有机器', '导出已中止、Moving 已落地后，teardown 当前机器（Running、Paused、Failed、Standby 或 Held 的机器）。', 'rs §5 Leaving'),
+    E('a_settle_dn', 'SE', 'DN', 'stop', 'M925 227 C 980 300, 990 400, 970 440', [[985, 330, 'start', '无机器']],
+      '无机器', 'Absent，或导入在建好机器之前失败：没有可 teardown 的东西。', 'rs §5 Leaving'),
+    E('a_td_dn', 'TD', 'DN', 'stop', 'M855 357 L880 440', [],
+      'teardown 结算', 'teardown 与在途变更都已结算。teardown 失败时保留 `PendingCleanup`。', 'rs §5 Leaving'),
+    E('a_rl_dn', 'RL', 'DN', 'stop', 'M1060 137 L1060 400 Q1060 470 1003 470', [[1068, 300, 'start', '完成']],
+      '本地释放完成', '退出原因含 `Handoff` 与 `GrantDelivery`：授予发出后确认丢失（Unknown）同样不再运行。', 'rs §8 ExitReason'),
+    E('a_dn_end', 'DN', 'END', 'stop', 'M900 497 L900 570', [],
+      'verdict', '线程返回 `VmmExitStatus`；`VmmClient::join_vmm_thread` 拿到它。', 'rs §8'),
+  ],
+  note: '图中未画出：Moving 进行中时的写请求一律拒绝（见「Exec」图）；查询类请求（GetInstanceInfo、GetTopology、UpdateLogger）在任何 Serving 状态立即回答。',
+});
+DIAGRAMS.push({
+  id: 'exec', tab: 'Exec', title: 'Exec：Owned 内部的执行状态', w: 1180, h: 790,
+  intro: [
+    '`Exec = Running { machine, export: Option<LiveExport> } | Paused { machine, export: Option<CutExport> } | Moving(Move)`。',
+    '导出会话嵌在执行状态里：Precopy 只能出现在 Running 中，Dump / StopCopy / Handover 只能出现在 Paused 中——由类型保证。',
+    '所有有界迁移共用一个完成类型 `Landed`：`Running | Paused(_, export) | Vacant | Failed | Stuck`。失败不回到出发状态。',
+  ],
+  nodes: {
+    XA: { x: 95, y: 170, t: 'Guest::Absent', s: 'Owned 之外', k: 'ext', info: {
+      d: 'Start 之前，或 Start 失败且已清理（`Landed::Vacant`）之后。', go: 'overview' } },
+    ST: { x: 300, y: 170, t: 'Moving(Starting)', s: '首次 resume', k: 'busy', info: {
+      d: '操作拥有刚 build 好的 `PausedMachine` 并执行首次 resume；失败时在操作内部先 teardown，再报告。',
+      rows: [['落点', '`Running`；`Vacant`（已清理，可重试）；`Stuck`（清理未完成）。'], ['回复', '落地时。']],
+      code: 'rs §3.1 MoveKind::Starting' } },
+    RU: { x: 560, y: 170, t: 'Exec::Running', s: 'Machine', k: 'stable', info: { rows: [
+      ['持有', '`Machine` 与 `export: Option<LiveExport>`（只可能是 Precopy）。'],
+      ['接受', 'Pause、PlugCpu、SendMigration；ResizeMemory / PlugMemory 是作用域变更，不占 Exec。Resume 幂等回复 Ok。'],
+      ['现在', '`Controller::Running`'],
+    ], code: 'rs §5 Exec::Running' } },
+    CPU: { x: 430, y: 55, w: 190, t: 'Moving(CPU 迁移)', s: 'PluggingCpu · ReleasingCpu', k: 'busy', info: {
+      d: '改变 vCPU 集合与 pause / resume 操作的是同一组线程，所以是独占的 Exec 迁移。线程应答有期限，超时 → `Landed::Failed`。',
+      rows: [
+        ['Plug', '新建或复用 Dormant 的 vCPU fd、起线程，然后通知 guest 插入。'],
+        ['Release', 'guest `_EJ0` 之后：停线程、保留 fd——KVM 没有销毁 vCPU 的接口。'],
+        ['Paused', '`CpuEjected` 也可能在 Paused 时到达，ReleasingCpu 落地后回到 Paused。'],
+      ], code: 'rs §1 CpuEffect · §7 Launch' } },
+    RB: { x: 690, y: 55, t: 'Moving(Rebooting)', s: 'E8 · 进程内重建', k: 'busy', info: {
+      d: '`ResetPolicy::Reboot` 时，guest 复位后不退出，而是 teardown 后按 plan + topology 在本进程内重建。热插进来的 CPU 与 DIMM 保留。',
+      rows: [['失败', '`Failed` / `Stuck` → Stopping。']], code: 'rs §3.1 MoveKind::Rebooting · §7 ResetPolicy' } },
+    PC: { x: 960, y: 170, w: 180, t: 'Running{Precopy}', s: 'LiveExport · 拓扑冻结', k: 'export', info: {
+      d: '热迁移的 precopy 阶段：guest 继续运行，内存按轮次发给对端。只有 precopy 需要 guest 运行，所以它是唯一的 `LiveExport`。',
+      rows: [
+        ['冻结', '`TopologyFreeze`：期间拒绝宿主侧拓扑请求与 resize。'],
+        ['写集', '`DirtyEpoch` 汇合 CPU、软件设备、直通设备的写入，不能只用 KVM dirty bitmap。'],
+        ['中止', 'Cancel 或对端失败只丢弃会话，guest 不受影响。'],
+      ], code: 'rs §4.1 Precopy', go: 'authority' } },
+    PG: { x: 470, y: 330, t: 'Moving(Pausing)', s: 'CPU → 设备 → 服务', k: 'busy', info: { rows: [
+      ['操作', '`Machine::pause`：先停 CPU（产生 `CpusParked`），再 quiesce 设备与内存服务。设备未应答只记进 `QuiesceAcks`，暂停照样完成。'],
+      ['落点', 'Paused；`Failed`（CPU 状态未知）。'],
+      ['报告', '`VmState::Running`（出发状态）。'],
+    ], code: 'rs §2 Machine::pause' } },
+    RS: { x: 650, y: 330, t: 'Moving(Resuming)', s: '服务 → 设备 → CPU', k: 'busy', info: { rows: [
+      ['操作', '`PausedMachine::resume(&RunAuthority)`。'],
+      ['前提', '借用运行权：Standby 时、交出之后，在类型上都无法 Resume。'],
+      ['落点', 'Running；`Failed`（vCPU 未应答，或内存服务没能证明 resume 安全）。'],
+    ], code: 'rs §2 PausedMachine::resume' } },
+    PA: { x: 560, y: 520, t: 'Exec::Paused', s: 'PausedMachine', k: 'stable', info: { rows: [
+      ['持有', '`PausedMachine` 与 `export: Option<CutExport>`。'],
+      ['切面', '已暂停 ≠ 可捕获：`cut()` 要求全部应答为 Replied，且没有在途或卡住的作用域变更，否则 `NotCuttable`。'],
+      ['接受', 'Resume、SaveSnapshot、HandoverState；Pause 幂等回复 Ok；ResizeMemory 拒绝（`NotRunning`）。'],
+    ], code: 'rs §2 Cut · §5 Exec::Paused' } },
+    CA: { x: 760, y: 520, t: 'Moving(Capturing)', s: '借用 Cut', k: 'busy', info: {
+      d: '捕获借用切面 `Cut`，产出 `MachineSnapshot`（Plan + Topology + 各组件状态，不含 RAM 内容与宿主端点）。落点是带导出会话的 Paused。捕获失败不致命：回复错误，留在 Paused。',
+      code: 'rs §2 Cut::capture · §1 MachineSnapshot' } },
+    DU: { x: 1020, y: 400, t: 'Paused{Dump}', s: '快照落盘', k: 'export', info: {
+      d: '快照落盘：状态 + 各 Object 的内容来源（`ObjectContents`）。可中止；写完或中止都回到 Paused。', code: 'rs §4.1 Dump' } },
+    SC: { x: 1020, y: 520, t: 'Paused{StopCopy}', s: '迁移最后一轮', k: 'export', info: {
+      d: '状态与最后的写集发给对端，等对端就绪后 grant。中止时自动 Resume 回到 Running，因为 guest 本来在运行。',
+      code: 'rs §4.1 StopCopy', go: 'authority' } },
+    HO: { x: 1020, y: 640, t: 'Paused{Handover}', s: '热升级交接', k: 'export', info: {
+      d: '回复 bundle（快照 + memfd + 设备后端 fd）。之后本进程不得对共享 backing 做破坏性操作。',
+      rows: [
+        ['提交', 'CommitHandover → grant。'],
+        ['回滚', 'AbortHandover → 收回 bundle，留在 Paused；新进程在 Standby，没有运行权。'],
+        ['前提', '内存后端为 Shared memfd；否则仍回复 `HandoverUnsupported`。'],
+      ], code: 'rs §4.1 Handover', go: 'authority' } },
+    XS: { x: 560, y: 745, t: '→ Stopping', s: 'TearingDown / Done', k: 'ext', info: {
+      d: '落点为 `Failed` 或 `Stuck`：整机进入 Stopping。Failed 走 TearingDown；Stuck 带着 `PendingCleanup` 直接到 Done。', go: 'overview' } },
+    XR: { x: 1020, y: 745, w: 190, t: '→ Leaving::Releasing', s: '运行权已交出', k: 'ext', info: {
+      d: '进程只做本地释放，然后以 Migrated / Upgraded 退出。', go: 'overview' } },
+  },
+  edges: [
+    E('b_start', 'XA', 'ST', 'req', 'M175 158 L217 158', [[196, 148, 'middle', 'Start']],
+      'Start', '外壳同步 plan + build 成功后，以 `Exec::Moving(Starting)` 装配 Owned。', 'rs §7 Next::Start'),
+    E('b_vacant', 'ST', 'XA', 'fail', 'M220 184 L178 184', [[198, 204, 'middle', 'Vacant']],
+      'Landed::Vacant', '首次 resume 失败，但操作内部已清理干净：回复错误，可重试。', 'rs §3.1 Landed'),
+    E('b_started', 'ST', 'RU', 'done', 'M380 170 L477 170', [[428, 162, 'middle', 'Landed']],
+      'Landed::Running', '回复 Start Ok。所有迁移共用 `Landed` 一个完成类型：控制器只需把落点装回 Exec，不再有“(状态, 完成) 交叉匹配 + unreachable!”。', 'rs §3.1 Landed'),
+    E('b_st_stuck', 'ST', 'XS', 'fail', 'M270 197 C 230 450, 300 745, 477 745', [[258, 470, 'end', 'Stuck']],
+      'Landed::Stuck', '首次 resume 失败后的 teardown 也失败，或 build 失败后的清理等待超时：资源可能仍被持有，不能重试。', 'rs §3.1 Landed'),
+    E('b_pause', 'RU', 'PG', 'req', 'M540 197 L490 300', [[505, 252, 'end', 'Pause']],
+      'Pause', '`Launch::Pause`：机器移入操作，Exec 由 `Owned<Vacated>` 占位，直到装回 `Moving(Pausing)`。Moving 期间其它写请求得到 `InProgress`。', 'rs §7 Next::Move'),
+    E('b_paused', 'PG', 'PA', 'done', 'M490 357 L540 490', [[506, 430, 'end', 'Landed']],
+      'Landed::Paused', '回复 Pause Ok。', 'rs §3.1 Landed'),
+    E('b_resume', 'PA', 'RS', 'req', 'M580 490 L630 360', [[614, 430, 'start', 'Resume']],
+      'Resume', '`Launch::Resume`：外壳从 Owned 借 `&RunAuthority` 交给 `resume`。', 'rs §7 Launch'),
+    E('b_resumed', 'RS', 'RU', 'done', 'M640 303 L590 200', [[624, 252, 'start', 'Landed']],
+      'Landed::Running', '回复 Resume Ok。', 'rs §3.1 Landed'),
+    E('b_pg_fail', 'PG', 'XS', 'fail', 'M445 357 C 400 500, 420 690, 485 735', [[410, 610, 'end', 'Failed']],
+      'Landed::Failed', 'CPU 未在期限内应答等，状态未知：`FailedMachine` 只能 teardown。暂停失败不会回到 Running。', 'rs §3.1 Landed'),
+    E('b_rs_fail', 'RS', 'XS', 'fail', 'M660 357 C 670 450, 660 650, 635 718', [[672, 600, 'start', 'Failed']],
+      'Landed::Failed', 'vCPU 未应答，或内存服务没能证明 resume 安全（记为 `unsafe_resume` 事实）。', 'rs §3.1 Landed · §8'),
+    E('b_cpu', 'RU', 'CPU', 'req', 'M530 143 L485 84', [[452, 125, 'end', 'PlugCpu · CpuEjected']],
+      'PlugCpu · CpuEjected', 'PlugCpu 请求，或事实 `CpuEjected`（guest 对该 CPU 执行了 `_EJ0`）。UnplugCpu 本身不在这里：它只是一个信号，见「拓扑」图。', 'rs §7 Launch::{PlugCpu, ReleaseCpu}'),
+    E('b_cpu_back', 'CPU', 'RU', 'done', 'M455 84 L505 143', [],
+      'Landed', '回到原执行状态，Topology 更新为 Present 或 Dormant。线程超时则 `Landed::Failed`（未画出）。', 'rs §3.1 Landed'),
+    E('b_reboot', 'RU', 'RB', 'fact', 'M605 143 L655 84', [[690, 118, 'start', '复位（Reboot 策略）']],
+      '复位 · ResetPolicy::Reboot', '复位事实（`CpuEnded{Reset}` 或 `GuestReset(I8042)`）且策略为 Reboot。策略为 Exit（现状）时改走 Stopping。', 'rs §6 Fact · §7 ResetPolicy'),
+    E('b_reboot_back', 'RB', 'RU', 'done', 'M680 84 L630 143', [],
+      'Landed::Running', '重建完成：新的 Machine，同一个 plan 与 topology。', 'rs §3.1 Landed'),
+    E('b_send', 'RU', 'PC', 'req', 'M640 158 L867 158', [[755, 150, 'middle', 'SendMigration']],
+      'SendMigration', '先取得 `TopologyFreeze`（只在没有在途或卡住的作用域变更时发放）。回复在会话结束时：已交出，或已回到原状态。', 'rs §4.1 · §3.2 Changes::freeze'),
+    E('b_cancel', 'PC', 'RU', 'fail', 'M870 184 L643 184', [[755, 202, 'middle', 'Cancel / 对端失败']],
+      'Cancel / 对端失败', '只丢弃会话与冻结令牌；运行权从未离开，guest 从未停过。', 'rs §4.1'),
+    E('b_conv', 'PC', 'PG', 'done', 'M900 197 C 820 260, 620 250, 540 302', [[800, 268, 'middle', '收敛']],
+      '收敛', '脏页收敛：进入 `Moving(Pausing)`；落地后外壳立即 `cut` → Capturing → Paused{StopCopy}。', 'rs §4'),
+    E('b_cut', 'PA', 'CA', 'req', 'M640 520 L677 520', [[659, 510, 'middle', 'cut']],
+      'cut', '`PausedMachine::cut(&topology, &changes)`：失败则拒绝请求（`NotCuttable`）并说明原因，例如某个设备没应答 quiesce，或有变更未结算。', 'rs §2 Cut'),
+    E('b_dump', 'CA', 'DU', 'done', 'M840 505 L937 415', [], 'SaveSnapshot', 'SaveSnapshot 的捕获结果。', 'rs §4.1 Dump'),
+    E('b_sc', 'CA', 'SC', 'done', 'M840 520 L937 520', [], 'StopCopy', '迁移收敛后的捕获结果。', 'rs §4.1 StopCopy'),
+    E('b_ho', 'CA', 'HO', 'done', 'M840 535 L937 625', [], 'HandoverState', 'HandoverState 的捕获结果：回复 bundle。', 'rs §4.1 Handover'),
+    E('b_dump_done', 'DU', 'PA', 'done', 'M940 392 C 820 380, 680 420, 625 490', [[870, 374, 'middle', '写完 / 中止']],
+      '写完 / 中止', '写完回复 SaveSnapshot Ok；中止或失败回复错误。两种情况都回到 Paused。', 'rs §4.1 Dump'),
+    E('b_sc_abort', 'SC', 'RS', 'fail', 'M940 510 C 880 470, 800 380, 733 345', [[905, 470, 'start', '中止 → Resume']],
+      '中止：先 Resume', '对端失败或 Cancel：中止会话，然后 Resume（guest 本来在运行）。', 'rs §4.1'),
+    E('b_sc_grant', 'SC', 'XR', 'auth', 'M1100 525 C 1150 570, 1150 700, 1112 735', [[1132, 640, 'start', 'grant']],
+      'grant', '对端就绪：`grant` 消耗运行权，进程进入 Releasing。', 'rs §4 grant'),
+    E('b_ho_abort', 'HO', 'PA', 'fail', 'M940 655 C 800 700, 640 650, 600 547', [[860, 690, 'middle', 'AbortHandover']],
+      'AbortHandover', '收回 bundle，留在 Paused；之后的 Resume 仍然合法。', 'rs §6 Request'),
+    E('b_ho_commit', 'HO', 'XR', 'auth', 'M1020 667 L1020 715', [[1028, 694, 'start', 'Commit']],
+      'CommitHandover', '`grant`，回复 `Grant` 数据，由编排者交给新进程。', 'rs §4 grant'),
+  ],
+  note: '`Exec` 只放有界、独占的迁移：Moving 至多一个。作用域变更（virtio-mem 发布、DIMM 物化与回收）不拿走机器，在 `Changes` 里与 Exec 并行，见「拓扑」图。Shutdown 时先中止导出，再等 Moving 落地。',
+});
+DIAGRAMS.push({
+  id: 'topology', tab: '拓扑', title: '拓扑槽位与作用域变更', w: 1160, h: 710,
+  intro: [
+    '`Owned` 里与 `Exec` 并列的两个值：`topology`（资源事实：哪些 CPU、DIMM 存在，各自的地址）和 `changes`（在途的作用域变更）。',
+    'Plan 决定上限（可能的 CPU、DIMM 槽与热插地址范围），Start 之后不变；热插拔只改 Topology。',
+    '“等 guest 弹出”不在两者之中，而是热插控制器的协议状态（粉色点线框）：它不阻塞任何操作，并随平台快照保存。',
+  ],
+  regions: [
+    { id: 'LC', x: 20, y: 20, w: 1120, h: 210, top: true, label: 'CPU 槽 · Topology.cpus: CpuIndex → CpuPresence' },
+    { id: 'LD', x: 20, y: 245, w: 1120, h: 215, top: true, label: 'DIMM 槽 · Topology.dimms: DimmSlot → DimmPresence' },
+    { id: 'LS', x: 20, y: 475, w: 1120, h: 220, top: true, label: '作用域 · Changes { active, stalled, frozen_by }：每个 Scope 至多一个变更' },
+  ],
+  nodes: {
+    c_abs: { x: 120, y: 80, t: 'Absent', s: '从未插入，无 vCPU', k: 'stable', info: {
+      d: 'MADT 列出的可能 CPU，但从未插入：没有 KVM vCPU。键集合由 `CpuPlan.possible` 决定，Start 之后不变。', code: 'rs §1 CpuPresence · CpuPlan' } },
+    c_plug: { x: 380, y: 80, w: 190, t: 'Moving(PluggingCpu)', s: '有界 · Exec 迁移', k: 'busy', info: {
+      d: '新建（或复用 Dormant 的）vCPU fd、配置、起线程——Running 时线程直接运行，在内核 LAPIC 里等 SIPI——然后通知 guest。线程应答超时 → `Landed::Failed`，整机只能 teardown。',
+      code: 'rs §1 CpuEffect::Start', go: 'exec' } },
+    c_pres: { x: 660, y: 80, t: 'Present', s: 'fd + 线程，随机器运行', k: 'stable', info: {
+      d: '有 vCPU fd 与线程，随机器 Running / Paused。guest 是否已 online 由 guest 决定，不在 Topology 里。', code: 'rs §1 CpuPresence::Present' } },
+    c_ej: { x: 920, y: 80, w: 180, t: '弹出已请求', s: '协议位 · Topology 仍是 Present', k: 'proto', info: {
+      d: 'UnplugCpu 只写热插控制器的协议位并发中断，同步完成，不占任何槽。guest 可能永远不弹出：这段等待只是设备里的数据，不阻塞 Pause、快照或 Shutdown。',
+      rows: [['撤回', 'ACPI 没有标准的撤回方式，见 md §9 未决问题 1。']], code: 'rs §1 HostEffect::Signal' } },
+    c_rel: { x: 660, y: 175, w: 200, t: 'Moving(ReleasingCpu)', s: '有界 · 停线程、保留 fd', k: 'busy', info: {
+      d: 'guest 执行 `_EJ0` 之后的 Exec 迁移：停线程、保留 fd。Running 或 Paused 时都可能发生，落地回到原执行状态。', code: 'rs §1 CpuEffect::Stop', go: 'exec' } },
+    c_dorm: { x: 380, y: 175, t: 'Dormant', s: '线程已结束，fd 保留', k: 'stable', info: {
+      d: 'KVM 只有 `KVM_CREATE_VCPU`，没有销毁 vCPU 的接口，所以再次插入时复用这个 fd（Cloud Hypervisor 的 `remove_vcpu` 同样只结束线程）。快照只含 Present 的 CPU。',
+      code: 'rs §1 CpuPresence::Dormant' } },
+
+    d_empty: { x: 120, y: 305, t: 'Empty', s: '槽位空闲', k: 'stable', info: {
+      d: 'DIMM 的地址从 `DimmPlan.range` 切分；空闲空间由已记录的 placement 推导，不另存分配器。', code: 'rs §1 DimmPlan · Dimm' } },
+    d_mat: { x: 380, y: 305, w: 190, t: 'Empty + Change', s: 'MaterializeDimm · 可卡住', k: 'busy', info: {
+      d: '提议已验证但未提交：Topology 仍是 Empty，`Changes` 里有一个 `Scope::Dimm` 变更。它创建 backing、Window 与内存服务，绑定，加入 CPU / DMA 视图——DMA 视图要等消费者确认，可能卡住。',
+      rows: [['回复', '物化结算并通知 guest 之后。']], code: 'rs §1 ScopedEffect::MaterializeDimm · §3.2' } },
+    d_pres: { x: 660, y: 305, t: 'Present(Dimm)', s: 'Window · 服务 · 绑定', k: 'stable', info: {
+      d: '`Dimm { window, object, placement, node, backing }` 是一次可重放的分配结果：恢复与迁移重放它，不重新分配。',
+      rows: [['升级', '只有 `backing = Shared(memfd)` 能在热升级中交接。']], code: 'rs §1 Dimm' } },
+    d_ej: { x: 920, y: 305, w: 180, t: '弹出已请求', s: '协议位 · Topology 仍是 Present', k: 'proto', info: {
+      d: 'UnplugMemory 只是信号：写协议位、发中断，同步完成。guest 可能不弹出。', code: 'rs §1 HostEffect::Signal' } },
+    d_recl: { x: 660, y: 400, w: 200, t: 'Reclaiming + Change', s: 'ReclaimDimm · 可卡住', k: 'busy', info: {
+      d: 'guest 已弹出，逻辑上已拔出；宿主回收进行中或已卡住。资源与地址仍被保留，同一槽不能重新插入，直到回收提交（逻辑拔出与物理回收分开，design.new-mem §10.4）。',
+      rows: [
+        ['回收', '永久关闭 Window 准入、排空租约、解绑、撤销 DMA、归还地址。'],
+        ['卡住', '不能因超时而释放（design.new-mem §11 撤销证据）：变成 StalledChange，凭 OperationId 重试。'],
+        ['冻结中', '导出期间 guest 自行弹出：回收推迟到会话结束，或随状态交给目标端。'],
+      ], code: 'rs §1 DimmPresence::Reclaiming · ScopedEffect::ReclaimDimm' } },
+
+    s_frozen: { x: 120, y: 560, t: '冻结', s: 'TopologyFreeze(session)', k: 'export', info: {
+      d: '导出会话持有 `TopologyFreeze`：期间拒绝宿主侧的新变更（`TopologyFrozen`）。只在没有在途或卡住的变更时发放。', code: 'rs §3.2 Changes::freeze · §4.1' } },
+    s_idle: { x: 360, y: 560, t: '空闲', s: 'Scope 不在 Changes 中', k: 'stable', info: {
+      d: '作用域有三种：`Window`（virtio-mem 发布）、`Dimm`、`Device`（E9）。没有 Cpu 作用域：CPU 集合的变化是 Exec 迁移。', code: 'rs §3.2 Scope' } },
+    s_active: { x: 620, y: 560, w: 190, t: 'Change 进行中', s: 'Stallable<ChangeOutcome>', k: 'busy', info: {
+      d: '`Change { id, proposal, reply, work }`。它不持有 Machine，只持有本作用域的能力，所以机器可以同时暂停或 teardown。',
+      rows: [
+        ['并行', '不同作用域互不阻塞；现在的 `Busy::Resizing` 会拒绝一切写请求。'],
+        ['同域', '新请求得到 `ScopeBusy`。'],
+        ['关机', '与 teardown 并行推进（`Leaving::TearingDown`），回复不丢。'],
+      ], code: 'rs §3.2 Change' } },
+    s_stall: { x: 880, y: 640, w: 180, t: 'StalledChange', s: '持有资源 · 可重试', k: 'stall', info: {
+      d: '补偿不完整：保留全部未证实可释放的资源，作用域保持占用。不能用超时、free 或 drop 抹掉它。',
+      rows: [
+        ['重试', '`retry(OperationId)`，现有 `WindowControl::retry` 的推广。'],
+        ['切面', '存在卡住的变更时 `cut()` 失败：不能快照或迁移。'],
+      ], code: 'rs §3.2 StalledChange' } },
+    s_fatal: { x: 1060, y: 560, w: 150, t: 'Fatal', s: '→ Held / Stopping', k: 'term', info: {
+      d: 'guest 已接受的 CPU 可见映射或内容无法恢复，继续运行会破坏正确性：按 `FaultPolicy` 进入 Held 或 Stopping。',
+      code: 'rs §3.2 ChangeOutcome::Fatal', go: 'overview' } },
+  },
+  edges: [
+    E('c1', 'c_abs', 'c_plug', 'req', 'M200 80 L282 80', [[241, 72, 'middle', 'PlugCpu']],
+      'PlugCpu', '`Topology::propose` 校验槽位与协议状态后给出提议，外壳构造 `Launch::PlugCpu`。回复在落地时。', 'rs §1 Topology::propose · §7 Launch'),
+    E('c2', 'c_plug', 'c_pres', 'done', 'M475 80 L577 80', [[526, 72, 'middle', 'Landed']],
+      'Landed', 'Topology 提交为 Present。', 'rs §3.1'),
+    E('c3', 'c_pres', 'c_ej', 'req', 'M740 80 L827 80', [[783, 72, 'middle', 'UnplugCpu']],
+      'UnplugCpu（信号）', '`HostEffect::Signal`：同步完成，立即回复。', 'rs §1 HostEffect'),
+    E('c4', 'c_ej', 'c_rel', 'fact', 'M890 107 L763 162', [[840, 150, 'start', '_EJ0']],
+      '_EJ0', '事实 `GuestHotplug::CpuEjected`：触发 `Launch::ReleaseCpu`，没有回复者。', 'rs §1 GuestHotplug · §6 Fact'),
+    E('c5', 'c_pres', 'c_rel', 'fact', 'M660 107 L660 145', [[668, 131, 'start', 'guest 自行 _EJ0']],
+      'guest 自行弹出', 'guest 可以不经宿主请求自行弹出（Linux 经 sysfs eject 触发 `_EJ0`），结果相同。', 'rs §1 GuestHotplug'),
+    E('c6', 'c_rel', 'c_dorm', 'done', 'M560 175 L463 175', [[511, 167, 'middle', 'Landed']],
+      'Landed', 'Topology 提交为 Dormant。', 'rs §3.1'),
+    E('c7', 'c_dorm', 'c_plug', 'req', 'M380 148 L380 110', [[388, 133, 'start', 'PlugCpu（复用 fd）']],
+      'PlugCpu（复用 fd）', '再次插入时复用保留的 vCPU fd。', 'rs §1 CpuPresence::Dormant'),
+
+    E('d1', 'd_empty', 'd_mat', 'req', 'M200 305 L282 305', [[241, 297, 'middle', 'PlugMemory']],
+      'PlugMemory', '提议通过后外壳调用 `Machine::begin(MaterializeDimm)`，放进 `Changes`；不占 Exec。冻结中拒绝（`TopologyFrozen`）。', 'rs §7 Next::Change'),
+    E('d2', 'd_mat', 'd_pres', 'done', 'M475 305 L577 305', [[526, 297, 'middle', 'Committed']],
+      'Committed', '提交 `proposal.next`：Topology 记为 Present，回复 PlugMemory。', 'rs §3.2 ChangeOutcome'),
+    E('d3', 'd_mat', 'd_empty', 'fail', 'M350 332 C 320 372, 160 372, 130 334', [[240, 384, 'middle', 'RolledBack']],
+      'RolledBack', '补偿已完成：事实不变，回复错误。', 'rs §3.2 ChangeOutcome'),
+    E('d4', 'd_pres', 'd_ej', 'req', 'M740 305 L827 305', [[783, 297, 'middle', 'Unplug']],
+      'UnplugMemory（信号）', '`HostEffect::Signal`：同步完成，立即回复。', 'rs §1 HostEffect'),
+    E('d5', 'd_ej', 'd_recl', 'fact', 'M890 332 L763 387', [[840, 375, 'start', '_EJ0']],
+      '_EJ0', '事实 `DimmEjected`：Topology 记为 Reclaiming，`ReclaimDimm` 进入 Changes，没有回复者。', 'rs §1 Topology::on_guest'),
+    E('d6', 'd_pres', 'd_recl', 'fact', 'M660 332 L660 370', [[668, 356, 'start', 'guest 自行 _EJ0']],
+      'guest 自行弹出', 'guest 可以不经宿主请求自行弹出，结果相同。', 'rs §1 GuestHotplug'),
+    E('d7', 'd_recl', 'd_empty', 'done', 'M558 405 C 400 432, 140 432, 115 335', [[320, 440, 'middle', 'Committed：撤销 · 解绑 · 归还 grant']],
+      'Committed', '回收提交：地址与 grant 归还，槽位重新可用。', 'rs §3.2'),
+
+    E('s1', 's_idle', 's_active', 'req', 'M440 560 L522 560', [[481, 552, 'middle', 'begin']],
+      'begin', '`begin(&mut machine, effect)` 的同步部分：分配 slot permit、建映射与服务、向设备入队，不等待。同步失败则回复错误，作用域保持空闲。', 'rs §2 Machine::begin'),
+    E('s2', 's_active', 's_idle', 'done', 'M560 587 C 530 627, 450 627, 400 589', [[480, 645, 'middle', 'Committed / RolledBack']],
+      'Committed / RolledBack', 'Committed：提交提议。RolledBack：补偿已完成，事实不变。两者都回复请求方（如果有）。', 'rs §3.2 ChangeOutcome'),
+    E('s3', 's_active', 's_stall', 'fail', 'M700 570 L842 612', [[786, 580, 'start', 'Stalled']],
+      'Stalled', '`ChangeOutcome::Stalled`：资源保留，作用域保持占用。', 'rs §3.2'),
+    E('s4', 's_stall', 's_active', 'req', 'M788 650 C 700 662, 640 640, 630 590', [[690, 680, 'middle', 'retry(OperationId)']],
+      'retry(OperationId)', '凭 OperationId 授权一次重试；之后的失败需要重新授权。', 'rs §3.2 StalledChange'),
+    E('s5', 's_active', 's_fatal', 'fail', 'M717 553 L982 553', [[848, 545, 'middle', 'Fatal']],
+      'Fatal', '`ChangeOutcome::Fatal`：交给故障策略。', 'rs §3.2 · §7 FaultPolicy'),
+    E('s6', 's_idle', 's_frozen', 'req', 'M280 548 L203 548', [[241, 540, 'middle', 'freeze']],
+      'freeze(session)', '`Changes::freeze(session)`：要求 active 与 stalled 都为空。', 'rs §3.2 Changes::freeze'),
+    E('s7', 's_frozen', 's_idle', 'done', 'M200 572 L277 572', [[239, 592, 'middle', '会话结束']],
+      '会话结束', '交出、中止或写完时释放令牌；冻结期间推迟的回收从这里开始。', 'rs §4.1 TopologyFreeze'),
+  ],
+  note: '紫色请求里，PlugCpu / ReleasingCpu 走 Exec 迁移（有界、独占）；PlugMemory 与 DIMM 回收走 `Changes`（可卡住、按作用域并行）。virtio-mem 的 ResizeMemory 只占 `Scope::Window`，不改 Topology：requested_size 归设备。',
+});
+DIAGRAMS.push({
+  id: 'authority', tab: '运行权', title: '运行权移交：迁移与热升级', w: 1160, h: 680,
+  intro: [
+    '快照、迁移、热升级共用一个骨架：切面（`Cut`）→ 只读导出 →（迁移与升级）交出运行权。',
+    '`RunAuthority` 不可克隆、不可伪造，来源只有三种：冷启动、本地恢复、接受授予。`resume` 借用它，`grant` 消耗它。',
+    '上半是源进程，下半是目标进程（迁移）或新进程（升级）；灰色点线是跨进程传递的数据。',
+  ],
+  regions: [
+    { id: 'SRC', x: 20, y: 20, w: 1120, h: 220, label: '源进程 · 持有 RunAuthority，直到 grant' },
+    { id: 'TGT', x: 20, y: 420, w: 1120, h: 240, top: true, label: '目标进程 / 新进程 · 授予之前没有 RunAuthority' },
+  ],
+  nodes: {
+    S1: { x: 120, y: 110, w: 170, t: 'Owned{Running}', s: '持有运行权', k: 'stable', info: {
+      d: '运行中的机器。迁移从这里直接 SendMigration；热升级先 Pause，再 HandoverState。', code: 'rs §5 Owned' } },
+    S2: { x: 340, y: 110, w: 180, t: 'Running{Precopy}', s: '仅迁移 · 拓扑冻结', k: 'export', info: {
+      d: '`LiveExport::Precopy`：guest 继续运行，内存按轮次发送；期间拓扑冻结，写集汇合 CPU、软件设备与直通设备的写入。',
+      code: 'rs §4.1 Precopy', go: 'exec' } },
+    S3: { x: 570, y: 110, w: 170, t: 'Moving', s: 'Pausing → Capturing', k: 'busy', info: {
+      d: '收敛（迁移）或 HandoverState（升级）：有界的 Pausing，然后对切面 `Cut` 做 Capturing。', code: 'rs §3.1 · §2 Cut', go: 'exec' } },
+    S4: { x: 800, y: 110, w: 190, t: 'Paused{StopCopy}', s: '或 Paused{Handover}', k: 'export', info: {
+      d: '`StopCopy`：状态与最后的写集发给对端，等就绪。`Handover`：回复 bundle（快照 + memfd + 设备后端 fd），等 CommitHandover。',
+      rows: [['可撤回', '授予之前都可以中止并回到原状态：运行权还在本进程。']], code: 'rs §4.1 CutExport', go: 'exec' } },
+    S5: { x: 1030, y: 110, w: 190, t: 'Leaving::Releasing', s: '→ 退出 Migrated / Upgraded', k: 'term', info: {
+      d: '`grant` 之后只做本地释放，不对共享 backing 做破坏性操作。授予发出后确认丢失记为 `GrantDelivery::Unknown`，同样不再运行，由编排者核对对端。',
+      code: 'rs §4 Remnant · §8 ExitReason', go: 'overview' } },
+    T1: { x: 120, y: 520, w: 170, t: 'Guest::Absent', s: '尚无机器', k: 'stable', info: {
+      d: '目标进程刚启动，还没有机器。' } },
+    T2: { x: 340, y: 520, w: 180, t: 'Importing', s: 'Receive | Adopt', k: 'busy', info: { rows: [
+      ['Receive', '先收 Plan + Topology 建 parked 机器，再收内存轮次与最终状态。'],
+      ['Adopt', '接管 memfd 与设备后端 fd，按快照重建 VM：`kvm->mm != current->mm` 时 KVM ioctl 返回 -EIO，VM 与 vCPU fd 不能跨进程使用。'],
+    ], code: 'rs §4.2 Import' } },
+    T3: { x: 570, y: 520, w: 170, t: 'Standby', s: '有机器 · 无运行权', k: 'noauth', info: {
+      d: '机器已就绪，但没有运行权，因此不能 Resume：只能等授予，或被放弃。没有客户端又没有运行权时退出。', code: 'rs §4.2 Standby' } },
+    T4: { x: 800, y: 520, w: 190, t: 'Owned{Paused}', s: 'RunAuthority(Granted)', k: 'stable', info: {
+      d: '`accept(&Standby, Grant)` 校验会话与 epoch 后产生运行权。从这里起才可以 Resume。', code: 'rs §4 accept' } },
+    T5: { x: 1030, y: 520, w: 190, t: 'Owned{Running}', s: '目标端运行 guest', k: 'stable', info: {
+      d: '目标端开始运行 guest。' } },
+    T6: { x: 455, y: 615, w: 230, t: '→ Stopping', s: '本地 teardown · guest 从未在此运行', k: 'term', info: {
+      d: '导入失败、对端或编排者放弃、或 Detached：本地 teardown。目标端从未拥有运行权，guest 从未在此运行，所以不会脑裂。', go: 'overview' } },
+  },
+  edges: [
+    E('d_send', 'S1', 'S2', 'req', 'M205 100 L247 100', [[228, 74, 'middle', 'SendMigration']],
+      'SendMigration', '取得 `TopologyFreeze` 后进入 Precopy。', 'rs §4.1'),
+    E('d_cancel', 'S2', 'S1', 'fail', 'M250 124 L208 124', [[229, 152, 'middle', 'Cancel']],
+      'Cancel / 对端失败', '只丢弃会话，guest 从未停过。', 'rs §4.1'),
+    E('d_conv', 'S2', 'S3', 'done', 'M430 110 L482 110', [[456, 102, 'middle', '收敛']],
+      '收敛', '脏页收敛：进入 Moving(Pausing)，落地后立即 cut → Capturing。', 'rs §4'),
+    E('d_up', 'S1', 'S3', 'req', 'M100 83 C 100 20, 520 20, 560 83', [[575, 50, 'start', 'Pause → HandoverState（升级）']],
+      'Pause → HandoverState', '热升级不需要 precopy：先 Pause，再 HandoverState（要求 Paused 且可 `cut`；内存后端须为 Shared memfd）。', 'rs §6 Request'),
+    E('d_cut', 'S3', 'S4', 'done', 'M655 110 L702 110', [[678, 102, 'middle', 'cut']],
+      'Landed::Paused(_, export)', 'Capturing 落地为带导出会话的 Paused。', 'rs §3.1 Landed'),
+    E('d_grant', 'S4', 'S5', 'auth', 'M895 110 L932 110', [[914, 74, 'middle', 'grant']],
+      'grant(RunAuthority)', '不可逆：消耗运行权，得到 `Grant`（数据）与 `Relinquishment`（证明）。源端必须先停 vCPU 再授予——此时 vCPU 已在 Paused 中停下。', 'rs §4 grant'),
+    E('d_abort', 'S4', 'S1', 'fail', 'M760 137 C 650 200, 250 200, 160 137', [[512, 214, 'middle', '中止：StopCopy → Resume；Handover → 留在 Paused']],
+      '中止', '对端失败、CancelMigration 或 AbortHandover。StopCopy 中止后自动 Resume（guest 本来在运行）；Handover 中止后留在 Paused。目标端处在 Standby，没有运行权，不可能已经运行过。', 'rs §4.1'),
+    E('t_recv', 'T1', 'T2', 'req', 'M205 520 L247 520', [[226, 484, 'middle', 'Receive / Adopt']],
+      'ReceiveMigration / AdoptState', '只在 Absent 接受。', 'rs §6 Request'),
+    E('t_ready', 'T2', 'T3', 'done', 'M430 520 L482 520', [[456, 512, 'middle', '就绪']],
+      '就绪', '机器 parked，等授予。', 'rs §4.2'),
+    E('t_accept', 'T3', 'T4', 'auth', 'M655 520 L702 520', [[678, 484, 'middle', 'AcceptGrant']],
+      'AcceptGrant', '`accept(&Standby, Grant)`：校验 session 与 epoch，拒绝过期或重放的授予消息。', 'rs §4 accept'),
+    E('t_run', 'T4', 'T5', 'req', 'M895 520 L932 520', [[914, 484, 'middle', 'Resume']],
+      'Resume', '借用刚得到的运行权。', 'rs §2 PausedMachine::resume'),
+    E('t_fail', 'T2', 'T6', 'fail', 'M370 547 L415 586', [[384, 582, 'end', '失败']],
+      '导入失败', '本地 teardown。', 'rs §4.2'),
+    E('t_fail2', 'T3', 'T6', 'fail', 'M540 547 L495 586', [[528, 582, 'start', '放弃 / Detached']],
+      '放弃 / Detached', '对端或编排者放弃，或所有客户端离开：本地 teardown。', 'rs §4.2 Standby'),
+    E('m_rounds', 'S2', 'T2', 'msg', 'M340 137 L340 490', [[348, 300, 'start', 'Plan + Topology · 内存轮次']],
+      'Plan + Topology · 内存轮次', '迁移：先发 Plan 与 Topology（目标端据此建 parked 机器），再发内存轮次。', 'rs §4.2 ReceiveStage'),
+    E('m_final', 'S4', 'T2', 'msg', 'M770 137 L385 490', [[500, 400, 'start', '最终状态 / bundle']],
+      '最终状态 / bundle', '迁移：最终状态与最后的写集。升级：bundle（快照 + memfd + 后端 fd），由编排者交给新进程。', 'rs §4.1'),
+    E('m_ready', 'T3', 'S4', 'msg', 'M600 493 L815 140', [[735, 330, 'start', '就绪 / Adopted']],
+      '就绪 / Adopted', '目标端就绪（迁移），或新进程已接管并重建完成（升级）。源端收到之后才 grant。', 'rs §4.1'),
+    E('m_grant', 'S5', 'T4', 'msg', 'M1030 137 L832 490', [[960, 300, 'start', 'Grant { session, epoch }']],
+      'Grant { session, epoch }', '`Grant` 只是数据，本身不是能力；目标端校验之后才产生 `RunAuthority`。此消息若丢失，源端也不会再运行：由编排者核对两端。', 'rs §4 Grant'),
+  ],
+  annos: [
+    [40, 282, 'start', '跨进程时类型无法保证运行权唯一，'],
+    [40, 300, 'start', '只能靠协议：源端先停 vCPU 再授予；'],
+    [40, 318, 'start', '授予一旦发出，即使确认丢失也不再运行。'],
+    [40, 350, 'start', 'KVM fd 不能跨进程：目标端必须重建 VM。'],
+  ],
+  note: '进程内，“交出运行权之后再 Resume”在类型上不可表示：`resume` 需要 `&RunAuthority`，`grant` 消耗它。跨进程时类型无能为力，只能靠协议保证不出现脑裂；按 AGENTS.md，这部分协议在实现前需要先写 TLA+ 规约。',
+});
+function initTheme() {
+  const root = document.documentElement;
+  let saved = null;
+  try { saved = localStorage.getItem('vms-theme'); } catch (_) {}
+  root.dataset.theme = saved || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  $('#theme').addEventListener('click', () => {
+    root.dataset.theme = root.dataset.theme === 'light' ? 'dark' : 'light';
+    try { localStorage.setItem('vms-theme', root.dataset.theme); } catch (_) {}
+  });
+}
+
+function init() {
+  initTheme();
+  $('#tabs').innerHTML = DIAGRAMS.map((d, i) =>
+    `<button role="tab" data-id="${d.id}"><span class="n">${i + 1}</span>${esc(d.tab)}</button>`).join('');
+  $('#tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) openDiagram(b.dataset.id); });
+  const svg = $('#svg');
+  const activate = g => {
+    if (!g) return;
+    if (g.classList.contains('edge')) showEdge(g.dataset.id); else showNode(g.dataset.id);
+  };
+  svg.addEventListener('click', e => {
+    const g = e.target.closest('.node,.edge,.region.hot');
+    if (g) activate(g); else showIntro();
+  });
+  svg.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(e.target.closest('.node,.edge,.region.hot')); }
+  });
+  $('#side').addEventListener('click', e => { const b = e.target.closest('[data-go]'); if (b) openDiagram(b.dataset.go); });
+  addEventListener('hashchange', () => openDiagram(location.hash.slice(1)));
+  openDiagram(location.hash.slice(1));
+}
+
+init();
+</script>
+</body>
+</html>

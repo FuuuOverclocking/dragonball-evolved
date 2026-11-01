@@ -1,0 +1,1383 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vmm-main 主循环的状态迁移</title>
+<style>
+:root{
+  --bg:#0c121c;--grid:rgba(120,160,220,.05);--panel:#121b29;--panel2:#172235;--chip:#1b273b;--line:#25334b;--line2:#34476a;
+  --text:#dce4f0;--muted:#8a98b0;--faint:#5a6982;
+  --stable:#3cc8a8;--busy:#f2b445;--term:#ff7a6b;--req:#b69cff;--done:#6fa8ff;--fail:#ff6b6b;--stop:#ff9a57;
+  --code:#0a0f18;--kw:#c792ea;--str:#c3e88d;--com:#5f7391;--ty:#82aaff;
+  --mono:"JetBrains Mono","Cascadia Code","Fira Code","SFMono-Regular",Menlo,Consolas,monospace;
+  --sans:"Inter","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Microsoft YaHei",system-ui,sans-serif;
+  color-scheme:dark;
+}
+[data-theme=light]{
+  --bg:#f5f2ea;--grid:rgba(80,70,40,.05);--panel:#fffdf7;--panel2:#f4f0e6;--chip:#efe9dc;--line:#ddd5c3;--line2:#c6bba3;
+  --text:#1d2330;--muted:#5f6675;--faint:#9aa0ab;
+  --stable:#0f8a6c;--busy:#b5740a;--term:#c43d2f;--req:#7246c0;--done:#2a5bcc;--fail:#c8312a;--stop:#c45a14;
+  --code:#f7f3e9;--kw:#8a3fb8;--str:#4b7a12;--com:#8b8f99;--ty:#2a5bcc;
+  color-scheme:light;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:60px}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.72 var(--sans);
+  background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:28px 28px}
+h1,h2,h3,h4,p{margin:0}
+p+p{margin-top:8px}
+code,.mono{font-family:var(--mono);font-size:.86em}
+code{background:var(--chip);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+a{color:var(--done);text-decoration:none}a:hover{text-decoration:underline}
+button{font:inherit;color:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--busy);outline-offset:3px}
+.wrap{max-width:1240px;margin:0 auto;padding:0 24px}
+.muted{color:var(--muted)}.small{font-size:12.5px}
+.ref{font:11.5px/1.5 var(--mono);color:var(--muted)}
+
+/* nav */
+nav.top{position:sticky;top:0;z-index:30;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+nav.top .wrap{display:flex;align-items:center;gap:18px;height:50px;overflow-x:auto}
+nav.top .brand{font:700 13px var(--mono);white-space:nowrap;display:flex;align-items:center;gap:8px}
+nav.top .brand i{width:10px;height:10px;border-radius:2px;background:var(--stable);box-shadow:14px 0 0 var(--busy),28px 0 0 var(--stop);margin-right:30px}
+nav.top a{color:var(--muted);font-size:13px;white-space:nowrap}nav.top a:hover{color:var(--text);text-decoration:none}
+.theme{margin-left:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:4px 10px;font-size:12px;white-space:nowrap}
+
+/* hero */
+header.hero{padding:54px 0 18px}
+.kicker{font:700 12px var(--mono);letter-spacing:.14em;color:var(--stable);text-transform:uppercase}
+.hero h1{font-size:clamp(28px,4vw,44px);line-height:1.22;margin:12px 0 14px;letter-spacing:-.02em}
+.hero h1 em{font-style:normal;color:var(--busy)}
+.hero .lead{color:var(--muted);max-width:860px}
+.files{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+.files span{font:12px var(--mono);border:1px solid var(--line);padding:3px 10px;border-radius:999px;color:var(--muted);background:var(--panel)}
+.takeaways{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:28px}
+.takeaways div{background:var(--panel);border:1px solid var(--line);border-top:3px solid var(--c,var(--stable));padding:13px 15px;border-radius:10px;font-size:13.5px}
+.takeaways b{display:block;font-size:14px;margin-bottom:4px}
+
+/* sections */
+section.sec{padding:46px 0 6px}
+.sec-head{display:flex;gap:14px;align-items:baseline;margin-bottom:8px}
+.sec-head .num{font:700 14px var(--mono);color:var(--busy)}
+.sec-head h2{font-size:24px;letter-spacing:-.01em}
+.sec .lead{color:var(--muted);max-width:880px;margin:0 0 20px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card h3{font-size:15px;margin-bottom:8px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+pre.code{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:auto;font:12.3px/1.6 var(--mono);margin:12px 0 0;tab-size:4;color:var(--text)}
+.tok-c{color:var(--com);font-style:italic}.tok-s{color:var(--str)}.tok-k{color:var(--kw)}.tok-t{color:var(--ty)}.tok-m{color:var(--busy)}
+.tag{display:inline-block;font:600 11px var(--mono);padding:1px 7px;border-radius:5px;border:1px solid currentColor;line-height:1.6;white-space:nowrap}
+.t-stable{color:var(--stable)}.t-busy{color:var(--busy)}.t-term{color:var(--term)}.t-req{color:var(--req)}.t-done{color:var(--done)}.t-fail{color:var(--fail)}.t-stop{color:var(--stop)}
+ul.tight{margin:6px 0 0;padding-left:18px}ul.tight li+li{margin-top:3px}
+
+/* 01 entry */
+.flow{display:grid;grid-template-columns:1fr 210px 1fr;align-items:stretch}
+.lane-tag{display:inline-block;font:700 11px var(--mono);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
+ol.steps{margin:4px 0 10px;padding-left:20px}ol.steps li+li{margin-top:4px}
+.pipe{display:flex;flex-direction:column;justify-content:center;gap:14px;padding:0 10px}
+.pipe-line{position:relative;height:2px;background:var(--req);margin:12px 0}
+.pipe-line:after{content:"";position:absolute;right:-2px;top:-5px;border:6px solid transparent;border-left:9px solid var(--req);border-right:0}
+.pipe-line.back{background:var(--stable)}.pipe-line.back:after{right:auto;left:-2px;border-left:0;border-right:9px solid var(--stable)}
+.pipe-line span{position:absolute;left:50%;transform:translateX(-50%);top:-22px;font:11px var(--mono);color:var(--muted);white-space:nowrap}
+.pipe-line.back span{top:6px}
+.pipe-note{font-size:11.5px;color:var(--muted);text-align:center;border:1px dashed var(--line2);border-radius:8px;padding:8px}
+
+/* 02 state */
+ul.tree{list-style:none;margin:0;padding:0;font-size:13.5px}
+ul.tree li{margin:5px 0}
+ul.tree ul{list-style:none;margin:6px 0 0 12px;padding-left:12px;border-left:2px dashed var(--busy)}
+.inv{margin-top:12px;padding:9px 11px;border-radius:8px;background:color-mix(in srgb,var(--stable) 12%,transparent);font-size:13px}
+.vmstate{display:flex;flex-wrap:wrap;gap:12px 28px;margin:6px 0 8px}
+.vmstate div{display:flex;align-items:center;gap:6px}
+.vmstate b{font:600 13px var(--mono);margin-left:4px}
+
+/* 03 diagram */
+.dia{display:grid;grid-template-columns:minmax(0,1fr) 370px;gap:16px;align-items:start}
+.dia-svg{padding:10px}
+.dia-svg svg{width:100%;height:auto;display:block;user-select:none}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;padding:8px 8px 4px;font-size:12px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{display:inline-block;width:22px;height:0;border-top:2px solid}
+.legend i.box{width:16px;height:11px;border:2px solid;border-radius:3px}
+.dia-note{font-size:12.5px;color:var(--muted);padding:6px 8px 4px;border-top:1px dashed var(--line);margin-top:6px}
+svg .node rect{fill:var(--panel2);stroke-width:2}
+svg .node.stable rect{stroke:var(--stable)}
+svg .node.busy rect{stroke:var(--busy);stroke-dasharray:7 4}
+svg .node.term rect{stroke:var(--term)}
+svg .node.end rect{stroke:var(--line2);fill:var(--chip)}
+svg .node{cursor:pointer;transition:opacity .2s}
+svg .node:hover rect,svg .node.sel rect{stroke-width:3}
+svg .node .n-t{font:600 14px var(--mono);fill:var(--text);text-anchor:middle}
+svg .node .n-s{font:11px var(--mono);fill:var(--muted);text-anchor:middle}
+svg .node.cur rect{fill:color-mix(in srgb,var(--busy) 22%,var(--panel2));stroke-width:3.5}
+svg .edge{cursor:pointer;transition:opacity .2s}
+svg .edge .line{fill:none;stroke-width:1.8}
+svg .edge .hit{fill:none;stroke:transparent;stroke-width:14}
+svg .edge.req .line{stroke:var(--req)}svg .edge.done .line{stroke:var(--done)}
+svg .edge.fail .line{stroke:var(--fail)}svg .edge.stop .line{stroke:var(--stop);stroke-dasharray:6 5}
+svg .edge:hover .line,svg .edge.sel .line{stroke-width:3.2}
+svg .elabel{font:11.5px var(--mono);paint-order:stroke;stroke:var(--panel);stroke-width:5px;stroke-linejoin:round}
+svg .edge.req .elabel{fill:var(--req)}svg .edge.done .elabel{fill:var(--done)}svg .edge.fail .elabel{fill:var(--fail)}svg .edge.stop .elabel{fill:var(--stop)}
+svg .m-req{fill:var(--req)}svg .m-done{fill:var(--done)}svg .m-fail{fill:var(--fail)}svg .m-stop{fill:var(--stop)}
+svg.focus .node:not(.hl){opacity:.25}
+svg.focus .edge:not(.hl){opacity:.12}
+svg.focus .edge.hl .line{stroke-width:3.2}
+
+.side{position:sticky;top:64px;max-height:calc(100vh - 80px);display:flex;flex-direction:column;padding:0;overflow:hidden}
+.side-tabs{display:flex;border-bottom:1px solid var(--line)}
+.side-tabs button{flex:1;background:none;border:0;padding:11px 8px;font-size:13px;color:var(--muted);border-bottom:2px solid transparent}
+.side-tabs button[aria-selected=true]{color:var(--text);border-bottom-color:var(--busy);font-weight:600}
+.side-body{padding:14px 16px 16px;overflow:auto}
+.side-body h4{font:600 13.5px var(--mono);margin-bottom:10px;overflow-wrap:anywhere}
+dl.kv{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;margin:0;font-size:13px}
+dl.kv dt{color:var(--muted);font-size:12px;padding-top:1px}dl.kv dd{margin:0}
+.hint{color:var(--muted);font-size:13px}
+.scn-pick{width:100%;padding:7px 9px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:13px}
+.scn-nav{display:flex;align-items:center;gap:8px;margin:10px 0}
+.scn-nav button{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:4px 12px;font-size:13px}
+.scn-nav button:disabled{opacity:.35;cursor:default}
+.scn-nav .pos{font:12px var(--mono);color:var(--muted);margin-left:auto}
+.scn-dots{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px}
+.scn-dots button{width:22px;height:6px;border-radius:3px;border:0;background:var(--line);padding:0}
+.scn-dots button.on{background:var(--busy)}.scn-dots button.past{background:var(--line2)}
+.vars{display:grid;grid-template-columns:70px 1fr;gap:4px 8px;font-size:12.5px;background:var(--code);border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin-bottom:10px}
+.vars dt{color:var(--muted);font:11.5px var(--mono);padding-top:2px}.vars dd{margin:0;font-family:var(--mono);overflow-wrap:anywhere}
+.vars dd.chg{color:var(--busy)}
+.loopchip{display:inline-block;font:600 11.5px var(--mono);color:var(--done);background:none;border:1px solid var(--done);border-radius:5px;padding:0 7px;margin-bottom:8px;cursor:pointer}
+.loopchip:disabled{cursor:default;opacity:.8}
+.scn-text{font-size:13.5px}
+.scn-warn{border-left:3px solid var(--fail);padding-left:9px}
+
+/* 04 round */
+ol.round{list-style:none;margin:0;padding:0;counter-reset:none;position:relative}
+ol.round:before{content:"";position:absolute;left:19px;top:14px;bottom:14px;width:2px;background:linear-gradient(var(--stable),var(--busy),var(--stop))}
+ol.round>li{position:relative;margin-bottom:10px;padding-left:46px}
+.stp{background:var(--panel);border:1px solid var(--line);border-radius:11px}
+.stp[open]{border-color:var(--line2)}
+.stp summary{list-style:none;display:flex;align-items:center;gap:12px;padding:11px 14px;cursor:pointer}
+.stp summary::-webkit-details-marker{display:none}
+.stp .n{position:absolute;left:4px;top:6px;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;background:var(--bg);border:2px solid var(--busy);font:700 15px var(--sans);color:var(--busy)}
+.stp .ttl{font-weight:600}
+.stp .ref{margin-left:auto;text-align:right}
+.stp.flash{animation:flash 1.2s ease}
+@keyframes flash{0%,40%{box-shadow:0 0 0 3px var(--busy)}100%{box-shadow:0 0 0 0 transparent}}
+.stp-body{padding:2px 16px 16px;font-size:14px}
+table.arms{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+table.arms th,table.arms td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+table.arms th{color:var(--muted);font-weight:600;font-size:12px}
+
+/* 05 matrix */
+.mx-legend{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;font-size:12px}
+.mx-legend span{padding:2px 9px;border-radius:5px}
+.mx-wrap{padding:0;overflow-x:auto}
+table.mx{border-collapse:separate;border-spacing:0;width:100%;min-width:980px;font-size:12px}
+table.mx th,table.mx td{padding:7px 8px;border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
+table.mx thead th{position:sticky;top:0;background:var(--panel);font:600 12px var(--mono);text-align:center}
+table.mx thead th.stable{color:var(--stable)}table.mx thead th.busy{color:var(--busy)}
+table.mx tbody th{text-align:left;white-space:nowrap;font:600 12.5px var(--mono);background:var(--panel)}
+table.mx tbody th small{display:block;font:11px var(--sans);color:var(--muted)}
+table.mx td{text-align:center;cursor:pointer;font-family:var(--mono);line-height:1.35}
+table.mx td:hover{outline:2px solid var(--line2);outline-offset:-2px}
+table.mx td.sel{outline:2px solid var(--busy);outline-offset:-2px}
+.c-o{background:color-mix(in srgb,var(--stable) 16%,transparent);color:var(--stable)}
+.c-e{background:color-mix(in srgb,var(--muted) 10%,transparent);color:var(--muted)}
+.c-g{background:color-mix(in srgb,var(--req) 20%,transparent);color:var(--req);font-weight:700}
+.c-d{background:color-mix(in srgb,var(--done) 18%,transparent);color:var(--done)}
+.c-x{background:color-mix(in srgb,var(--stop) 18%,transparent);color:var(--stop)}
+.c-s{background:color-mix(in srgb,var(--busy) 12%,transparent);color:var(--busy)}
+.c-n{color:var(--faint)}
+.mx-detail{margin-top:12px;font-size:14px}
+.mx-detail h4{font:600 13.5px var(--mono);margin-bottom:6px}
+
+/* 06 exit */
+ol.ladder{margin:4px 0 0;padding:0;list-style:none;counter-reset:l}
+ol.ladder li{counter-increment:l;position:relative;padding:7px 10px 7px 38px;border-radius:8px;margin-bottom:5px;font-size:13px;background:linear-gradient(90deg,color-mix(in srgb,var(--fail) calc(34% - var(--i,0) * 4.5%),transparent),transparent 85%)}
+ol.ladder li:before{content:counter(l);position:absolute;left:10px;top:7px;font:700 13px var(--mono);color:var(--muted)}
+ol.ladder li span{display:block;color:var(--muted);font-size:12px}
+.fold-presets,.fold-btns{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+.fold-presets button,.fold-btns button,.btn{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 10px;font-size:12px}
+.fold-presets button:hover,.fold-btns button:hover,.btn:hover{border-color:var(--busy)}
+.fold-btns button{font-family:var(--mono)}
+.fold-presets button{border-style:dashed}
+.fold-seq{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:34px;padding:6px 8px;border:1px dashed var(--line2);border-radius:8px;font:12px var(--mono)}
+.fold-seq button{background:var(--chip);border:1px solid var(--line);border-radius:6px;padding:2px 8px;font:12px var(--mono)}
+.fold-seq button:hover{border-color:var(--fail);text-decoration:line-through}
+.fold-seq .arrow{color:var(--faint)}
+.fold-td{display:flex;align-items:center;gap:6px;font-size:12.5px;margin:10px 0 4px;color:var(--muted)}
+ol.fold-steps{margin:6px 0;padding-left:20px;font:12px/1.6 var(--mono)}
+ol.fold-steps li{margin:4px 0}
+ol.fold-steps .arm{display:block;color:var(--muted);font-size:11.5px}
+.fold-out{margin-top:8px;padding:10px 12px;border-radius:8px;font:13px var(--mono);overflow-wrap:anywhere}
+.fold-out.ok{background:color-mix(in srgb,var(--stable) 16%,transparent);color:var(--stable)}
+.fold-out.err{background:color-mix(in srgb,var(--fail) 16%,transparent);color:var(--fail)}
+
+/* 07 notes */
+.notes .card p{font-size:14px}
+.notes .card .ref{margin-top:8px}
+.edge-case{margin-top:14px;border-color:color-mix(in srgb,var(--fail) 55%,var(--line));background:linear-gradient(135deg,color-mix(in srgb,var(--fail) 8%,var(--panel)),var(--panel) 60%)}
+.edge-case h3{color:var(--fail)}
+.edge-case p,.edge-case li{font-size:14px}
+.edge-case ol{margin:8px 0}
+.ec-actions{display:flex;gap:8px;margin-top:12px}
+
+@media (max-width:1100px){
+  .dia{grid-template-columns:1fr}
+  .side{position:static;max-height:none}
+}
+@media (max-width:980px){
+  .flow{grid-template-columns:1fr}
+  .pipe{padding:12px 30px}
+  .stp .ref{display:none}
+}
+
+@media (max-width:980px){
+  .takeaways{grid-template-columns:1fr 1fr}
+  .grid2,.grid3{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<nav class="top"><div class="wrap">
+  <span class="brand"><i></i>main_loop</span>
+  <a href="#entry">01 入口</a>
+  <a href="#state">02 状态构成</a>
+  <a href="#diagram">03 状态图</a>
+  <a href="#round">04 一轮循环</a>
+  <a href="#matrix">05 迁移表</a>
+  <a href="#exit">06 退出合并</a>
+  <a href="#notes">07 要点</a>
+  <button class="theme" id="theme">切换明暗</button>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <div class="kicker">Dragonball Evolved · crates/vmm</div>
+  <h1>vmm-main 主循环里的<em>状态迁移</em></h1>
+  <p class="lead">从 <code>crates/vmm/src/lib.rs:41</code> 的 <code>start()</code> 出发：它创建请求通道、启动 <code>vmm-main</code> 线程，在单线程 <code>LocalRuntime</code> 上运行 <code>main_loop::run</code>。主循环每轮等待<b>一个</b>输入，把它交给 <code>controller</code> 中的纯决策函数，再执行返回的 <code>Next</code>。本页逐层拆解这个过程：状态由什么构成、每轮循环做什么、每种输入在每个状态下导致什么、退出原因如何合并。</p>
+  <div class="files">
+    <span>crates/vmm/src/lib.rs</span>
+    <span>crates/vmm/src/main_loop.rs</span>
+    <span>crates/vmm/src/main_loop/controller.rs</span>
+    <span>crates/vmm/src/vmm_server.rs</span>
+    <span>crates/vmm/src/machine/state.rs</span>
+  </div>
+  <div class="takeaways">
+    <div style="--c:var(--stable)"><b>状态是一个值</b><code>Controller</code> 枚举，加上循环里的两个局部变量 <code>server</code> 与 <code>stopping</code>。</div>
+    <div style="--c:var(--done)"><b>决策与执行分离</b><code>controller.rs</code> 消耗旧状态、返回 <code>Next</code>；副作用都在 <code>main_loop.rs</code>。</div>
+    <div style="--c:var(--busy)"><b>一次只等一个输入</b><code>biased select!</code>：事件 ≻ 操作完成 ≻ 请求。</div>
+    <div style="--c:var(--stop)"><b>操作从不被取消</b>Start / Pause / Resume / Resize / teardown 都等它们自己结束；失败的机器只能 teardown。</div>
+  </div>
+</div></header>
+
+<main class="wrap">
+<section class="sec" id="entry">
+  <div class="sec-head"><span class="num">01</span><h2>入口：从 start() 到 serve()</h2></div>
+  <p class="lead">调用方只拿到一个可克隆的 <code>VmmClient</code>；真正的生命周期全部在 <code>vmm-main</code> 线程里，由一个 future 串行推进。</p>
+  <div class="flow">
+    <div class="card lane">
+      <div class="lane-tag t-req">调用方线程</div>
+      <ol class="steps">
+        <li><code>start(ctx)</code> 创建 <code>mpsc::unbounded_channel</code></li>
+        <li>接收端包成 <code>VmmServer::new(rx)</code>，移入新线程</li>
+        <li>返回 <code>VmmClient { tx, JoinHandle }</code></li>
+      </ol>
+      <p class="small muted">客户端用 <code>send / call / call_timeout / call_async</code> 发请求，每个 <code>VmmRequest</code> 自带一次性 <code>reply</code>。<code>join_vmm_thread</code> 取回线程返回的 <code>VmmExitStatus</code>。</p>
+    </div>
+    <div class="pipe">
+      <div class="pipe-line"><span>VmmRequest →</span></div>
+      <div class="pipe-note">所有 <code>VmmClient</code> 被 drop<br>⇒ 通道关闭 ⇒ <code>Inbound::Detached</code>（只报告一次）</div>
+      <div class="pipe-line back"><span>← VmmExitStatus</span></div>
+    </div>
+    <div class="card lane">
+      <div class="lane-tag t-stable">vmm-main 线程</div>
+      <ol class="steps">
+        <li><code>vmm_main</code> 构建 current-thread <code>LocalRuntime</code>（失败 → <code>VmmExitStatus::Error</code>）</li>
+        <li><code>block_on(main_loop::run(server, &amp;ctx))</code></li>
+        <li><code>serve(server, ctx, NotStarted(MachineSpec::default()))</code></li>
+        <li>循环直到某条路径 <code>return VmmExitStatus</code></li>
+      </ol>
+      <p class="small muted">设备 future 也跑在这个 runtime 上，可以是 <code>!Send</code>。<code>Instance { id, version, update_logger }</code> 是回答请求所需的进程信息——除 KVM 之外的一切。</p>
+    </div>
+  </div>
+  <pre class="code" data-code="code-entry"></pre>
+  <p class="ref">crates/vmm/src/lib.rs:41-59 · main_loop.rs:41-52</p>
+</section>
+
+<section class="sec" id="state">
+  <div class="sec-head"><span class="num">02</span><h2>状态由什么构成</h2></div>
+  <p class="lead">"主循环的状态"并不只是 <code>Controller</code>。<code>serve()</code> 里还有两个可变局部变量，它们共同决定下一轮等什么、如何退出。</p>
+  <div class="grid3">
+    <div class="card">
+      <h3><code>controller: Controller&lt;Machine, PausedMachine, FailedMachine&gt;</code></h3>
+      <ul class="tree">
+        <li><span class="tag t-stable">NotStarted</span> <code>(MachineSpec)</code> 配置以不可变值累积</li>
+        <li><span class="tag t-stable">Running</span> <code>(Live&lt;Machine&gt;)</code></li>
+        <li><span class="tag t-stable">Paused</span> <code>(Live&lt;PausedMachine&gt;)</code></li>
+        <li><span class="tag t-busy">Busy</span> 操作进行中，机器被保留到它自己结束
+          <ul>
+            <li><code>Starting(Starting&lt;Machine&gt;)</code></li>
+            <li><code>Pausing(Transition&lt;PausedMachine, FailedMachine, PauseError&gt;)</code></li>
+            <li><code>Resuming(Transition&lt;Machine, FailedMachine, ResumeError&gt;)</code></li>
+            <li><code>Resizing(Resizing&lt;Machine&gt;)</code></li>
+          </ul>
+        </li>
+      </ul>
+      <p class="small muted" style="margin-top:10px"><code>Live&lt;M&gt; = { machine, events }</code>。注意没有 <code>Failed</code> 变体：<code>F</code> 只出现在失败结果里，"带着失败的机器继续服务"在类型上不可表示。</p>
+    </div>
+    <div class="card">
+      <h3><code>server: Option&lt;VmmServer&gt;</code> — 准入</h3>
+      <ul class="tight">
+        <li><b>Some</b>：可以接收请求。</li>
+        <li><b>None</b>：准入关闭。drop 接收端会丢弃队列里尚未出队的请求及其 reply，客户端得到 <code>CallError::NoReply</code>；之后的 <code>send</code> 返回 <code>ServerStopped</code>。</li>
+        <li><code>next_inbound</code> 在 <code>None</code> 时永久 pending，不会让 <code>select!</code> 空转。</li>
+        <li>收到 <code>Detached</code> 后 <code>VmmServer</code> 内部的 <code>rx</code> 变为 <code>None</code>，同样永久 pending，但 <code>server</code> 仍是 <code>Some</code>。</li>
+      </ul>
+      <p class="ref" style="margin-top:8px">vmm_server.rs:11-44 · main_loop.rs:365-370</p>
+    </div>
+    <div class="card">
+      <h3><code>stopping: Option&lt;Exit&gt;</code> — 待执行的退出</h3>
+      <ul class="tight">
+        <li><b>None</b>：正常服务。</li>
+        <li><b>Some(exit)</b>：已决定退出，原因已记录；后续原因只通过 <code>prefer_exit</code> 合并进来，不会被清除。</li>
+        <li>下一轮入口 <code>take()</code> 它：稳定状态立即 teardown 并 <code>return</code>；非 Resize 的 Busy 原样放回，继续等操作完成。</li>
+      </ul>
+      <p class="inv">不变量：<code>stopping.is_some()</code> ⇒ <code>server.is_none()</code>。每个设置 <code>stopping</code> 的位置都同时关闭准入。</p>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <h3><code>GetInstanceInfo</code> 报告的 <code>VmState</code>：操作进行中报告它的出发状态</h3>
+    <div class="vmstate">
+      <div><span class="tag t-stable">NotStarted</span><span class="tag t-busy">Starting</span><b>→ NotStarted</b></div>
+      <div><span class="tag t-stable">Running</span><span class="tag t-busy">Pausing</span><span class="tag t-busy">Resizing</span><b>→ Running</b></div>
+      <div><span class="tag t-stable">Paused</span><span class="tag t-busy">Resuming</span><b>→ Paused</b></div>
+    </div>
+    <p class="ref">controller.rs:276-284</p>
+  </div>
+</section>
+<section class="sec" id="diagram">
+  <div class="sec-head"><span class="num">03</span><h2>状态图</h2></div>
+  <p class="lead">点击节点或连线查看细节；切到「场景演练」可以逐步走完一条真实路径，图中会高亮当前所在位置，侧栏显示三个状态变量和回复的变化。</p>
+  <div class="dia">
+    <div class="card dia-svg">
+      <svg id="svg" viewBox="0 0 1120 715" role="img" aria-label="主循环状态图"></svg>
+      <div class="legend">
+        <span><i class="box" style="border-color:var(--stable)"></i>稳定状态：机器由 controller 持有</span>
+        <span><i class="box" style="border-color:var(--busy);border-style:dashed"></i>Busy：操作进行中，不可取消</span>
+        <span><i class="box" style="border-color:var(--term)"></i>终止路径</span>
+        <span><i style="border-color:var(--req)"></i>请求触发</span>
+        <span><i style="border-color:var(--done)"></i>操作成功完成</span>
+        <span><i style="border-color:var(--fail)"></i>失败</span>
+        <span><i style="border-color:var(--stop);border-top-style:dashed"></i>stopping 后的退出路径</span>
+      </div>
+      <p class="dia-note">图中未画出的全局规则：任意状态收到 <code>Shutdown</code>，或任意有机器的状态收到 <code>GuestReset</code> / <code>VcpuFailed</code>，controller 都返回 <code>Next::Exit</code>——关闭准入、记录 <code>stopping</code>，状态本身不变。稳定状态在下一轮沿橙色虚线退出；Busy 先等自己的操作完成，到达稳定状态（或失败走 Terminate）后再退出。查询类请求在任何状态都原地回答。</p>
+    </div>
+    <aside class="card side">
+      <div class="side-tabs" role="tablist">
+        <button role="tab" id="tab-detail" aria-selected="true">节点 / 连线详情</button>
+        <button role="tab" id="tab-scn" aria-selected="false">场景演练</button>
+      </div>
+      <div class="side-body" id="pane-detail">
+        <p class="hint">点击图中任意节点或连线。</p>
+      </div>
+      <div class="side-body" id="pane-scn" hidden>
+        <select class="scn-pick" id="scn-pick" aria-label="选择场景"></select>
+        <div class="scn-nav">
+          <button id="scn-prev">← 上一步</button><button id="scn-next">下一步 →</button>
+          <span class="pos" id="scn-pos"></span>
+        </div>
+        <div class="scn-dots" id="scn-dots"></div>
+        <dl class="vars" id="scn-vars"></dl>
+        <div id="scn-body"></div>
+        <p class="hint small" style="margin-top:12px">键盘 ← / → 也可以切换步骤。</p>
+      </div>
+    </aside>
+  </div>
+</section>
+<section class="sec" id="round">
+  <div class="sec-head"><span class="num">04</span><h2>一轮循环的八个步骤</h2></div>
+  <p class="lead"><code>serve()</code> 的 <code>loop</code> 体按固定顺序做八件事。只有第 ③ 步会 <code>await</code> 输入；第 ② 和第 ⑧ 步可能直接 <code>return</code> 结束线程。点开每一步查看对应源码。</p>
+  <ol class="round">
+    <li><details class="stp" open>
+      <summary><span class="n">①</span><span class="ttl">入口：检查内存服务是否失效</span><span class="ref">main_loop.rs:54-63, 242-251</span></summary>
+      <div class="stp-body">
+        <p>服务退出可能丢掉热插拔 RAM 仅有的注册，所以每轮等待前都检查<b>真实 owner</b>，不论上一轮是被什么唤醒的。只能检查机器在 operation 之外的状态：<code>Running</code>、<code>Paused</code>、<code>Resizing</code>。<code>Starting / Pausing / Resuming</code> 的机器在 future 里，不能为了检查而取消它，留给第 ④ 步。</p>
+        <p>命中时：<code>server = None</code>，<code>stopping = Some(MemoryServiceFailed(window))</code>。已经在 stopping 时跳过——停止过程中服务退出是预期的。</p>
+        <pre class="code" data-code="code-s1"></pre>
+      </div>
+    </details></li>
+    <li><details class="stp">
+      <summary><span class="n">②</span><span class="ttl">处理待执行的退出</span><span class="ref">main_loop.rs:64-82</span></summary>
+      <div class="stp-body">
+        <p><code>stopping.take()</code> 之后按状态分三种：</p>
+        <ul class="tight">
+          <li><span class="tag t-busy">Resizing</span> → <code>return shutdown_resize(…)</code>。发布可能要等 CPU / 内存服务 teardown 释放卡住的内存才能结束，必须两者并发。</li>
+          <li><span class="tag t-busy">Starting / Pausing / Resuming</span> → 把 <code>stopping</code> 放回，继续本轮。CPU 迁移不可取消。</li>
+          <li><span class="tag t-stable">NotStarted / Running / Paused</span> → <code>return teardown(state, exit)</code>。</li>
+        </ul>
+        <pre class="code" data-code="code-s2"></pre>
+      </div>
+    </details></li>
+    <li><details class="stp">
+      <summary><span class="n">③</span><span class="ttl">等待一个输入</span><span class="ref">main_loop.rs:83, 318-381</span></summary>
+      <div class="stp-body">
+        <p><code>next_input(&amp;mut controller, &amp;mut server)</code> 只<b>借用</b>状态里的 operation：输掉一轮 <code>select!</code> 不会 drop 它。分支按 <code>biased</code> 顺序轮询，事件永远优先——当 reset 和 <code>PauseError::Exited</code> 同时就绪时，先记住 reset，而不是把它当成致命错误。</p>
+        <table class="arms">
+          <thead><tr><th>状态</th><th>分支（优先级从左到右）</th><th>产生的 <code>Input</code></th></tr></thead>
+          <tbody>
+            <tr><td><span class="tag t-stable">NotStarted</span></td><td>请求</td><td><code>Inbound</code></td></tr>
+            <tr><td><span class="tag t-stable">Running</span> <span class="tag t-stable">Paused</span></td><td>事件 → 请求</td><td><code>Event</code> / <code>Inbound</code></td></tr>
+            <tr><td><span class="tag t-busy">Starting</span></td><td>事件 → operation → 请求</td><td>… / <code>Started(Result&lt;Machine, StartError&gt;)</code></td></tr>
+            <tr><td><span class="tag t-busy">Pausing</span></td><td>事件 → operation → 请求</td><td>… / <code>Paused(Result&lt;PausedMachine, (FailedMachine, PauseError)&gt;)</code></td></tr>
+            <tr><td><span class="tag t-busy">Resuming</span></td><td>事件 → operation → 请求</td><td>… / <code>Resumed(Result&lt;Machine, (FailedMachine, ResumeError)&gt;)</code></td></tr>
+            <tr><td><span class="tag t-busy">Resizing</span></td><td>事件 → operation → 请求</td><td>… / <code>Resized(Result&lt;(), MachineResizeError&gt;)</code></td></tr>
+          </tbody>
+        </table>
+        <p class="small muted" style="margin-top:8px"><code>next_event</code> 内部也是 biased：machine 事件（<code>GuestReset</code> / <code>VcpuFailed</code>）先于设备退出；两个源都关闭后永久 pending。<code>next_inbound</code> 在 <code>server</code> 为 <code>None</code> 时永久 pending。</p>
+        <pre class="code" data-code="code-s3"></pre>
+      </div>
+    </details></li>
+    <li><details class="stp">
+      <summary><span class="n">④</span><span class="ttl">输入后再检查内存服务</span><span class="ref">main_loop.rs:84-103</span></summary>
+      <div class="stp-body">
+        <p>一次完成可能把机器"交还"出来：<code>Started(Ok)</code> / <code>Resumed(Ok)</code> 交回 <code>Machine</code>，<code>Paused(Ok)</code> 交回 <code>PausedMachine</code>。在它被装进新状态之前就检查其内存服务；同时也再查一遍当前状态。必须在 reset 等事件把循环带入 stopping <b>之前</b>做，否则服务的正常 Stop 会被误判为丢失 RAM 依赖。</p>
+        <pre class="code" data-code="code-s4"></pre>
+      </div>
+    </details></li>
+    <li><details class="stp">
+      <summary><span class="n">⑤</span><span class="ttl">完成后补收 final-poll 事件</span><span class="ref">main_loop.rs:104-125</span></summary>
+      <div class="stp-body">
+        <p>operation 可能在<b>最后一次 poll</b> 中往事件通道里塞了一个事件——此时事件分支已经被轮询过了。如果不补收，Start 失败时它会随 events 一起被丢掉，或者从完成直接走到 teardown 时被忽略。因此每次收到完成类输入，都用 <code>try_recv</code> 把 machine 事件抽干，合并进 <code>stopping</code> 并关闭准入。</p>
+        <p class="small muted">对应测试：<code>events_queued_in_a_failed_starts_final_poll_are_not_lost</code>（main_loop.rs:759）。</p>
+        <pre class="code" data-code="code-s5"></pre>
+      </div>
+    </details></li>
+    <li><details class="stp">
+      <summary><span class="n">⑥</span><span class="ttl">已在退出时，Start 的 resume 失败也要记入原因</span><span class="ref">main_loop.rs:126-135</span></summary>
+      <div class="stp-body">
+        <p>正常情况下 <code>StartError::Resume</code> 是可重试的：回到 <code>NotStarted(spec)</code>，原因只体现在回复里。但如果已经在 stopping（比如先收到了 reset），回到 NotStarted 后会直接退出，这时 resume 失败本身必须进入退出原因，否则一个良性的 reset 会掩盖致命的 CPU 或内存依赖故障。</p>
+        <pre class="code" data-code="code-s6"></pre>
+      </div>
+    </details></li>
+    <li><details class="stp">
+      <summary><span class="n">⑦</span><span class="ttl">交给 controller 决策</span><span class="ref">main_loop.rs:136-174 · controller.rs</span></summary>
+      <div class="stp-body">
+        <p>按 <code>(状态, 输入)</code> 匹配到 <code>controller</code> 的纯函数：<code>on_inbound</code>（请求 / Detached）、<code>on_event</code>、<code>on_started</code>、<code>on_paused</code>、<code>on_resumed</code>、<code>on_resized</code>。它们按值消耗旧状态，能立刻回答的就地回复，返回 <code>Next</code>。由于 <code>next_input</code> 只 poll 当前状态自己的 operation，其余 (状态, 完成) 组合都是 <code>unreachable!</code>。</p>
+        <p class="small muted">controller 泛型于 <code>R / P / F</code>，测试里用 <code>Running(u32)</code>、<code>Paused(u32)</code>、<code>FakeFailed(u32)</code> 驱动，无需 KVM。</p>
+        <pre class="code" data-code="code-s7"></pre>
+      </div>
+    </details></li>
+    <li><details class="stp">
+      <summary><span class="n">⑧</span><span class="ttl">执行 Next</span><span class="ref">main_loop.rs:175-238</span></summary>
+      <div class="stp-body">
+        <table class="arms">
+          <thead><tr><th><code>Next</code></th><th>外壳做什么</th><th>之后</th></tr></thead>
+          <tbody>
+            <tr><td><code>Stay(state)</code></td><td>无</td><td>继续循环</td></tr>
+            <tr><td><code>Start(spec, reply)</code></td><td><code>start()</code>：在 vmm-main 上同步 plan + build（读 kernel / initrd，构建 parked 机器，guest 尚未运行），再由 <code>on_built</code> 决定状态</td><td><span class="tag t-busy">Starting</span> 或 <span class="tag t-stable">NotStarted</span></td></tr>
+            <tr><td><code>Pause(running, reply)</code></td><td><code>Transition::new(running, reply, |m| m.pause())</code></td><td><span class="tag t-busy">Pausing</span></td></tr>
+            <tr><td><code>Resume(paused, reply)</code></td><td><code>Transition::new(paused, reply, |m| m.resume())</code></td><td><span class="tag t-busy">Resuming</span></td></tr>
+            <tr><td><code>Resize(running, size, reply)</code></td><td>同步 <code>machine.resize_memory(size)</code>；成功得到只等待发布的 future</td><td><span class="tag t-busy">Resizing</span>；同步失败回复 Err 留在 <span class="tag t-stable">Running</span></td></tr>
+            <tr><td><code>Exit(state, exit)</code></td><td><code>server = None</code>；<code>stopping = prefer_exit(stopping, exit)</code></td><td>状态不变，下一轮第 ② 步处理</td></tr>
+            <tr><td><code>Terminate(Live&lt;F&gt;, exit)</code></td><td>关闭准入，合并原因，<code>return poll_teardown(failed.teardown(), events, exit)</code></td><td><span class="tag t-term">终止</span></td></tr>
+            <tr><td><code>StartTeardown { error, events }</code></td><td>关闭准入，原因置为 <code>StartTeardown</code>，补收事件，算出状态，最后才 drop 残留 owner</td><td><span class="tag t-term">终止</span></td></tr>
+          </tbody>
+        </table>
+        <pre class="code" data-code="code-s8"></pre>
+      </div>
+    </details></li>
+  </ol>
+</section>
+<section class="sec" id="matrix">
+  <div class="sec-head"><span class="num">05</span><h2>迁移表：输入 × 状态</h2></div>
+  <p class="lead">每一格是 controller 对 <code>(输入, 状态)</code> 的决定。点击单元格查看说明。拒绝类回复都不改变状态；"退出"类只设置 <code>stopping</code>，实际退出发生在下一轮第 ② 步。</p>
+  <div class="mx-legend">
+    <span class="c-o">回复 Ok，原地停留</span><span class="c-e">拒绝（回复 Err）</span><span class="c-g">进入 Busy</span><span class="c-d">操作完成后的迁移</span><span class="c-x">退出路径</span><span class="c-s">原地停留，无回复 / 仅警告</span><span class="c-n">不可能出现</span>
+  </div>
+  <div class="mx-wrap card"><table class="mx" id="mx"></table></div>
+  <div class="card mx-detail" id="mx-detail"><p class="hint">点击上表任一单元格。</p></div>
+</section>
+
+<section class="sec" id="exit">
+  <div class="sec-head"><span class="num">06</span><h2>退出原因如何合并</h2></div>
+  <p class="lead">进入 stopping 之后仍会有新的原因到来：迟到的 vCPU 故障、操作失败、teardown 期间的事件。<code>prefer_exit(prior, next)</code> 决定保留哪一个；<code>exit_status(exit, teardown)</code> 把最终原因映射为线程返回值。</p>
+  <div class="grid2">
+    <div class="card">
+      <h3>优先级（高 → 低）</h3>
+      <ol class="ladder">
+        <li><code>StartTeardown</code><span>Start 的清理失败：资源可能仍被持有</span></li>
+        <li><code>VcpuFailed</code><span>来自 vCPU 线程的真实故障事件</span></li>
+        <li><code>MemoryServiceFailed</code> · <code>MemoryServiceResumeFailed</code><span>RAM 依赖丢失，或无法证明 resume 安全</span></li>
+        <li><code>TransitionFailed</code><span>CPU 超时、panic 或 join 失败</span></li>
+        <li><code>GuestReset</code> ≻ <code>TransitionExited</code><span>已退出的 CPU 由 reset 事件解释，属正常</span></li>
+        <li><code>TransitionExited</code> ≻ <code>Shutdown</code> · <code>Detached</code><span>没有事件解释的 CPU 退出是错误</span></li>
+        <li><code>Shutdown</code> · <code>Detached</code> · <code>GuestReset</code><span>彼此之间先到者保留</span></li>
+      </ol>
+      <p class="small muted" style="margin-top:10px">前四级中同级相遇时<b>后到者</b>胜出。第 5–7 级不是全序：结果可能依赖到达顺序（见第 07 节的边角）。</p>
+      <h3 style="margin-top:16px">exit_status</h3>
+      <ul class="tight small">
+        <li>teardown 返回 <code>Err</code> → 覆盖一切：<code>Error("tear down the machine: …")</code>。已回复 Ok 的 Shutdown 无法再报告它，只有线程状态能。</li>
+        <li><code>Shutdown / Detached / GuestReset</code> → <code>VmmExitStatus::Ok</code></li>
+        <li>其余 → <code>VmmExitStatus::Error(渲染后的错误链)</code></li>
+      </ul>
+      <p class="ref" style="margin-top:8px">main_loop.rs:383-401 · controller.rs:692-711</p>
+    </div>
+    <div class="card fold">
+      <h3>合并演算</h3>
+      <p class="small muted">依次点击原因，按到达顺序折叠 <code>prefer_exit</code>。点击序列中的项可移除。</p>
+      <div class="fold-presets" id="fold-presets"></div>
+      <div class="fold-btns" id="fold-btns"></div>
+      <div class="fold-seq" id="fold-seq"></div>
+      <label class="fold-td"><input type="checkbox" id="fold-td"> teardown 返回 Err</label>
+      <ol class="fold-steps" id="fold-steps"></ol>
+      <div class="fold-out" id="fold-out"></div>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="notes">
+  <div class="sec-head"><span class="num">07</span><h2>设计要点与一个值得留意的边角</h2></div>
+  <div class="grid2 notes">
+    <div class="card"><h3>操作只被借用，不被取消</h3><p><code>select!</code> 里写的是 <code>&amp;mut operation</code>，输掉一轮不会 drop future。stopping 时非 Resize 的 Busy 原样放回；teardown 的 future 同样会一直 poll 到结束。</p><p class="ref">main_loop.rs:1-3, 74-77, 509-520</p></div>
+    <div class="card"><h3>失败不回到出发状态</h3><p><code>Transition::finish</code> 失败时返回 <code>Live&lt;F&gt;</code>，<code>FailedMachine</code> 只有 <code>teardown()</code>。Controller 里没有能容纳 <code>F</code> 的变体，"失败后继续服务"在类型上不可表示。</p><p class="ref">controller.rs:115-122, 391-406</p></div>
+    <div class="card"><h3>事件先于完成和请求</h3><p>biased select 保证同时就绪时先处理事件；第 ⑤ 步再补收 operation 最后一次 poll 时入队的事件。teardown 期间事件也继续被合并。</p><p class="ref">main_loop.rs:318-363, 104-125, 504-524</p></div>
+    <div class="card"><h3>回复总有着落</h3><p>Busy 状态持有触发它的 <code>reply</code>，在 <code>finish</code> 时回答；<code>shutdown_resize</code> 清理失败时回答 <code>ResizeUnavailable</code>。被丢弃的只有准入关闭时尚未出队的请求，客户端得到 <code>NoReply</code>。</p><p class="ref">controller.rs:352-406 · main_loop.rs:449-457</p></div>
+    <div class="card"><h3>内存服务按 owner 检查，不看任务名</h3><p>设备退出事件只警告（局部故障就地隔离）。是否失去 RAM 依赖由 <code>failed_memory_service()</code> 查询实际持有的服务句柄，在第 ① 和第 ④ 步各查一次。</p><p class="ref">controller.rs:541-547 · main_loop.rs:54-63, 84-103</p></div>
+    <div class="card"><h3>同步构建是唯一的阻塞例外</h3><p><code>start()</code> 在 vmm-main 上读取 kernel / initrd 并构建 parked 机器，此时还没有 guest 代码运行。build 部分失败后的 <code>pending.wait(4s)</code> 放进 Starting 的 operation，而不是同步外壳。</p><p class="ref">main_loop.rs:253-306</p></div>
+  </div>
+  <div class="card edge-case">
+    <h3>值得留意：先到的 Shutdown 会"吸收" reset，使结果依赖到达顺序</h3>
+    <p><code>GuestReset</code> 有两个来源：i8042 设备（vCPU 继续存活），以及 KVM 的 shutdown / system-reset 退出（<code>vcpu.rs:925-928</code>）——后者会让该 vCPU 线程以 <code>Ending::Reset</code> 结束，之后发给它的命令得到 <code>VcpuError::Exited</code>。<code>TransitionExited</code> 的设计意图是"由事件进一步解释"：若同时有 reset，就保留 reset，结果为 Ok。</p>
+    <p>但当 <code>stopping</code> 已经是 <code>Shutdown</code> 时：</p>
+    <ol class="tight">
+      <li>reset 事件到达：<code>prefer_exit(Some(Shutdown), GuestReset)</code> 命中 <code>(Some(prior), _)</code>，保留 <code>Shutdown</code>，reset 这一事实被丢掉；</li>
+      <li>随后 Pausing / Resuming（或 Starting 的首次 resume）因该 CPU 已退出而失败：<code>prefer_exit(Some(Shutdown), TransitionExited)</code> 命中 <code>(_, fallback @ TransitionExited)</code>；</li>
+      <li>最终 <code>VmmExitStatus::Error(…)</code>。若 reset 事件晚于完成才被观察到，则会走 <code>(Some(TransitionExited), GuestReset)</code>，结果是 Ok。</li>
+    </ol>
+    <p class="small muted">这是按代码推导的结论，没有在 KVM 上复现；现有测试 <code>cpu_failure_precedence_distinguishes_exited_from_fatal_errors</code> 只覆盖了"Shutdown + 失败、无 reset"。一种可能的修正是让 <code>GuestReset</code> 在与 <code>Shutdown / Detached</code> 合并时胜出——三者都映射为 Ok，其他结果不受影响。</p>
+    <div class="ec-actions"><button class="btn" id="ec-scn">在状态图中演练</button><button class="btn" id="ec-fold">在合并演算中试试</button></div>
+  </div>
+</section>
+</main>
+
+<footer class="wrap" style="padding:40px 24px 60px;color:var(--faint);font-size:12px">
+  基于 <code>memory</code> 分支 <code>b6bbf3d</code> 的源码整理 · 2026-11-01 · 行号以该提交为准。
+</footer>
+
+<script type="text/plain" id="code-entry">// crates/vmm/src/lib.rs:41-59
+pub fn start(ctx: ProcessCtx) -> Result<VmmClient, StartError> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let server = VmmServer::new(rx);
+    let thread = thread::Builder::new()
+        .name("vmm-main".into())
+        .spawn(move || vmm_main(server, ctx))
+        .map_err(StartError)?;
+    Ok(VmmClient::new(tx, Some(thread)))
+}
+
+fn vmm_main(server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
+    match Builder::new_current_thread()
+        .enable_all()
+        .build_local(LocalOptions::default())
+    {
+        Ok(runtime) => runtime.block_on(main_loop::run(server, &ctx)),
+        Err(error) => VmmExitStatus::Error(error::render_chain(&RuntimeError(error))),
+    }
+}
+
+// crates/vmm/src/main_loop.rs:41-43
+pub(crate) async fn run(server: VmmServer, ctx: &ProcessCtx) -> VmmExitStatus {
+    serve(server, ctx, State::NotStarted(MachineSpec::default())).await
+}</script>
+<script type="text/plain" id="code-s1">// Service exit can drop the only live hotplug RAM registrations. Check
+// actual owners before waiting, regardless of which event woke the loop.
+// During Start/Pause/Resume the future retains its owner; do not cancel
+// it. Check again at loop entry once it returns a usable machine.
+if stopping.is_none()
+    && let Some(window) = failed_memory_service(&controller)
+{
+    server = None;
+    stopping = Some(Exit::MemoryServiceFailed(window));
+}
+
+/// Only stable states and resize keep a machine outside an operation future.
+fn failed_memory_service(state: &State) -> Option<WindowId> {
+    match state {
+        Controller::Running(running) => running.machine.failed_memory_service(),
+        Controller::Paused(paused) => paused.machine.failed_memory_service(),
+        Controller::Busy(Busy::Resizing(resizing)) => resizing.machine.failed_memory_service(),
+        Controller::NotStarted(_)
+        | Controller::Busy(Busy::Starting(_) | Busy::Pausing(_) | Busy::Resuming(_)) => None,
+    }
+}</script>
+<script type="text/plain" id="code-s2">// CPU transitions remain noncancelable. Resize instead needs CPU/service
+// teardown to release stalled memory before publication can settle.
+if let Some(exit) = stopping.take() {
+    controller = match controller {
+        Controller::Busy(Busy::Resizing(resizing)) => {
+            return shutdown_resize(resizing, exit, |machine| {
+                Box::pin(async move { machine.teardown().await.map(drop) })
+            })
+            .await;
+        }
+        busy @ Controller::Busy(_) => {
+            stopping = Some(exit);
+            busy
+        }
+        state @ (Controller::NotStarted(_)
+        | Controller::Running(_)
+        | Controller::Paused(_)) => return teardown(state, exit).await,
+    };
+}</script>
+<script type="text/plain" id="code-s3">// main_loop.rs:83, 318-381（节选）
+let input = next_input(&mut controller, &mut server).await;
+
+/// Events precede completions and requests. In particular a reset is not
+/// reclassified as a fatal PauseError::Exited if both are ready together.
+async fn next_input(state: &mut State, server: &mut Option<VmmServer>) -> Input {
+    match state {
+        Controller::NotStarted(_) => Input::Inbound(next_inbound(server).await),
+        Controller::Running(Live { events, .. }) | Controller::Paused(Live { events, .. }) => {
+            select! {
+                biased;
+                event = next_event(events) => Input::Event(event),
+                inbound = next_inbound(server) => Input::Inbound(inbound),
+            }
+        }
+        Controller::Busy(Busy::Pausing(pausing)) => {
+            select! {
+                biased;
+                event = next_event(&mut pausing.events) => Input::Event(event),
+                result = &mut pausing.operation => Input::Paused(result),
+                inbound = next_inbound(server) => Input::Inbound(inbound),
+            }
+        }
+        // Starting / Resuming / Resizing 同构 ……
+    }
+}
+
+/// Closed streams do not spin or hide the other source. Both recv methods
+/// are cancel-safe; an unready event future can be dropped each select round.
+async fn next_event(events: &mut MachineEvents) -> Event {
+    select! {
+        biased;
+        Some(event) = events.machine.recv() => Event::Machine(event),
+        Some(exit) = events.devices.next() => Event::Device(exit),
+        else => pending().await,
+    }
+}</script>
+<script type="text/plain" id="code-s4">// Also check the concrete owner returned by a transition, before a
+// simultaneous reset starts stopping. Once stopping, service Stop is
+// expected and must not be reclassified as a lost RAM dependency.
+if stopping.is_none()
+    && let Some(window) = failed_memory_service(&controller).or_else(|| match &input {
+        Input::Started(Ok(machine)) | Input::Resumed(Ok(machine)) => {
+            machine.failed_memory_service()
+        }
+        Input::Paused(Ok(machine)) => machine.failed_memory_service(),
+        Input::Inbound(_)
+        | Input::Event(_)
+        | Input::Started(Err(_))
+        | Input::Paused(Err(_))
+        | Input::Resumed(Err(_))
+        | Input::Resized(_) => None,
+    })
+{
+    server = None;
+    stopping = Some(Exit::MemoryServiceFailed(window));
+}</script>
+<script type="text/plain" id="code-s5">// The operation can enqueue an event during its final poll, AFTER
+// the event arm was polled. Consume it before dropping Start's events
+// or moving straight from completion to teardown.
+match &input {
+    Input::Started(_) | Input::Paused(_) | Input::Resumed(_) | Input::Resized(_) => {
+        let events = match &mut controller {
+            Controller::Busy(Busy::Starting(starting)) => &mut starting.events,
+            Controller::Busy(Busy::Pausing(pausing)) => &mut pausing.events,
+            Controller::Busy(Busy::Resuming(resuming)) => &mut resuming.events,
+            Controller::Busy(Busy::Resizing(resizing)) => &mut resizing.events,
+            Controller::NotStarted(_) | Controller::Running(_) | Controller::Paused(_) => {
+                unreachable!("completion while not Busy")
+            }
+        };
+        while let Ok(event) = events.machine.try_recv() {
+            let exit = machine_exit(event);
+            stopping = Some(prefer_exit(stopping.take(), exit));
+            server = None;
+        }
+    }
+    Input::Inbound(_) | Input::Event(_) => {}
+}</script>
+<script type="text/plain" id="code-s6">// Start remains retryable after successful cleanup. If already exiting,
+// however, a reset must not hide a fatal CPU or memory dependency failure.
+if let Input::Started(Err(StartError::Resume(error))) = &input
+    && stopping.is_some()
+{
+    stopping = Some(prefer_exit(
+        stopping.take(),
+        controller::resume_failure(error),
+    ));
+}</script>
+<script type="text/plain" id="code-s7">// main_loop.rs:136-174（节选）
+let next = match (controller, input) {
+    (state, Input::Inbound(inbound)) => controller::on_inbound(state, inbound, instance),
+    (state, Input::Event(event)) => controller::on_event(state, event),
+    (Controller::Busy(Busy::Starting(starting)), Input::Started(result)) => {
+        controller::on_started(starting, result)
+    }
+    (Controller::Busy(Busy::Pausing(pausing)), Input::Paused(result)) => {
+        controller::on_paused(pausing, result)
+    }
+    (Controller::Busy(Busy::Resuming(resuming)), Input::Resumed(result)) => {
+        controller::on_resumed(resuming, result)
+    }
+    (Controller::Busy(Busy::Resizing(resizing)), Input::Resized(result)) => {
+        controller::on_resized(resizing, result)
+    }
+    // next_input only polls the operation belonging to this state.
+    ( /* 其余 (状态, 完成) 组合 */ ) => {
+        unreachable!("completion from a different operation")
+    }
+};</script>
+<script type="text/plain" id="code-s8">// main_loop.rs:175-238（节选，/* */ 处为省略）
+controller = match next {
+    Next::Stay(state) => state,
+    Next::Start(spec, reply) => start(spec, reply, ctx),
+    Next::Pause(running, reply) => {
+        Controller::Busy(Busy::Pausing(Transition::new(running, reply, |machine| {
+            Box::pin(machine.pause())
+        })))
+    }
+    Next::Resume(paused, reply) => { /* 对称：Busy::Resuming + machine.resume() */ }
+    Next::Resize(mut running, size, reply) => match running.machine.resize_memory(size) {
+        Ok(resized) => {
+            let operation = Box::pin(async move { resized.await.map_err(MachineResizeError::from) });
+            Controller::Busy(Busy::Resizing(Resizing::new(running, reply, operation)))
+        }
+        Err(error) => {
+            reply.send(Err(api_error(&error)));
+            Controller::Running(running)
+        }
+    },
+    Next::Terminate(Live { machine, events }, exit) => {
+        // A failed transition cannot enter any serving state.
+        // Close admission before polling its teardown, retaining events.
+        drop(server.take());
+        let exit = prefer_exit(stopping.take(), exit);
+        return poll_teardown(/* machine.teardown() */, events, exit).await;
+    }
+    Next::StartTeardown { error, mut events } => {
+        drop(server.take());
+        let exit = prefer_exit(stopping.take(), Exit::StartTeardown(render_chain(&error)));
+        let exit = drain_machine_events(&mut events, exit);
+        let status = controller::exit_status(exit, Ok(()));
+        // No retry/serving state: release the retained owner by RAII only
+        // at terminal handling. Live tasks still own their VM/bindings.
+        drop(error);
+        return status;
+    }
+    Next::Exit(state, exit) => {
+        // Dropping the receiver closes admission and drops queued replies.
+        server = None;
+        // A fatal event while stopping must not be hidden by Shutdown/reset.
+        stopping = Some(prefer_exit(stopping.take(), exit));
+        state
+    }
+};</script>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// `x` in prose becomes <code>x</code>
+const fmt = s => esc(s).replace(/`([^`]+)`/g, '<code>$1</code>');
+
+const KW = new Set('fn let mut match if else return loop async await move pub crate impl struct enum use mod type while for in break continue self Self as where dyn ref true false'.split(' '));
+function highlight(src) {
+  const re = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:[^"\\]|\\.)*")|([A-Za-z_][A-Za-z0-9_]*!?)/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(src))) {
+    out += esc(src.slice(last, m.index));
+    const [, com, str, word] = m;
+    if (com) out += `<span class="tok-c">${esc(com)}</span>`;
+    else if (str) out += `<span class="tok-s">${esc(str)}</span>`;
+    else if (word.endsWith('!')) out += `<span class="tok-m">${esc(word)}</span>`;
+    else if (KW.has(word)) out += `<span class="tok-k">${word}</span>`;
+    else if (/^[A-Z]/.test(word)) out += `<span class="tok-t">${word}</span>`;
+    else out += word;
+    last = re.lastIndex;
+  }
+  return out + esc(src.slice(last));
+}
+
+function initTheme() {
+  const root = document.documentElement;
+  let saved = null;
+  try { saved = localStorage.getItem('ml-theme'); } catch (_) {}
+  root.dataset.theme = saved || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  $('#theme').addEventListener('click', () => {
+    root.dataset.theme = root.dataset.theme === 'light' ? 'dark' : 'light';
+    try { localStorage.setItem('ml-theme', root.dataset.theme); } catch (_) {}
+  });
+}
+
+function initCode() {
+  $$('pre.code[data-code]').forEach(pre => {
+    pre.innerHTML = highlight(document.getElementById(pre.dataset.code).textContent.replace(/^\n/, ''));
+  });
+}
+
+// opens step i (1-based) of section 04 and scrolls to it
+function gotoRound(i) {
+  const d = $$('ol.round details')[i - 1];
+  if (!d) return;
+  d.open = true;
+  d.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  d.classList.remove('flash'); void d.offsetWidth; d.classList.add('flash');
+}
+const CIRCLED = '①②③④⑤⑥⑦⑧';
+const NODES = {
+  NS: { x: 110, y: 100, t: 'NotStarted', s: 'MachineSpec', k: 'stable' },
+  ST: { x: 360, y: 100, t: 'Busy::Starting', s: '首次 resume', k: 'busy' },
+  RU: { x: 640, y: 100, t: 'Running', s: 'Live<Machine>', k: 'stable' },
+  RZ: { x: 1000, y: 100, t: 'Busy::Resizing', s: '等待发布', k: 'busy' },
+  PG: { x: 520, y: 265, t: 'Busy::Pausing', s: 'machine.pause()', k: 'busy' },
+  RS: { x: 760, y: 265, t: 'Busy::Resuming', s: 'machine.resume()', k: 'busy' },
+  PA: { x: 640, y: 420, t: 'Paused', s: 'Live<PausedMachine>', k: 'stable' },
+  XS: { x: 360, y: 560, t: 'StartTeardown', s: '清理失败 · 直接返回', k: 'term' },
+  TD: { x: 640, y: 560, t: 'poll_teardown', s: 'machine.teardown()', k: 'term' },
+  SR: { x: 1000, y: 560, t: 'shutdown_resize', s: 'teardown ∥ 发布', k: 'term' },
+};
+
+// [id, from, to, kind, path, labels: [x, y, anchor, text]]
+const EDGES = [
+  ['e_cfg', 'NS', 'NS', 'req', 'M88 73 C 74 22, 146 22, 132 73', [[110, 20, 'middle', 'Configure · 同步失败']]],
+  ['e_detach', 'ST', 'ST', 'req', 'M338 73 C 324 22, 396 22, 382 73', [[360, 20, 'middle', 'Detached（仅标记）']]],
+  ['e_start', 'NS', 'ST', 'req', 'M190 100 L277 100', [[234, 92, 'middle', 'Start']]],
+  ['e_started', 'ST', 'RU', 'done', 'M440 100 L557 100', [[499, 92, 'middle', 'Started(Ok)']]],
+  ['e_retry', 'ST', 'NS', 'fail', 'M330 127 C 300 185, 160 185, 124 130', [[228, 194, 'middle', 'Started(Err) 可重试']]],
+  ['e_xs', 'ST', 'XS', 'fail', 'M360 127 L360 530', [[352, 330, 'end', 'Started(Err)'], [352, 346, 'end', '清理失败']]],
+  ['e_pause', 'RU', 'PG', 'req', 'M604 127 L551 236', [[566, 180, 'end', 'Pause']]],
+  ['e_paused', 'PG', 'PA', 'done', 'M550 292 L606 391', [[568, 352, 'end', 'Paused(Ok)']]],
+  ['e_resume', 'PA', 'RS', 'req', 'M673 393 L729 294', [[712, 352, 'start', 'Resume']]],
+  ['e_resumed', 'RS', 'RU', 'done', 'M730 238 L678 129', [[714, 182, 'start', 'Resumed(Ok)']]],
+  ['e_resize', 'RU', 'RZ', 'req', 'M720 86 L917 86', [[819, 78, 'middle', 'ResizeMemory']]],
+  ['e_resized', 'RZ', 'RU', 'done', 'M920 114 L723 114', [[819, 131, 'middle', 'Resized(Ok | Err)']]],
+  ['e_pg_td', 'PG', 'TD', 'fail', 'M480 292 C 450 420, 470 560, 557 556', [[458, 468, 'end', 'Paused(Err)'], [458, 484, 'end', '→ Terminate']]],
+  ['e_rs_td', 'RS', 'TD', 'fail', 'M800 292 C 830 420, 810 545, 723 548', [[796, 472, 'end', 'Resumed(Err)'], [796, 488, 'end', '→ Terminate']]],
+  ['e_ru_td', 'RU', 'TD', 'stop', 'M700 127 C 960 180, 960 500, 723 572', [[908, 300, 'start', 'stopping']]],
+  ['e_pa_td', 'PA', 'TD', 'stop', 'M640 447 L640 530', [[648, 494, 'start', 'stopping']]],
+  ['e_rz_sr', 'RZ', 'SR', 'stop', 'M1000 127 L1000 530', [[1008, 330, 'start', 'stopping']]],
+  ['e_ns_end', 'NS', 'END', 'stop', 'M110 127 L110 645', [[118, 420, 'start', 'stopping'], [118, 436, 'start', '（无机器）']]],
+  ['e_xs_end', 'XS', 'END', 'stop', 'M360 587 L360 645', []],
+  ['e_td_end', 'TD', 'END', 'stop', 'M640 587 L640 645', [[648, 622, 'start', 'exit_status(exit, teardown)']]],
+  ['e_sr_end', 'SR', 'END', 'stop', 'M1000 587 L1000 645', []],
+];
+const EDGE_BY_ID = Object.fromEntries(EDGES.map(e => [e[0], e]));
+
+function renderSvg() {
+  const kinds = ['req', 'done', 'fail', 'stop'];
+  let h = '<defs>' + kinds.map(k =>
+    `<marker id="ar-${k}" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="m-${k}"/></marker>`).join('') + '</defs>';
+  for (const [id, , , k, d, labels] of EDGES) {
+    h += `<g class="edge ${k}" data-id="${id}" tabindex="0" role="button" aria-label="${esc(EDGE_INFO[id].t)}">`
+      + `<path class="hit" d="${d}"/><path class="line" d="${d}" marker-end="url(#ar-${k})"/>`
+      + labels.map(([x, y, a, t]) => `<text class="elabel" x="${x}" y="${y}" text-anchor="${a}">${esc(t)}</text>`).join('')
+      + '</g>';
+  }
+  for (const [id, n] of Object.entries(NODES)) {
+    h += `<g class="node ${n.k}" data-id="${id}" tabindex="0" role="button" aria-label="${esc(n.t)}" transform="translate(${n.x},${n.y})">`
+      + `<rect x="-80" y="-27" width="160" height="54" rx="10"/><text class="n-t" y="-2">${esc(n.t)}</text><text class="n-s" y="16">${esc(n.s)}</text></g>`;
+  }
+  h += '<g class="node end" data-id="END" tabindex="0" role="button" aria-label="return VmmExitStatus">'
+    + '<rect x="30" y="647" width="1060" height="52" rx="10"/><text class="n-t" x="560" y="669">return VmmExitStatus</text>'
+    + '<text class="n-s" x="560" y="688">Ok ⇐ Shutdown / Detached / GuestReset 且 teardown 成功；其余为 Error</text></g>';
+  $('#svg').innerHTML = h;
+}
+
+// nodes/edges to keep bright; sel gets the selection ring; cur marks the scenario position
+function focusGraph(nodes = [], edges = [], sel = null, cur = null) {
+  const svg = $('#svg');
+  svg.classList.toggle('focus', nodes.length + edges.length > 0);
+  $$('.node', svg).forEach(g => {
+    const id = g.dataset.id;
+    g.classList.toggle('hl', nodes.includes(id));
+    g.classList.toggle('sel', id === sel);
+    g.classList.toggle('cur', id === cur);
+  });
+  $$('.edge', svg).forEach(g => {
+    g.classList.toggle('hl', edges.includes(g.dataset.id));
+    g.classList.toggle('sel', g.dataset.id === sel);
+  });
+}
+
+function selectTab(which) {
+  const scn = which === 'scn';
+  $('#tab-detail').setAttribute('aria-selected', String(!scn));
+  $('#tab-scn').setAttribute('aria-selected', String(scn));
+  $('#pane-detail').hidden = scn;
+  $('#pane-scn').hidden = !scn;
+}
+
+function showNode(id) {
+  const info = NODE_INFO[id];
+  const edges = EDGES.filter(e => e[1] === id || e[2] === id);
+  const nodes = [...new Set([id, ...edges.flatMap(e => [e[1], e[2]])])];
+  $('#pane-detail').innerHTML = `<h4>${fmt(info.t)}</h4><dl class="kv">`
+    + info.rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${fmt(v)}</dd>`).join('')
+    + `</dl><p class="ref" style="margin-top:12px">${esc(info.code)}</p>`;
+  focusGraph(nodes, edges.map(e => e[0]), id);
+  selectTab('detail');
+}
+
+function showEdge(id) {
+  const info = EDGE_INFO[id], [, from, to] = EDGE_BY_ID[id];
+  const name = n => n === 'END' ? 'VmmExitStatus' : NODES[n].t;
+  $('#pane-detail').innerHTML = `<h4>${fmt(info.t)}</h4><p class="small muted" style="margin-bottom:8px">${esc(name(from))} → ${esc(name(to))}</p>`
+    + `<div class="scn-text">${fmt(info.d)}</div>${info.code ? `<p class="ref" style="margin-top:12px">${esc(info.code)}</p>` : ''}`;
+  focusGraph([from, to], [id], id);
+  selectTab('detail');
+}
+
+const NODE_INFO = {
+  NS: {
+    t: 'Controller::NotStarted(MachineSpec)',
+    rows: [
+      ['持有', '只有配置值 `MachineSpec`。没有机器，也没有事件流。'],
+      ['报告', '`VmState::NotStarted`'],
+      ['等待', '只等请求（`next_inbound`）；不监听任何事件。'],
+      ['接受', 'Configure：`spec.apply` 返回新 spec 替换旧值；Start；查询类请求。'],
+      ['离开', 'Start → 同步 plan + build → `Busy::Starting`；同步失败留在 NotStarted。Shutdown / Detached → `Next::Exit`，下一轮 `teardown(NotStarted)` 无事可做，直接返回 `exit_status`。'],
+    ],
+    code: 'controller.rs:116-117, 438-457, 505-508 · main_loop.rs:322, 476',
+  },
+  ST: {
+    t: 'Busy::Starting(Starting<Machine>)',
+    rows: [
+      ['持有', '`spec`（失败时放回 NotStarted）、Start 的 `reply`、`events`、`detached` 标记；`operation` 拥有刚构建的 PausedMachine 并执行首次 `resume()`——失败时在 operation 内部先 teardown，再报告错误。'],
+      ['报告', '`VmState::NotStarted`'],
+      ['等待', '事件 → `Started` → 请求'],
+      ['接受', '查询类请求；写请求得到 `InProgress`；Detached 只设置 `detached = true`。'],
+      ['离开', '`Started(Ok)` → Running；`Err(Plan | Build | Resume)` → NotStarted(spec)，detached 时改为 `Exit(Detached)`；`Err(Teardown | BuildCleanup)` → StartTeardown。stopping 时继续等待完成。'],
+    ],
+    code: 'controller.rs:140-150, 336-375, 570-589 · main_loop.rs:253-306',
+  },
+  RU: {
+    t: 'Controller::Running(Live<Machine>)',
+    rows: [
+      ['持有', '`Live { machine, events }`——机器由 controller 直接持有，不在任何 future 中。'],
+      ['报告', '`VmState::Running`'],
+      ['等待', '事件 → 请求'],
+      ['接受', 'Pause → Pausing；ResizeMemory → Resizing；Resume 幂等回复 Ok；Start → `AlreadyStarted`；Configure → `ConfigurationFrozen`。Detached 只警告，guest 继续运行。'],
+      ['离开', '每轮第 ① 步检查 `failed_memory_service()`；stopping 时 `teardown()` → `poll_teardown`。'],
+    ],
+    code: 'controller.rs:118, 458-481 · main_loop.rs:323-329, 477-486',
+  },
+  PG: {
+    t: 'Busy::Pausing(Transition<PausedMachine, FailedMachine, PauseError>)',
+    rows: [
+      ['持有', 'Pause 的 `reply` 与 `events`；机器已移入 `operation = machine.pause()`：先让 vCPU 停下，再 quiesce 设备。'],
+      ['报告', '`VmState::Running`（出发状态）'],
+      ['等待', '事件 → `Paused` → 请求'],
+      ['接受', '查询类请求；写请求得到 `InProgress`。'],
+      ['离开', '`Ok(PausedMachine)` → Paused；`Err((FailedMachine, PauseError))` → `Next::Terminate`，绝不回到 Running。stopping 时继续等待完成。'],
+    ],
+    code: 'controller.rs:127, 152-158, 591-603 · state.rs:745-760',
+  },
+  PA: {
+    t: 'Controller::Paused(Live<PausedMachine>)',
+    rows: [
+      ['持有', '`Live { machine: PausedMachine, events }`：vCPU 已停，设备已 quiesce（就它们的应答而言）。'],
+      ['报告', '`VmState::Paused`'],
+      ['等待', '事件 → 请求'],
+      ['接受', 'Resume → Resuming；Pause 幂等回复 Ok；ResizeMemory → `NotRunning`；Configure → `ConfigurationFrozen`。'],
+      ['离开', '每轮第 ① 步检查内存服务；stopping 时 `teardown()` → `poll_teardown`。'],
+    ],
+    code: 'controller.rs:119, 466-473 · main_loop.rs:487-496',
+  },
+  RS: {
+    t: 'Busy::Resuming(Transition<Machine, FailedMachine, ResumeError>)',
+    rows: [
+      ['持有', 'Resume 的 `reply` 与 `events`；PausedMachine 移入 `machine.resume()`：先恢复存活且已确认的内存服务，再恢复设备，最后恢复 vCPU。'],
+      ['报告', '`VmState::Paused`（出发状态）'],
+      ['等待', '事件 → `Resumed` → 请求'],
+      ['接受', '查询类请求；写请求得到 `InProgress`。'],
+      ['离开', '`Ok(Machine)` → Running；`Err((FailedMachine, ResumeError))` → `Next::Terminate`。`ResumeError::Vcpus` 映射为 TransitionFailed / TransitionExited，`MemoryService*` 映射为 MemoryServiceResumeFailed。'],
+    ],
+    code: 'controller.rs:128, 605-633 · state.rs:901-950',
+  },
+  RZ: {
+    t: 'Busy::Resizing(Resizing<Machine>)',
+    rows: [
+      ['持有', '`machine`（不在 future 中）、`reply`、`events`；`operation` 只等待 virtio-mem 发布新的大小。'],
+      ['报告', '`VmState::Running`'],
+      ['等待', '事件 → `Resized` → 请求'],
+      ['接受', '查询类请求；写请求得到 `InProgress`。'],
+      ['离开', '`Resized(Ok | Err)` → Running，并把结果回复给请求方；stopping 时进入 `shutdown_resize`。因为机器在外面，第 ① 步每轮都能检查内存服务。'],
+    ],
+    code: 'controller.rs:132-138, 287-324, 619-624 · main_loop.rs:188-199',
+  },
+  XS: {
+    t: 'Next::StartTeardown { error, events }',
+    rows: [
+      ['何时', 'Starting 的 operation 报告 `StartError::Teardown` 或 `StartError::BuildCleanup`：清理没能证明自己完成。'],
+      ['做什么', '关闭准入；`exit = prefer_exit(stopping, StartTeardown(…))`；补收 machine 事件；算出 `VmmExitStatus`；最后才 drop 残留的 `PendingCleanup`——RAII 只是请求停止，不当作清理证明。'],
+      ['结果', '直接 `return`，不经过 teardown：已经没有完整的机器可以 teardown，也不允许重试。'],
+    ],
+    code: 'controller.rs:57-72, 577-579 · main_loop.rs:218-230',
+  },
+  TD: {
+    t: 'teardown() → poll_teardown()',
+    rows: [
+      ['入口', 'Running / Paused + stopping（第 ② 步）；Pausing / Resuming 失败后的 `Next::Terminate`（拥有 FailedMachine）。'],
+      ['循环', 'biased select：事件 → teardown future。machine 事件经 `prefer_exit` 合并，迟到的 vCPU 故障不会被 Shutdown 掩盖；设备退出只警告。'],
+      ['结束', 'teardown 完成后再抽干一次事件（同样的 final-poll 竞争），返回 `exit_status(exit, result)`。teardown 同样不可取消。'],
+    ],
+    code: 'main_loop.rs:200-217, 473-524',
+  },
+  SR: {
+    t: 'shutdown_resize()',
+    rows: [
+      ['入口', '`Busy::Resizing` + stopping（第 ② 步）。'],
+      ['为什么', '发布可能要等 CPU / 内存服务的 teardown 释放卡住的内存才能结束。先等 resize 再 teardown 可能永远等不到，所以两者并发 poll。'],
+      ['循环', 'biased：事件 → resize（reply 未发时）→ cleanup（未完成时）。resize 先完成就立刻回复；两者都完成后 break。'],
+      ['清理失败', '再 poll 一次 resize：就绪则回复其结果，否则回复 `ResizeUnavailable`；返回 teardown 错误状态，并保留 owner 直到终止处理。'],
+    ],
+    code: 'main_loop.rs:419-471 · controller.rs:74-77, 301-317',
+  },
+  END: {
+    t: 'return VmmExitStatus',
+    rows: [
+      ['计算', '`exit_status(exit, teardown)`：teardown 为 Err 时覆盖一切 → `Error("tear down the machine: …")`。'],
+      ['Ok', '`Shutdown`、`Detached`、`GuestReset`'],
+      ['Error', '`VcpuFailed`、`MemoryServiceFailed`、`MemoryServiceResumeFailed`、`StartTeardown`、`TransitionFailed`、`TransitionExited`'],
+      ['之后', '`serve` 返回 → `vmm_main` 返回 → 线程结束；`VmmClient::join_vmm_thread` 拿到这个值。'],
+    ],
+    code: 'controller.rs:692-711 · lib.rs:51-59',
+  },
+};
+
+const EDGE_INFO = {
+  e_cfg: { t: 'NotStarted 自环', d: 'Configure：`spec.apply` 成功 → `Stay(NotStarted(新 spec))` 并回复 Ok；失败 → 回复 Err，保留旧 spec。Start 的同步失败（`MachinePlan::new` 失败，或 build 失败且 `BuildCleanup::Unstarted`——没有任务、没有 vCPU 线程）也由 `on_built` 回到 `NotStarted(spec)`，可以立即重试。', code: 'controller.rs:438-445, 553-568 · main_loop.rs:256-282' },
+  e_detach: { t: 'Starting 中收到 Detached', d: '`Stay`，但设置 `detached = true`。若之后 Start 以可重试错误失败，已经没人能再发 Start，于是返回 `Next::Exit(NotStarted(spec), Detached)`。', code: 'controller.rs:509-515, 580-584' },
+  e_start: { t: 'Start', d: '`on_request` 返回 `Next::Start(spec, reply)`。外壳 `start()` 同步执行 plan + build：成功 → `operation` = 首次 resume（失败时先 teardown 再报错）；build 失败但已有任务在跑（`BuildCleanup::Pending`）→ `operation` = `pending.wait(4s)`，事件流用 `closed_events()`。两种情况都进入 `Busy::Starting`。', code: 'controller.rs:451-452 · main_loop.rs:177, 253-316' },
+  e_started: { t: 'Started(Ok)', d: '`Starting::finish` 回复 Ok，`Live { machine, events }` → Running。在这之前，第 ④ 步已检查返回机器的内存服务，第 ⑤ 步已补收 final-poll 事件。', code: 'controller.rs:353-367, 576' },
+  e_retry: { t: 'Started(Err) — 可重试', d: '`StartError::Plan | Build | Resume`：operation 内部已经清理干净。回复 Err，spec 放回 NotStarted；若 `detached` 则 `Next::Exit(NotStarted, Detached)`。若此时已在 stopping，`Resume` 错误会先在第 ⑥ 步经 `resume_failure` 并入退出原因，良性的 reset 不能掩盖致命的 CPU / 内存故障。', code: 'controller.rs:580-587 · main_loop.rs:126-135' },
+  e_xs: { t: 'Started(Err) — 清理失败', d: '`StartError::Teardown` 或 `StartError::BuildCleanup` → `Next::StartTeardown { error, events }`。资源可能仍被持有，不能回到 NotStarted 重试。', code: 'controller.rs:577-579' },
+  e_pause: { t: 'Pause', d: '`Next::Pause(running, reply)`：`Transition::new` 把 `machine` 交给 `machine.pause()`，`events` 留在 Transition 中继续由循环监听。', code: 'controller.rs:462, 377-390 · main_loop.rs:178-182' },
+  e_paused: { t: 'Paused(Ok)', d: '`Transition::finish` 回复 Ok，把新的 PausedMachine 与 events 重新组合成 `Live` → `Stay(Paused)`。', code: 'controller.rs:393-399, 600' },
+  e_resume: { t: 'Resume', d: '`Next::Resume(paused, reply)` → `Transition::new(paused, reply, |m| m.resume())` → `Busy::Resuming`。', code: 'controller.rs:471 · main_loop.rs:183-187' },
+  e_resumed: { t: 'Resumed(Ok)', d: '回复 Ok → `Stay(Running)`。', code: 'controller.rs:605-617' },
+  e_resize: { t: 'ResizeMemory', d: '`Next::Resize(running, size, reply)`：外壳同步调用 `machine.resize_memory(size)` 入队目标。Ok → `Busy::Resizing`，机器留在 `Resizing.machine`；Err → 回复 Err，留在 Running。', code: 'controller.rs:478 · main_loop.rs:188-199' },
+  e_resized: { t: 'Resized', d: '`on_resized` 总是回到 Running；结果（Ok 或 `MachineResizeError`）只影响回复。', code: 'controller.rs:319-334, 619-624' },
+  e_pg_td: { t: 'Paused(Err) → Terminate', d: '`on_paused`：`transition_failure` 把 `VcpuError::Exited` 映射为 `TransitionExited`（等事件来解释），`TimedOut / Panicked / Join` 映射为 `TransitionFailed`。回复 Err，返回 `Next::Terminate(Live<FailedMachine>, exit)`；外壳关闭准入、合并原因、直接 `return poll_teardown(…)`。', code: 'controller.rs:591-603, 635-643 · main_loop.rs:200-217' },
+  e_rs_td: { t: 'Resumed(Err) → Terminate', d: '`on_resumed`：`resume_failure` 区分 vCPU 失败（同上）与内存服务失败（`MemoryServiceResumeFailed`）。其余同 Pause 失败。', code: 'controller.rs:605-633 · main_loop.rs:200-217' },
+  e_ru_td: { t: 'Running + stopping', d: '第 ② 步 `stopping.take()` → `teardown(Running)` → `poll_teardown(machine.teardown(), events, exit)`。', code: 'main_loop.rs:78-80, 477-486' },
+  e_pa_td: { t: 'Paused + stopping', d: '同 Running：`teardown(Paused)` → `poll_teardown`。', code: 'main_loop.rs:78-80, 487-496' },
+  e_rz_sr: { t: 'Resizing + stopping', d: '`shutdown_resize`：`into_shutdown` 拆出 `(machine, events, reply, resize)`，teardown 与发布并发 poll。', code: 'main_loop.rs:68-73, 419-471' },
+  e_ns_end: { t: 'NotStarted + stopping', d: '`teardown(NotStarted)` 无事可做，直接 `exit_status(exit, Ok(()))`。典型情况：Start 之前收到 Shutdown 或 Detached；或 Start 可重试地失败而客户端已全部断开。', code: 'main_loop.rs:476' },
+  e_xs_end: { t: 'StartTeardown → 返回', d: '状态在 drop 残留 owner 之前已经算好，随后 `return status`。', code: 'main_loop.rs:218-230' },
+  e_td_end: { t: 'teardown 完成', d: '抽干剩余事件，`exit_status(exit, result)`：teardown 错误覆盖原有原因。', code: 'main_loop.rs:521-523 · controller.rs:692-711' },
+  e_sr_end: { t: 'shutdown_resize 完成', d: '两者都完成 → `exit_status(exit, Ok(()))`；清理失败 → 先回答 resize，再 `exit_status(exit, Err(error))`。', code: 'main_loop.rs:442-470' },
+};
+// step: n=node, e=edge, loop=round step, ctl/srv/stop/reply carry forward, x=text
+const SCN = [
+  { t: '完整生命周期：配置 → 启动 → 暂停 → 恢复 → 关闭', steps: [
+    { n: 'NS', loop: '入口', ctl: 'NotStarted(MachineSpec::default())', srv: 'Some', stop: 'None', reply: '—', x: '`run()` 以默认 spec 调用 `serve()`。NotStarted 没有机器、没有事件流，`next_input` 只等请求。', code: 'main_loop.rs:41-43, 322' },
+    { n: 'NS', e: 'e_cfg', loop: '⑦ on_request → ⑧ Stay', ctl: 'NotStarted(spec′)', reply: 'SetKernel：Ok', x: '`SetKernel` 被归为 `Request::Configure`。`spec.apply` 返回新值，旧 spec 被替换——配置以不可变值累积。若 apply 失败则回复 Err 并保留原 spec。', code: 'controller.rs:438-445' },
+    { n: 'ST', e: 'e_start', loop: '⑧ Next::Start', ctl: 'Busy::Starting', reply: 'Start：等待中', x: '`on_request` 返回 `Next::Start(spec, reply)`。外壳 `start()` 在 vmm-main 上同步执行 `MachinePlan::new` 与 `build`（读 kernel / initrd，构建 parked 机器，guest 尚未运行），把 `paused.resume()` 包成 operation，交给 `on_built` 构造 `Busy::Starting`。', code: 'main_loop.rs:253-306 · controller.rs:553-568' },
+    { n: 'RU', e: 'e_started', loop: '③ 完成 → ④ → ⑤ → ⑦ on_started', ctl: 'Running(Live { machine, events })', reply: 'Start：Ok', x: 'biased select 中事件分支未就绪、operation 就绪 → `Input::Started(Ok(machine))`。④ 检查这台机器的内存服务；⑤ 用 `try_recv` 补收 operation 最后一次 poll 时入队的事件；`on_started` 回复 Ok 并 `Stay(Running)`。', code: 'main_loop.rs:84-125 · controller.rs:570-576' },
+    { n: 'PG', e: 'e_pause', loop: '⑧ Next::Pause', ctl: 'Busy::Pausing', reply: 'Pause：等待中', x: 'Running 的 `Live` 被拆开：`machine` 移入 `machine.pause()` future，`events` 留在 Transition 里继续由循环监听。此时 GetInstanceInfo 仍报告 Running（出发状态）；写请求得到 `InProgress`。', code: 'controller.rs:377-390, 462 · main_loop.rs:178-182' },
+    { n: 'PA', e: 'e_paused', loop: '③ 完成 → ⑤ → ⑦ on_paused', ctl: 'Paused(Live { paused, events })', reply: 'Pause：Ok', x: '`Input::Paused(Ok(paused))`。`Transition::finish` 回复 Ok，把 events 与新的 PausedMachine 重新组合成 `Live`。', code: 'controller.rs:393-399, 591-603' },
+    { n: 'RS', e: 'e_resume', loop: '⑧ Next::Resume', ctl: 'Busy::Resuming', reply: 'Resume：等待中', x: '对称地，PausedMachine 移入 `machine.resume()`。GetInstanceInfo 报告 Paused。', code: 'controller.rs:471 · main_loop.rs:183-187' },
+    { n: 'RU', e: 'e_resumed', loop: '③ 完成 → ⑦ on_resumed', ctl: 'Running', reply: 'Resume：Ok', x: '`Input::Resumed(Ok(machine))` → `Stay(Running)`。', code: 'controller.rs:605-617' },
+    { n: 'RU', loop: '⑦ on_request → ⑧ Next::Exit', srv: 'None', stop: 'Some(Shutdown)', reply: 'Shutdown：Ok（已接受）', x: 'Shutdown 在任何状态都立即回复 Ok——表示"已接受"，不是"已完成"。`Next::Exit` 让外壳丢弃 `VmmServer`：排队中的请求连同 reply 被丢弃，之后的 `send` 返回 `ServerStopped`；同时记录 `stopping`。状态仍是 Running。', code: 'controller.rs:482-487 · main_loop.rs:231-237' },
+    { n: 'TD', e: 'e_ru_td', loop: '② stopping → teardown', ctl: '（机器移入 teardown future）', stop: '（已取出）', x: '下一轮入口：① 因已在 stopping 而跳过；② `stopping.take()` 得到 Shutdown，状态为 Running → `return teardown(state, exit)` → `poll_teardown`。teardown 期间仍监听事件，迟到的 vCPU 故障会经 `prefer_exit` 覆盖 Shutdown。', code: 'main_loop.rs:66-81, 473-524' },
+    { n: 'END', e: 'e_td_end', loop: '终止', ctl: '—', stop: '—', reply: 'VmmExitStatus::Ok', x: 'teardown 返回 Ok → 抽干剩余事件 → `exit_status(Shutdown, Ok(()))` = `Ok`。`vmm_main` 返回，`VmmClient::join_vmm_thread` 拿到这个状态。', code: 'controller.rs:692-711 · lib.rs:51-59' },
+  ] },
+  { t: 'Pausing 中 guest 通过 i8042 重置', steps: [
+    { n: 'PG', e: 'e_pause', loop: '⑧ Next::Pause', ctl: 'Busy::Pausing', srv: 'Some', stop: 'None', reply: 'Pause：等待中', x: '机器在 `pause()` future 中。对应测试 `guest_reset_during_an_in_flight_pause_on_kvm`：operation 先停在一个受控前奏里，再执行真正的 pause。', code: 'main_loop.rs:839-918' },
+    { n: 'PG', loop: '③ 事件优先 → ⑦ on_event → ⑧ Next::Exit', srv: 'None', stop: 'Some(GuestReset)', x: 'guest 向 i8042 写入 0xfe，设备发送 `MachineEvent::GuestReset`（这条路径下 vCPU 线程仍存活）。biased select 先取事件。`on_event` 返回 `Next::Exit(Pausing, GuestReset)`：关闭准入、记录 stopping，不碰 operation。测试正是通过 `client.send` 开始失败来观察到这一点。', code: 'main_loop.rs:338-345 · controller.rs:533-536 · i8042.rs:160' },
+    { n: 'PG', loop: '② Busy 放回', x: '下一轮入口：`stopping.take()` 后发现是非 Resize 的 Busy，原样放回。`next_input` 中请求分支因 `server = None` 永久 pending，只等事件和 operation。operation 不会被取消。', code: 'main_loop.rs:74-77, 365-370' },
+    { n: 'PA', e: 'e_paused', loop: '③ 完成 → ⑤ → ⑦ on_paused', ctl: 'Paused', reply: 'Pause：Ok', x: 'pause 完成 → `Input::Paused(Ok)`。已在 stopping，④ 不再检查内存服务（停止时服务退出是预期的）。⑤ 补收事件。`on_paused` 回复 Ok 并 `Stay(Paused)`——Pause 的请求方仍然得到了答复。', code: 'main_loop.rs:87, 104-125' },
+    { n: 'TD', e: 'e_pa_td', loop: '② stopping → teardown', ctl: '（机器移入 teardown future）', stop: '（已取出）', x: '入口 `stopping.take()` → Paused → `teardown` → `poll_teardown`。', code: 'main_loop.rs:78-80' },
+    { n: 'END', e: 'e_td_end', loop: '终止', ctl: '—', stop: '—', reply: 'VmmExitStatus::Ok', x: '`exit_status(GuestReset, Ok)` = Ok。若是 KVM 级 reset（vCPU 线程随之结束），pause 会以 `VcpuError::Exited` 失败并走 Terminate，得到 `TransitionExited`；`prefer_exit(Some(GuestReset), TransitionExited)` 保留 GuestReset，结果仍是 Ok。', code: 'main_loop.rs:395' },
+  ] },
+  { t: 'Resume 失败：vCPU 未应答', steps: [
+    { n: 'RS', e: 'e_resume', loop: '⑧ Next::Resume', ctl: 'Busy::Resuming', srv: 'Some', stop: 'None', reply: 'Resume：等待中', x: 'Paused → `Next::Resume` → PausedMachine 移入 `resume()`。它依次恢复内存服务、设备、vCPU。', code: 'state.rs:901-950' },
+    { n: 'RS', loop: '③ 完成 → ⑤ → ⑦ on_resumed', reply: 'Resume：Err', x: '`Input::Resumed(Err((failed, ResumeError::Vcpus(TimedOut(0)))))`。`resume_failure` → `transition_failure` → `Exit::TransitionFailed("resume the vCPUs: vCPU 0 did not answer in time")`。`Transition::finish` 回复 Err，返回 `Live<FailedMachine>`。', code: 'controller.rs:605-643' },
+    { n: 'TD', e: 'e_rs_td', loop: '⑧ Next::Terminate', ctl: '（FailedMachine 移入 teardown）', srv: 'None', stop: '（take 后并入 exit）', x: '失败绝不恢复出发状态：FailedMachine 既不是 Paused 也不是 Running，类型上只能 teardown。外壳 `drop(server.take())` 关闭准入，exit 与 stopping 合并，直接 `return poll_teardown(…)`——不再回到循环。', code: 'main_loop.rs:200-217' },
+    { n: 'END', e: 'e_td_end', loop: '终止', ctl: '—', stop: '—', reply: 'VmmExitStatus::Error(…)', x: 'teardown Ok → `Error("resume the vCPUs: vCPU 0 did not answer in time")`。若 teardown 也失败，则 teardown 错误覆盖原因：`Error("tear down the machine: …")`。若失败原因是内存服务（`MemoryServiceExited / TimedOut`），则为 MemoryServiceResumeFailed。', code: 'controller.rs:692-711' },
+  ] },
+  { t: 'Start 失败与重试', steps: [
+    { n: 'ST', e: 'e_start', loop: '⑧ Next::Start', ctl: 'Busy::Starting', srv: 'Some', stop: 'None', reply: 'Start：等待中', x: 'build 成功，operation = 首次 resume。若 resume 失败，operation 内部先 `failed.teardown().await`（不可取消），再返回错误。', code: 'main_loop.rs:259-276' },
+    { n: 'NS', e: 'e_retry', loop: '③ 完成 → ⑦ on_started', ctl: 'NotStarted(spec)', reply: 'Start：Err', x: '首次 resume 失败但 teardown 成功 → `StartError::Resume`。`on_started` 回复 Err，Starting 保存的 spec 放回 NotStarted——可以调整配置后再次 Start。', code: 'controller.rs:580-587' },
+    { n: 'NS', e: 'e_cfg', loop: '⑧ Next::Start → on_built', reply: 'Start：Err', x: '另一类失败发生在 `start()` 的同步阶段：`MachinePlan::new` 失败，或 build 失败且 `BuildCleanup::Unstarted`（没有任务、没有 vCPU 线程）。`on_built` 直接回复 Err 并返回 `NotStarted(spec)`，根本不进入 Starting。', code: 'main_loop.rs:256-282 · controller.rs:562-566' },
+    { n: 'ST', e: 'e_start', loop: '⑧ Next::Start', ctl: 'Busy::Starting', reply: 'Start：等待中', x: '若 build 失败时已经启动了部分任务，cleanup 为 `Pending`：operation 改为 `pending.wait(4s)`，事件流用 `closed_events()`（两个源都已关闭，`next_event` 永久 pending 而不是空转）。等待成功 → `StartError::Build`，仍可重试。', code: 'main_loop.rs:283-316' },
+    { n: 'XS', e: 'e_xs', loop: '⑦ on_started → ⑧ Next::StartTeardown', ctl: '—', srv: 'None', stop: '（直接计算）', reply: 'Start：Err', x: '若等待超时（`StartError::BuildCleanup`）或首次 resume 后的 teardown 失败（`StartError::Teardown`），资源可能仍被持有，不能重试：关闭准入，exit = `StartTeardown(…)`（最高优先级），补收事件，算出状态，最后才 drop 残留的 owner。', code: 'controller.rs:577-579 · main_loop.rs:218-230' },
+    { n: 'END', e: 'e_xs_end', loop: '终止', stop: '—', reply: 'VmmExitStatus::Error(…)', x: '例如 `Error("tear down the machine after a failed Start: the VM is still held after teardown")`。', code: 'main_loop.rs:800-801' },
+  ] },
+  { t: 'Resizing 中收到 Shutdown', steps: [
+    { n: 'RZ', e: 'e_resize', loop: '⑧ Next::Resize', ctl: 'Busy::Resizing', srv: 'Some', stop: 'None', reply: 'Resize：等待中', x: '外壳同步调用 `running.machine.resize_memory(size)` 入队目标，得到一个只等待发布的 future。与其他 Busy 不同，机器保留在 `Resizing.machine`，不在 future 里。同步失败则回复 Err 并留在 Running。', code: 'main_loop.rs:188-199 · controller.rs:132-138' },
+    { n: 'RZ', loop: '① 入口检查', x: '因为机器在外面，第 ① 步每轮都能检查 `resizing.machine.failed_memory_service()`。', code: 'main_loop.rs:242-251' },
+    { n: 'RZ', loop: '⑦ on_request → ⑧ Next::Exit', srv: 'None', stop: 'Some(Shutdown)', reply: 'Resize：等待中；Shutdown：Ok', x: 'Shutdown 到达：回复 Ok，关闭准入，记录 stopping。' },
+    { n: 'SR', e: 'e_rz_sr', loop: '② stopping → shutdown_resize', ctl: '（拆为 machine / events / reply / resize）', stop: '（已取出）', x: '入口发现 `Busy::Resizing` → `shutdown_resize`。`into_shutdown` 拆出四部分，立即开始 `machine.teardown()`。发布可能要等 CPU / 内存服务 teardown 释放卡住的内存才能结束，所以两者必须并发 poll，而不是先等 resize。', code: 'main_loop.rs:64-73, 419-428' },
+    { n: 'SR', loop: 'shutdown_resize 内部', reply: 'Resize：Ok 或 Err；Shutdown：Ok', x: 'biased select：事件 → resize（reply 未发时）→ cleanup（未完成时）。resize 先完成 → `reply_resized` 回答；cleanup Ok 且 reply 已发 → break。若 cleanup 失败：再 poll 一次 resize，就绪则回复其结果，否则回复 `ResizeUnavailable`。', code: 'main_loop.rs:429-466' },
+    { n: 'END', e: 'e_sr_end', loop: '终止', ctl: '—', stop: '—', reply: 'VmmExitStatus::Ok', x: '抽干事件 → `exit_status(Shutdown, Ok)` = Ok。', code: 'main_loop.rs:469-470' },
+  ] },
+  { t: 'Running 中内存服务失效', steps: [
+    { n: 'RU', ctl: 'Running', srv: 'Some', stop: 'None', reply: '—', loop: '③ 事件 → ⑦ on_event', x: '某个 virtio-mem 窗口的内存服务任务退出。它可能先作为 `Event::Device` 被观察到，但 `on_event` 对设备退出一律 `Stay` 并警告：任务名不能区分"局部设备故障"与"失去 RAM 依赖"。', code: 'controller.rs:541-547' },
+    { n: 'RU', loop: '① 入口检查', srv: 'None', stop: 'Some(MemoryServiceFailed(w))', x: '无论哪个输入唤醒了循环，下一轮第 ① 步都会检查真实 owner：`Running.machine.failed_memory_service()` 返回 `Some(w)`。服务退出可能已丢掉热插拔 RAM 仅有的注册——关闭准入，进入 stopping。', code: 'main_loop.rs:54-63' },
+    { n: 'TD', e: 'e_ru_td', loop: '② stopping → teardown', ctl: '（机器移入 teardown future）', stop: '（已取出）', x: '同一轮紧接着的第 ② 步就取出 stopping 并 teardown。', code: 'main_loop.rs:66-81' },
+    { n: 'END', e: 'e_td_end', loop: '终止', ctl: '—', stop: '—', reply: 'VmmExitStatus::Error(…)', x: '`Error("memory service for window w exited unexpectedly; guest RAM may no longer be CPU-mapped")`。在 Starting / Pausing / Resuming 中机器在 future 里无法检查，于是第 ④ 步在完成时检查 operation 交回的机器。', code: 'controller.rs:84-85 · main_loop.rs:84-103' },
+  ] },
+  { t: 'Starting 中客户端全部断开', steps: [
+    { n: 'ST', e: 'e_detach', loop: '③ 请求分支 → ⑦ on_detached', ctl: 'Busy::Starting { detached: true }', srv: 'Some（rx 已关闭）', stop: 'None', reply: 'Start：等待中', x: '所有 `VmmClient` 被 drop，通道关闭。`VmmServer` 报告一次 `Inbound::Detached`，之后永久 pending（避免 select 空转）。Starting 中收到 Detached 只做标记。', code: 'vmm_server.rs:28-44 · controller.rs:509-515' },
+    { n: 'NS', e: 'e_retry', loop: '③ 完成 → ⑦ on_started → ⑧ Next::Exit', ctl: 'NotStarted(spec)', srv: 'None', stop: 'Some(Detached)', reply: 'Start：Err（已无人接收）', x: 'Start 以可重试错误失败。因为 `detached`，已经没人能再 Start：`on_started` 返回 `Next::Exit(NotStarted(spec), Detached)`。', code: 'controller.rs:580-584' },
+    { n: 'END', e: 'e_ns_end', loop: '② stopping → teardown(NotStarted)', ctl: '—', stop: '—', reply: 'VmmExitStatus::Ok', x: '`teardown(NotStarted)` 直接返回 `exit_status(Detached, Ok)` = Ok。对比：Running / Paused 中收到 Detached 只警告，guest 继续运行，直到 reset 或故障。若 Start 成功，同样进入 Running 并继续运行。', code: 'main_loop.rs:476 · controller.rs:516-521' },
+  ] },
+  { t: '边角：先到的 Shutdown 吸收了 KVM reset', steps: [
+    { n: 'PG', e: 'e_pause', loop: '⑧ Next::Pause', ctl: 'Busy::Pausing', srv: 'Some', stop: 'None', reply: 'Pause：等待中', x: 'Running 中客户端发 Pause，机器进入 `pause()` future。' },
+    { n: 'PG', loop: '⑦ on_request → ⑧ Next::Exit', srv: 'None', stop: 'Some(Shutdown)', reply: 'Pause：等待中；Shutdown：Ok', x: '另一个客户端发 Shutdown：回复 Ok，关闭准入，`stopping = Shutdown`。Pausing 继续。' },
+    { n: 'PG', loop: '③ 事件 → ⑦ on_event → ⑧ Next::Exit', stop: 'Some(Shutdown)', warn: true, x: 'guest 触发 KVM 级 reset / shutdown（`VcpuExit::Shutdown` 或 `SystemEvent(RESET)`）：该 vCPU 线程以 `Ending::Reset` 结束并发送 `GuestReset`。`on_event` 返回 `Next::Exit(GuestReset)`，但 `prefer_exit(Some(Shutdown), GuestReset)` 命中最后的 `(Some(prior), _)`，保留 Shutdown——reset 这个事实没有被记住。', code: 'vcpu.rs:504-509, 925-928 · main_loop.rs:398' },
+    { n: 'TD', e: 'e_pg_td', loop: '③ 完成 → ⑦ on_paused → ⑧ Next::Terminate', ctl: '（FailedMachine 移入 teardown）', stop: '（并入 exit）', reply: 'Pause：Err；Shutdown：Ok', warn: true, x: 'pause 的命令发给已结束的线程，reply 槽随之被丢弃 → `VcpuError::Exited` → `PauseError`。`on_paused` 产生 `TransitionExited`；Terminate 中 `prefer_exit(Some(Shutdown), TransitionExited)` 命中 `(_, fallback @ TransitionExited)`。', code: 'vcpu.rs:436-441 · controller.rs:635-643 · main_loop.rs:397' },
+    { n: 'END', e: 'e_td_end', loop: '终止', ctl: '—', stop: '—', reply: 'VmmExitStatus::Error(…)', warn: true, x: '最终 `Error("pause the vCPUs: vCPU 0 has exited")`，尽管原因是良性的 reset。若没有先到的 Shutdown，stopping 会是 GuestReset，结果为 Ok；若 reset 事件晚于 pause 完成才被观察到，也会得到 Ok。这是对代码的推导，未在 KVM 上复现；现有测试没有覆盖这个顺序。', code: 'main_loop.rs:383-401, 543-581' },
+  ] },
+];
+
+let scnIdx = 0, stepIdx = 0;
+const VAR_KEYS = [['controller', 'ctl'], ['server', 'srv'], ['stopping', 'stop'], ['回复', 'reply']];
+
+function scnVars(si, k) {
+  const cur = { ctl: '', srv: '', stop: '', reply: '' };
+  let prev = { ...cur };
+  SCN[si].steps.slice(0, k + 1).forEach(st => {
+    prev = { ...cur };
+    for (const [, key] of VAR_KEYS) if (st[key] !== undefined) cur[key] = st[key];
+  });
+  return [cur, prev];
+}
+
+function renderStep() {
+  const S = SCN[scnIdx], st = S.steps[stepIdx];
+  const [cur, prev] = scnVars(scnIdx, stepIdx);
+  $('#scn-vars').innerHTML = VAR_KEYS.map(([label, key]) =>
+    `<dt>${label}</dt><dd class="${stepIdx > 0 && cur[key] !== prev[key] ? 'chg' : ''}">${esc(cur[key] || '—')}</dd>`).join('');
+  const digit = st.loop ? [...st.loop].find(c => CIRCLED.includes(c)) : null;
+  const chip = st.loop ? `<button class="loopchip" ${digit ? `data-round="${CIRCLED.indexOf(digit) + 1}" title="跳到第 04 节对应步骤"` : 'disabled'}>${esc(st.loop)}</button>` : '';
+  $('#scn-body').innerHTML = `${chip}<div class="scn-text${st.warn ? ' scn-warn' : ''}">${fmt(st.x || '')}</div>`
+    + (st.code ? `<p class="ref" style="margin-top:8px">${esc(st.code)}</p>` : '');
+  $('#scn-pos').textContent = `${stepIdx + 1} / ${S.steps.length}`;
+  $('#scn-prev').disabled = stepIdx === 0;
+  $('#scn-next').disabled = stepIdx === S.steps.length - 1;
+  $('#scn-dots').innerHTML = S.steps.map((_, i) =>
+    `<button aria-label="第 ${i + 1} 步" data-i="${i}" class="${i === stepIdx ? 'on' : i < stepIdx ? 'past' : ''}"></button>`).join('');
+  const nodes = [st.n];
+  if (st.e) nodes.push(EDGE_BY_ID[st.e][1]);
+  focusGraph(nodes, st.e ? [st.e] : [], null, st.n);
+}
+
+function openScenario(i) {
+  scnIdx = i; stepIdx = 0;
+  $('#scn-pick').value = String(i);
+  selectTab('scn');
+  renderStep();
+}
+
+function initScenarios() {
+  $('#scn-pick').innerHTML = SCN.map((s, i) => `<option value="${i}">${i + 1}. ${esc(s.t)}</option>`).join('');
+  $('#scn-pick').addEventListener('change', e => openScenario(Number(e.target.value)));
+  $('#scn-prev').addEventListener('click', () => { if (stepIdx > 0) { stepIdx--; renderStep(); } });
+  $('#scn-next').addEventListener('click', () => { if (stepIdx < SCN[scnIdx].steps.length - 1) { stepIdx++; renderStep(); } });
+  $('#scn-dots').addEventListener('click', e => { const b = e.target.closest('button[data-i]'); if (b) { stepIdx = Number(b.dataset.i); renderStep(); } });
+  $('#scn-body').addEventListener('click', e => { const b = e.target.closest('[data-round]'); if (b) gotoRound(Number(b.dataset.round)); });
+  document.addEventListener('keydown', e => {
+    if ($('#pane-scn').hidden || e.target.closest('input,select,textarea')) return;
+    if (e.key === 'ArrowRight') $('#scn-next').click();
+    else if (e.key === 'ArrowLeft') $('#scn-prev').click();
+  });
+}
+const MX_COLS = [['NS', 'NotStarted', 'stable'], ['ST', 'Starting', 'busy'], ['RU', 'Running', 'stable'], ['PG', 'Pausing', 'busy'], ['PA', 'Paused', 'stable'], ['RS', 'Resuming', 'busy'], ['RZ', 'Resizing', 'busy']];
+const all7 = c => Array(7).fill(c);
+const live6 = c => ['n:不监听', ...Array(6).fill(c)];
+// cell = "kind:text"; kinds o e g d x s n (see legend)
+const MX_ROWS = [
+  ['GetInstanceInfo', '查询', ['o:NotStarted', 'o:NotStarted', 'o:Running', 'o:Running', 'o:Paused', 'o:Paused', 'o:Running'],
+    '任何状态都回答，状态不变。Busy 期间报告操作的出发状态：Starting 报 NotStarted，Pausing / Resizing 报 Running，Resuming 报 Paused。', 'controller.rs:276-284, 426-429'],
+  ['UpdateLogger', '查询', all7('o:应用并回复'),
+    '调用进程注入的 `update_logger` 并回复其结果；与生命周期无关。', 'controller.rs:430-433'],
+  ['HandoverState', '查询', all7('e:Unsupported'),
+    '热升级尚未支持，一律回复 `HandoverUnsupported`。', 'controller.rs:434-437'],
+  ['Set* / AddDisk', '配置', ['o:spec.apply', 'e:InProgress', 'e:Frozen', 'e:InProgress', 'e:Frozen', 'e:InProgress', 'e:InProgress'],
+    '`SetCpus`、`SetMemory`、`SetMemoryHotplug`、`SetMemoryBacking`、`SetConsole`、`SetKernel`、`AddDisk` 都归为 `Request::Configure`。只有 NotStarted 接受：`spec.apply` 成功返回新 spec；失败回复错误并保留旧 spec。启动后回复 `ConfigurationFrozen`，Busy 时回复 `InProgress`。', 'controller.rs:438-450'],
+  ['Start', '生命周期', ['g:→ Starting', 'e:InProgress', 'e:AlreadyStarted', 'e:InProgress', 'e:AlreadyStarted', 'e:InProgress', 'e:InProgress'],
+    'NotStarted 返回 `Next::Start(spec, reply)`，外壳同步 plan + build。同步失败（plan 失败或 build 失败且无需清理）直接回复 Err 并回到 `NotStarted(spec)`。', 'controller.rs:451-457 · main_loop.rs:253-306'],
+  ['Pause', '生命周期', ['e:NotStarted', 'e:InProgress', 'g:→ Pausing', 'e:InProgress', 'o:幂等 Ok', 'e:InProgress', 'e:InProgress'],
+    'Running 返回 `Next::Pause`；已经 Paused 时直接回复 Ok。', 'controller.rs:458-465'],
+  ['Resume', '生命周期', ['e:NotStarted', 'e:InProgress', 'o:幂等 Ok', 'e:InProgress', 'g:→ Resuming', 'e:InProgress', 'e:InProgress'],
+    'Paused 返回 `Next::Resume`；已经 Running 时直接回复 Ok。', 'controller.rs:466-473'],
+  ['ResizeMemory', '生命周期', ['e:NotStarted', 'e:InProgress', 'g:→ Resizing', 'e:InProgress', 'e:NotRunning', 'e:InProgress', 'e:InProgress'],
+    '只有 Running 可以调整热插拔内存。外壳同步调用 `resize_memory`，失败时回复 Err 并留在 Running。', 'controller.rs:474-481 · main_loop.rs:188-199'],
+  ['Shutdown', '生命周期', ['x:立即结束', 'x:等完成', 'x:teardown', 'x:等完成', 'x:teardown', 'x:等完成', 'x:shutdown_resize'],
+    '任何状态都先回复 Ok（"已接受"），再 `Next::Exit(Shutdown)`：关闭准入、记录 stopping。下一轮第 ② 步按状态处理：NotStarted 直接返回；Running / Paused 进入 teardown；Resizing 进入 `shutdown_resize`；其他 Busy 等 operation 自己完成后再按到达的状态处理。teardown 的结果只体现在线程退出状态里。', 'controller.rs:482-487 · main_loop.rs:64-82'],
+  ['Detached', '连接', ['x:Exit(Detached)', 's:标记 detached', 's:警告·继续', 's:警告·继续', 's:警告·继续', 's:警告·继续', 's:警告·继续'],
+    '所有 `VmmClient` 被 drop 后，`VmmServer` 报告一次 Detached，之后永久 pending。NotStarted 已无人能配置或启动，于是退出；Starting 只做标记，可重试的失败才退出；其余状态 guest 继续运行，直到 reset 或故障。', 'controller.rs:505-523 · vmm_server.rs:28-44'],
+  ['GuestReset', '事件', live6('x:Exit(GuestReset)'),
+    '两个来源：i8042 设备（vCPU 仍存活），或 KVM 的 shutdown / system-reset 退出（该 vCPU 线程随之结束，之后对它的命令得到 `Exited`）。任何有机器的状态都返回 `Next::Exit`；Busy 继续等 operation 完成。NotStarted 没有事件流。', 'controller.rs:533-536 · i8042.rs:160 · vcpu.rs:504-509'],
+  ['VcpuFailed', '事件', live6('x:Exit(VcpuFailed)'),
+    'vCPU 线程以 `Ending::Failed` 结束时发送。合并优先级仅次于 `StartTeardown`。', 'controller.rs:537-540 · vcpu.rs:510-514'],
+  ['设备任务退出', '事件', live6('s:警告·Stay'),
+    '设备监督者已记录原因；局部故障就地隔离。是否失去 RAM 依赖不看任务名，而由外壳检查 `failed_memory_service()`。', 'controller.rs:541-547'],
+  ['操作完成', '完成', ['n:—', 'd:Running / NotStarted / StartTeardown', 'n:—', 'd:Paused / Terminate', 'n:—', 'd:Running / Terminate', 'd:Running（回复结果）'],
+    '`next_input` 只 poll 当前 Busy 自己的 operation，其他 (状态, 完成) 组合都是 `unreachable!`。完成先经过第 ④ ⑤ ⑥ 步，再交给 `on_started / on_paused / on_resumed / on_resized`。', 'controller.rs:570-624 · main_loop.rs:136-174'],
+  ['内存服务失效', '外壳检查', ['n:—', 's:完成后检查', 'x:stopping', 's:完成后检查', 'x:stopping', 's:完成后检查', 'x:stopping'],
+    '不是 controller 的输入，而是外壳在第 ① 步（入口）和第 ④ 步（输入后）检查真实 owner。机器在 operation 中的状态无法检查，改为检查 operation 交回的机器。进入 stopping 后不再检查。', 'main_loop.rs:54-63, 84-103, 242-251'],
+];
+
+function renderMatrix() {
+  let h = '<thead><tr><th></th>' + MX_COLS.map(([, n, k]) => `<th class="${k}">${n}</th>`).join('') + '</tr></thead><tbody>';
+  MX_ROWS.forEach(([name, group, cells], r) => {
+    h += `<tr><th>${esc(name)}<small>${esc(group)}</small></th>`;
+    cells.forEach((cell, c) => {
+      const [kind, ...rest] = cell.split(':');
+      h += `<td class="c-${kind}" data-r="${r}" data-c="${c}" tabindex="0">${esc(rest.join(':'))}</td>`;
+    });
+    h += '</tr>';
+  });
+  $('#mx').innerHTML = h + '</tbody>';
+  const pick = td => {
+    $$('#mx td.sel').forEach(x => x.classList.remove('sel'));
+    td.classList.add('sel');
+    const [name, , cells, desc, code] = MX_ROWS[td.dataset.r];
+    const [, col] = MX_COLS[td.dataset.c];
+    const text = cells[td.dataset.c].split(':').slice(1).join(':');
+    $('#mx-detail').innerHTML = `<h4>${esc(name)} × ${esc(col)} → ${esc(text)}</h4><p>${fmt(desc)}</p><p class="ref" style="margin-top:6px">${esc(code)}</p>`;
+  };
+  $('#mx').addEventListener('click', e => { const td = e.target.closest('td'); if (td) pick(td); });
+  $('#mx').addEventListener('keydown', e => { const td = e.target.closest('td'); if (td && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); pick(td); } });
+}
+
+// ---- prefer_exit fold ----
+const EXITS = ['Shutdown', 'Detached', 'GuestReset', 'VcpuFailed', 'MemoryServiceFailed', 'MemoryServiceResumeFailed', 'StartTeardown', 'TransitionFailed', 'TransitionExited'];
+const MEM = new Set(['MemoryServiceFailed', 'MemoryServiceResumeFailed']);
+const ARMS = [
+  '(_, teardown @ Exit::StartTeardown(_)) => teardown',
+  '(Some(prior @ Exit::StartTeardown(_)), _) => prior',
+  '(_, fatal @ Exit::VcpuFailed { .. }) => fatal',
+  '(Some(prior @ Exit::VcpuFailed { .. }), _) => prior',
+  '(_, fatal @ (MemoryServiceFailed | MemoryServiceResumeFailed)) => fatal',
+  '(Some(prior @ (MemoryServiceFailed | MemoryServiceResumeFailed)), _) => prior',
+  '(_, failure @ Exit::TransitionFailed(_)) => failure',
+  '(Some(prior @ Exit::TransitionFailed(_)), _) => prior',
+  '(Some(reset @ Exit::GuestReset), Exit::TransitionExited(_)) => reset',
+  '(Some(Exit::TransitionExited(_)), reset @ Exit::GuestReset) => reset',
+  '(_, fallback @ Exit::TransitionExited(_)) => fallback',
+  '(Some(prior), _) => prior',
+  '(None, exit) => exit',
+];
+// mirrors main_loop.rs:383-401 arm by arm; returns [winner, armIndex]
+function preferExit(prior, next) {
+  if (next === 'StartTeardown') return [next, 0];
+  if (prior === 'StartTeardown') return [prior, 1];
+  if (next === 'VcpuFailed') return [next, 2];
+  if (prior === 'VcpuFailed') return [prior, 3];
+  if (MEM.has(next)) return [next, 4];
+  if (MEM.has(prior)) return [prior, 5];
+  if (next === 'TransitionFailed') return [next, 6];
+  if (prior === 'TransitionFailed') return [prior, 7];
+  if (prior === 'GuestReset' && next === 'TransitionExited') return [prior, 8];
+  if (prior === 'TransitionExited' && next === 'GuestReset') return [next, 9];
+  if (next === 'TransitionExited') return [next, 10];
+  if (prior) return [prior, 11];
+  return [next, 12];
+}
+const EXIT_MSG = {
+  VcpuFailed: 'vCPU 1 failed: …',
+  MemoryServiceFailed: 'memory service for window 73 exited unexpectedly; guest RAM may no longer be CPU-mapped',
+  MemoryServiceResumeFailed: 'memory service for window 73 did not resume in time',
+  StartTeardown: 'tear down the machine after a failed Start: …',
+  TransitionFailed: 'resume the vCPUs: vCPU 0 did not answer in time',
+  TransitionExited: 'pause the vCPUs: vCPU 0 has exited',
+};
+const FOLD_PRESETS = [
+  ['i8042 reset', ['GuestReset']],
+  ['reset 后 CPU 已退出', ['GuestReset', 'TransitionExited']],
+  ['CPU 退出后才见到 reset', ['TransitionExited', 'GuestReset']],
+  ['Shutdown → reset → CPU 已退出', ['Shutdown', 'GuestReset', 'TransitionExited']],
+  ['Shutdown 后 vCPU 故障', ['Shutdown', 'VcpuFailed']],
+  ['内存服务失效 + vCPU 故障', ['MemoryServiceFailed', 'VcpuFailed']],
+];
+let foldSeq = ['Shutdown', 'GuestReset', 'TransitionExited'];
+
+function renderFold() {
+  $('#fold-seq').innerHTML = foldSeq.length
+    ? foldSeq.map((x, i) => `${i ? '<span class="arrow">→</span>' : ''}<button data-i="${i}" title="移除">${x}</button>`).join('')
+    : '<span class="muted">（空：stopping 仍为 None）</span>';
+  let acc = null;
+  const steps = foldSeq.map(next => {
+    const [win, arm] = preferExit(acc, next);
+    const line = `<li>prefer_exit(${acc ? `Some(${acc})` : 'None'}, ${next}) = <b>${win}</b><span class="arm">${esc(ARMS[arm])}</span></li>`;
+    acc = win;
+    return line;
+  });
+  $('#fold-steps').innerHTML = steps.join('');
+  const out = $('#fold-out');
+  if (!acc) { out.className = 'fold-out'; out.textContent = ''; return; }
+  const tdErr = $('#fold-td').checked;
+  const ok = !tdErr && ['Shutdown', 'Detached', 'GuestReset'].includes(acc);
+  out.className = 'fold-out ' + (ok ? 'ok' : 'err');
+  out.textContent = tdErr ? 'VmmExitStatus::Error("tear down the machine: …")  ← teardown 错误覆盖原因'
+    : ok ? `VmmExitStatus::Ok  ← ${acc}` : `VmmExitStatus::Error("${EXIT_MSG[acc]}")  ← ${acc}`;
+}
+
+function initFold() {
+  $('#fold-btns').innerHTML = EXITS.map(x => `<button data-x="${x}">+ ${x}</button>`).join('');
+  $('#fold-presets').innerHTML = FOLD_PRESETS.map(([t], i) => `<button data-p="${i}">${esc(t)}</button>`).join('');
+  $('#fold-btns').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { foldSeq.push(b.dataset.x); renderFold(); } });
+  $('#fold-presets').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { foldSeq = [...FOLD_PRESETS[b.dataset.p][1]]; renderFold(); } });
+  $('#fold-seq').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { foldSeq.splice(Number(b.dataset.i), 1); renderFold(); } });
+  $('#fold-td').addEventListener('change', renderFold);
+  renderFold();
+}
+function initDiagram() {
+  renderSvg();
+  const svg = $('#svg');
+  const activate = g => {
+    if (!g) return;
+    if (g.classList.contains('edge')) showEdge(g.dataset.id); else showNode(g.dataset.id);
+  };
+  svg.addEventListener('click', e => {
+    const g = e.target.closest('.node,.edge');
+    if (g) activate(g);
+    else if ($('#pane-scn').hidden) { focusGraph(); $('#pane-detail').innerHTML = '<p class="hint">点击图中任意节点或连线。</p>'; }
+  });
+  svg.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(e.target.closest('.node,.edge')); }
+  });
+  $('#tab-detail').addEventListener('click', () => { selectTab('detail'); focusGraph(); });
+  $('#tab-scn').addEventListener('click', () => { selectTab('scn'); renderStep(); });
+}
+
+function initNotes() {
+  $$('.ladder li').forEach((li, i) => li.style.setProperty('--i', i));
+  $('#ec-scn').addEventListener('click', () => {
+    openScenario(SCN.length - 1);
+    $('#diagram').scrollIntoView({ behavior: 'smooth' });
+  });
+  $('#ec-fold').addEventListener('click', () => {
+    foldSeq = ['Shutdown', 'GuestReset', 'TransitionExited'];
+    renderFold();
+    $('#exit').scrollIntoView({ behavior: 'smooth' });
+  });
+}
+
+initTheme();
+initCode();
+initDiagram();
+initScenarios();
+renderMatrix();
+initFold();
+initNotes();
+</script>
+</body>
+</html>

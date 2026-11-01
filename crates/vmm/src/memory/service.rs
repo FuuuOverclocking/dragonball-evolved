@@ -1127,6 +1127,12 @@ mod tests {
     use crate::space::ObjectOffset;
     use crate::vm::MemSlots;
 
+    impl MemoryResources {
+        pub(crate) fn inject_unbind_failures(&mut self, count: usize) {
+            self.unbind_failures = count;
+        }
+    }
+
     const HOT: WindowId = WindowId(1);
     const START: Gpa = Gpa(1 << 30);
     const BLOCK: u64 = 0x1000;

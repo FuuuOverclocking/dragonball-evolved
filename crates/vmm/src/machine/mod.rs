@@ -22,14 +22,16 @@ pub use self::boot::BootDataError;
 pub use self::build::{BuildCleanup, BuildError, BuildFailure, build};
 pub use self::cleanup::PendingCleanup;
 pub use self::kvm_state::{CaptureVmError, RestoreVmError, VcpuSnapshot, VmKvmState};
-pub use self::mem::{AttachMemError, MachineResizeError, MemSnapshot};
+pub use self::mem::{
+    AttachMemError, CaptureMemError, MachineResizeError, MemSnapshot, RestoreMemError,
+};
 pub use self::plan::{MachinePlan, PlanError};
 pub use self::platform::{
     PlatformCaptureError, PlatformError, PlatformQuiesced, PlatformRestoreError, PlatformSnapshot,
 };
 pub use self::snapshot::{
-    CaptureError, DeviceSnapshot, MachineSnapshot, RebuildError, RebuildFailure, RebuildMemory,
-    rebuild,
+    CaptureError, CaptureMemoryError, DeviceSnapshot, MachineSnapshot, MemorySnapshot,
+    RebuildError, RebuildFailure, RebuildMemory, RestoreMemoryError, rebuild,
 };
 pub use self::state::{
     FailedMachine, Machine, PauseError, PausedMachine, QuiescedBlock, QuiescedDevice, QuiescedMem,

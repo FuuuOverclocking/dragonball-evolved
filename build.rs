@@ -37,14 +37,13 @@ where
         .args(args)
         .output()
         .context("Failed to run `git`")?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
+    if !output.status.success() {
         bail!(
             "`git` failed, stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         )
     }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn git_dir() -> Result<PathBuf> {

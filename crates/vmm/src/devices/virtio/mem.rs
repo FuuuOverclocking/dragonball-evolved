@@ -19,7 +19,7 @@ use super::config::{ConfigPublisher, ConfigReader, ConfigSnapshot};
 use super::mmio::DeviceDesc;
 use super::{ActivationRx, Activator, IrqTrigger, activation_channel};
 use crate::devices::async_fd::AsyncEventFd;
-use crate::memory::hotplug::{MemGeometry, PopulationError};
+use crate::memory::hotplug::{MemGeometry, Population, PopulationError};
 use crate::memory::service::{
     MemoryOperationError, MemoryOperationId, MemoryPhase, MemoryStatus, RetryError, SubmitError,
     WindowControl, WindowStatus,
@@ -254,15 +254,8 @@ impl MemResources {
         restored: MemRestore,
     ) -> Result<(Self, MemHandle), MemError> {
         let snapshot = status.snapshot();
-        let image = project(geometry, restored.state, &snapshot)?;
-        if restored.state.memory_revision != snapshot.revision
-            || !restored
-                .state
-                .usable_region_size
-                .is_multiple_of(geometry.chunk_size())
-        {
-            return Err(MemError::RestoreState);
-        }
+        let image =
+            Self::validate_restore(geometry, &snapshot.population, snapshot.revision, &restored)?;
         let (publisher, config) = ConfigPublisher::restore(restored.config, &image.encode())?;
         Self::prepare(
             geometry,
@@ -273,6 +266,45 @@ impl MemResources {
             restored.state,
             restored.state.queue,
         )
+    }
+
+    pub(crate) fn descriptor(geometry: MemGeometry) -> DeviceDesc {
+        DeviceDesc {
+            device_type: protocol::DEVICE_ID,
+            features: protocol::OFFERED_FEATURES,
+            required_features: protocol::REQUIRED_FEATURES,
+            queue_max: vec![protocol::QUEUE_MAX],
+            config: baseline(geometry).encode().to_vec(),
+        }
+    }
+
+    pub(crate) fn validate_restore(
+        geometry: MemGeometry,
+        population: &Population,
+        revision: u64,
+        restored: &MemRestore,
+    ) -> Result<protocol::Config, MemError> {
+        let image = project_population(geometry, restored.state, population)?;
+        if restored.state.memory_revision != revision
+            || !restored
+                .state
+                .usable_region_size
+                .is_multiple_of(geometry.chunk_size())
+        {
+            return Err(MemError::RestoreState);
+        }
+        let bytes = image.encode();
+        if restored.config.bytes.len() != bytes.len() {
+            return Err(super::config::ConfigError::Length {
+                expected: bytes.len(),
+                actual: restored.config.bytes.len(),
+            }
+            .into());
+        }
+        if restored.config.bytes != bytes {
+            return Err(super::config::ConfigError::Image.into());
+        }
+        Ok(image)
     }
 
     fn prepare(
@@ -298,13 +330,7 @@ impl MemResources {
         let (resize_tx, resize) = mpsc::channel(HOST_QUEUE_SIZE);
         let (retry_tx, retry) = mpsc::channel(HOST_QUEUE_SIZE);
         let admission = Arc::new(Mutex::new(ResizeAdmission::default()));
-        let desc = DeviceDesc {
-            device_type: protocol::DEVICE_ID,
-            features: protocol::OFFERED_FEATURES,
-            required_features: protocol::REQUIRED_FEATURES,
-            queue_max: vec![protocol::QUEUE_MAX],
-            config: baseline(geometry).encode().to_vec(),
-        };
+        let desc = Self::descriptor(geometry);
         Ok((
             Self {
                 geometry,
@@ -373,20 +399,27 @@ fn project(
     state: MemQuiesced,
     status: &MemoryStatus,
 ) -> Result<protocol::Config, MemError> {
-    if status.population.geometry() != geometry {
+    project_population(geometry, state, &status.population)
+}
+
+fn project_population(
+    geometry: MemGeometry,
+    state: MemQuiesced,
+    population: &Population,
+) -> Result<protocol::Config, MemError> {
+    if population.geometry() != geometry {
         return Err(MemError::GeometryMismatch);
     }
     let config = protocol::Config {
         requested_size: state.requested_size,
         usable_region_size: state.usable_region_size,
-        plugged_size: status.population.plugged_size(),
+        plugged_size: population.plugged_size(),
         ..baseline(geometry)
     };
     config.validate()?;
     let usable = Range::new(config.addr, config.usable_region_size)
         .ok_or(protocol::ConfigError::RegionOverflow)?;
-    if status
-        .population
+    if population
         .plugged_ranges()
         .any(|range| !usable.contains_range(range))
     {

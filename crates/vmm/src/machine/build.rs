@@ -27,7 +27,9 @@ use crate::arch::x86_64::layout::HIMEM_START;
 use crate::bus::{BusError, MmioBus, PioBus};
 use crate::devices::runtime::{DeviceRuntime, Response};
 use crate::kvm_context::KvmContext;
+use crate::memory::layout::WindowId;
 use crate::memory::policy::HostPolicy;
+use crate::memory::service::MemoryResources;
 use crate::memory::store::{MaterializeError, MemoryStore};
 use crate::space::{Gpa, Pio};
 use crate::vm::{Binding, CreateVmError, KvmVcpu, KvmVcpuError, KvmVm, MemSlots, create_vm};
@@ -281,6 +283,18 @@ pub(super) enum PreparedDevice {
     Mem(PreparedMem),
 }
 
+pub(super) fn retain_prepared_memory(
+    prepared: BTreeMap<String, PreparedDevice>,
+    retained: &mut BTreeMap<WindowId, MemoryResources>,
+) {
+    for device in prepared.into_values() {
+        if let PreparedDevice::Mem(mem) = device {
+            let (window, resources) = mem.into_resources();
+            assert!(retained.insert(window, resources).is_none());
+        }
+    }
+}
+
 fn validate_prepared(
     plan: &MachinePlan,
     prepared: &BTreeMap<String, PreparedDevice>,
@@ -330,6 +344,7 @@ pub(super) fn assemble_parked(
         mems: BTreeMap::new(),
         memory_services: BTreeMap::new(),
         memory_statuses: BTreeMap::new(),
+        unstarted_memory: BTreeMap::new(),
         bindings,
         memslots,
         vm,
@@ -367,7 +382,7 @@ pub(super) fn assemble_parked(
             mmio: MmioBus::new(mmio)?,
         }))
     })();
-    drop(prepared);
+    retain_prepared_memory(prepared, &mut parts.unstarted_memory);
     let buses = match assembled {
         Ok(buses) => buses,
         Err(error) => {
@@ -390,10 +405,12 @@ pub(super) fn assemble_parked(
         mems,
         memory_services,
         memory_statuses: _,
+        unstarted_memory,
         bindings,
         memslots,
         vm,
     } = *parts;
+    assert!(unstarted_memory.is_empty());
     let parts = Box::new(Parts {
         vcpus: vcpus.expect("the CPU cohort was started"),
         runtime,
