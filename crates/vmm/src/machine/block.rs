@@ -479,6 +479,7 @@ mod tests {
             .0
             .devices()[ID]
             .block()
+            .unwrap()
             .clone()
     }
 

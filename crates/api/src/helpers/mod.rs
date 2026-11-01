@@ -10,4 +10,4 @@ pub(crate) mod result;
 #[cfg(feature = "serde")]
 pub use self::metadata::ParseInput;
 #[cfg(all(feature = "request", feature = "serde"))]
-pub use self::reply::{SerializedReply, SerializedReplyWaiter};
+pub use self::reply::{SerializedReply, SerializedReplyError, SerializedReplyWaiter};

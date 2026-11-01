@@ -2,15 +2,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use logger::warn_unlimited;
 use tokio::time::Instant;
 
 use super::block::AttachedBlock;
+use super::mem::AttachedMem;
 use super::platform::Platform;
 use super::state::{Parts, TeardownError};
 use super::vcpu::Vcpus;
-use crate::devices::runtime::DeviceRuntime;
-use crate::error::render_chain;
+use crate::devices::runtime::{DeviceRuntime, Response};
+use crate::memory::layout::WindowId;
+use crate::memory::service::{MemoryHandle, MemoryPhase, WindowStatus};
 use crate::memory::store::MemoryStore;
 use crate::vm::{Binding, KvmVm, MemSlots};
 
@@ -20,6 +21,9 @@ pub(super) struct CleanupParts {
     pub(super) runtime: DeviceRuntime,
     pub(super) platform: Option<Platform>,
     pub(super) blocks: BTreeMap<String, AttachedBlock>,
+    pub(super) mems: BTreeMap<String, AttachedMem>,
+    pub(super) memory_services: BTreeMap<WindowId, MemoryHandle>,
+    pub(super) memory_statuses: BTreeMap<WindowId, WindowStatus>,
     pub(super) bindings: Vec<Binding>,
     pub(super) memslots: MemSlots,
     pub(super) vm: Arc<KvmVm>,
@@ -32,7 +36,9 @@ enum Stage {
 }
 
 /// The sole, retryable owner of a machine that is being stopped.
-/// Dropping it requests stop without waiting; it never implies completion.
+/// Dropping it requests stop through resource-handle RAII without waiting;
+/// it does not prove cleanup completion or return RAM. A live memory service
+/// owns its chunk bindings and VM until it stops. Use `wait` to complete cleanup.
 #[derive(Debug)]
 pub struct PendingCleanup(Stage);
 
@@ -47,16 +53,30 @@ impl PendingCleanup {
             runtime,
             platform,
             blocks,
+            mems,
+            memory_services,
             bindings,
             memslots,
             vm,
             plan: _,
         } = *parts;
+        let memory_statuses = mems
+            .values()
+            .map(|mem| {
+                (
+                    mem.status.snapshot().population.geometry().window_id(),
+                    mem.status.clone(),
+                )
+            })
+            .collect();
         Self::tasks(Box::new(CleanupParts {
             vcpus: Some(vcpus),
             runtime,
             platform: Some(platform),
             blocks,
+            mems,
+            memory_services,
+            memory_statuses,
             bindings,
             memslots,
             vm,
@@ -80,19 +100,43 @@ impl PendingCleanup {
                 }
                 None => Ok(()),
             };
-            let devices = parts
+            if let Err(error) = cpus {
+                return Err((self, TeardownError::Vcpus(error)));
+            }
+            for mem in parts.mems.values() {
+                mem.worker.stop();
+            }
+            for service in parts.memory_services.values() {
+                service.stop();
+            }
+            for (window, service) in &parts.memory_services {
+                let response = service
+                    .stop_wait(deadline.saturating_duration_since(Instant::now()))
+                    .await;
+                let error = match response {
+                    Response::TimedOut => Some(TeardownError::MemoryServiceTimedOut(*window)),
+                    Response::Exited => Some(TeardownError::MemoryServiceExited(*window)),
+                    Response::Replied(()) => {
+                        if matches!(
+                            parts.memory_statuses[window].snapshot().phase,
+                            MemoryPhase::Stopped
+                        ) {
+                            None
+                        } else {
+                            Some(TeardownError::MemoryServiceExited(*window))
+                        }
+                    }
+                };
+                if let Some(error) = error {
+                    return Err((self, error));
+                }
+            }
+            if let Err(error) = parts
                 .runtime
                 .shutdown_wait(deadline.saturating_duration_since(Instant::now()))
-                .await;
-            match (cpus, devices) {
-                (Err(error), devices) => {
-                    if let Err(devices) = devices {
-                        warn_unlimited!("{}", render_chain(&devices));
-                    }
-                    return Err((self, TeardownError::Vcpus(error)));
-                }
-                (Ok(()), Err(error)) => return Err((self, TeardownError::Devices(error))),
-                (Ok(()), Ok(())) => {}
+                .await
+            {
+                return Err((self, TeardownError::Devices(error)));
             }
         }
         let vm = match self.0 {
@@ -103,6 +147,9 @@ impl PendingCleanup {
                     runtime,
                     platform,
                     blocks,
+                    mems,
+                    memory_services,
+                    memory_statuses,
                     bindings,
                     memslots,
                     vm,
@@ -111,6 +158,9 @@ impl PendingCleanup {
                 drop(runtime);
                 drop(platform);
                 drop(blocks);
+                drop(mems);
+                drop(memory_services);
+                drop(memory_statuses);
                 drop(bindings);
                 drop(memslots);
                 vm
@@ -192,6 +242,9 @@ mod tests {
                     runtime,
                     platform: None,
                     blocks: BTreeMap::new(),
+                    mems: BTreeMap::new(),
+                    memory_services: BTreeMap::new(),
+                    memory_statuses: BTreeMap::new(),
                     bindings,
                     memslots,
                     vm,
@@ -245,7 +298,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "local")]
-    async fn cpu_timeout_still_requests_device_stop_and_retains_the_thread_for_retry() {
+    async fn cpu_timeout_preserves_device_owners_without_requesting_stop_before_retry() {
         use std::sync::{Mutex, mpsc};
 
         use super::super::vcpu::{self, Buses, VcpuError};
@@ -319,7 +372,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let (mut runtime, _exits) = DeviceRuntime::new();
-            let (stopped_tx, stopped_rx) = oneshot::channel();
+            let (stopped_tx, mut stopped_rx) = oneshot::channel();
             let handle: DeviceHandle<()> = runtime
                 .spawn(
                     "stop-observer",
@@ -336,6 +389,9 @@ mod tests {
                 runtime,
                 platform: None,
                 blocks: BTreeMap::new(),
+                mems: BTreeMap::new(),
+                memory_services: BTreeMap::new(),
+                memory_statuses: BTreeMap::new(),
                 bindings,
                 memslots,
                 vm,
@@ -345,10 +401,11 @@ mod tests {
                 error,
                 TeardownError::Vcpus(VcpuError::TimedOut(0))
             ));
-            tokio::time::timeout(TIMEOUT, stopped_rx)
-                .await
-                .unwrap()
-                .unwrap();
+            assert!(matches!(
+                stopped_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(!handle.has_exited());
             assert!(weak.upgrade().is_some());
             release_tx.send(()).unwrap();
             let pending = if panics {
@@ -362,6 +419,10 @@ mod tests {
                 pending
             };
             let memory = pending.wait(TIMEOUT).await.unwrap();
+            tokio::time::timeout(TIMEOUT, stopped_rx)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), memory.view()));
             drop(handle);
             drop(memory);

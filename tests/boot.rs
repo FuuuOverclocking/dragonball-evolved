@@ -260,10 +260,23 @@ async fn rest_api_configures_and_shuts_down_before_start() {
         ("PUT", "/v1/machine/memory-mib", json!(16), StatusCode::OK),
         (
             "PUT",
-            "/v1/machine/cpus",
-            json!(0),
-            StatusCode::INTERNAL_SERVER_ERROR,
+            "/v1/machine/memory-hotplug",
+            json!({ "size_mib": 128 }),
+            StatusCode::OK,
         ),
+        (
+            "PUT",
+            "/v1/machine/memory-hotplug",
+            json!([128]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "PATCH",
+            "/v1/machine/memory-hotplug",
+            json!(0),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("PUT", "/v1/machine/cpus", json!(0), StatusCode::BAD_REQUEST),
         (
             "PUT",
             "/v1/machine/kernel",
@@ -271,12 +284,12 @@ async fn rest_api_configures_and_shuts_down_before_start() {
             StatusCode::OK,
         ),
         ("PUT", "/v1/disks", disk.clone(), StatusCode::OK),
-        ("PUT", "/v1/disks", disk, StatusCode::INTERNAL_SERVER_ERROR),
+        ("PUT", "/v1/disks", disk, StatusCode::BAD_REQUEST),
         (
             "PUT",
             "/v1/actions/pause",
             Value::Null,
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_REQUEST,
         ),
     ] {
         let (actual, reply) = api.request(method, path, body).await;
@@ -284,7 +297,7 @@ async fn rest_api_configures_and_shuts_down_before_start() {
     }
 
     let (status, reply) = api.request("PUT", "/v1/actions/start", Value::Null).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
         reply["error"]
             .as_str()
@@ -353,7 +366,7 @@ async fn rest_api_configures_pauses_and_shuts_down_a_real_vm() {
             "PUT",
             "/v1/machine/cpus",
             serde_json::json!(2),
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_REQUEST,
         ),
         (
             "PUT",

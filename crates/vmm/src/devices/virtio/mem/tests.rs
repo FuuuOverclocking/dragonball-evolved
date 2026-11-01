@@ -277,7 +277,7 @@ impl Fixture {
             None => MemResources::new(geometry, window, status.clone()).unwrap(),
         };
         let mut guest = Guest {
-            mem: vm.memory().view(),
+            mem: Arc::clone(vm.memory().view()),
             submitted: 0,
         };
         let session = restored_queue.map(|queue| {

@@ -4,12 +4,16 @@ use api::VmmCommand;
 use api::block::{AddDisk, BlockDevConfig};
 use api::boot::{KernelConfig, SetKernel};
 use api::machine::{
-    ConsoleConfig, MemoryBacking, MemorySizeMib, SetConsole, SetCpus, SetMemory, SetMemoryBacking,
-    VcpuCount,
+    ConsoleConfig, MemoryBacking, MemoryHotplugConfig, MemorySizeMib, SetConsole, SetCpus,
+    SetMemory, SetMemoryBacking, SetMemoryHotplug, VcpuCount,
 };
+
+use crate::memory::hotplug::{DEFAULT_BLOCK_SIZE, DEFAULT_CHUNK_SIZE};
 
 // xAPIC IDs are 8 bits wide and 0xff is the broadcast ID.
 const MAX_VCPUS: u8 = 254;
+
+pub const VIRTIO_MEM_ID: &str = "virtio-mem0";
 
 /// The machine as configured so far.
 ///
@@ -29,12 +33,14 @@ pub struct MachineSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceSpec {
     Block(BlockSpec),
+    Mem(MemSpec),
 }
 
 impl DeviceSpec {
     pub fn id(&self) -> &str {
         match self {
             Self::Block(block) => &block.id,
+            Self::Mem(_) => VIRTIO_MEM_ID,
         }
     }
 }
@@ -48,12 +54,30 @@ pub struct BlockSpec {
     pub root: bool,
 }
 
+/// Memory hotplug geometry, normalized to bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemSpec {
+    pub region_size: u64,
+    pub block_size: u64,
+    pub chunk_size: u64,
+}
+
 #[derive(Debug, PartialEq, Eq, displaydoc::Display, thiserror::Error)]
 pub enum SpecError {
     /// vCPU count {0} is not between 1 and 254
     VcpuCount(u8),
     /// guest memory size must be non-zero
     ZeroMemory,
+    /// hotplug memory size must be non-zero
+    ZeroHotplugMemory,
+    /// hotplug block size {0} bytes is not a non-zero power of two
+    HotplugBlockSize(u64),
+    /// hotplug chunk size {0} bytes is not a non-zero power of two
+    HotplugChunkSize(u64),
+    /// hotplug chunk size {chunk_size} bytes must be at least and a multiple of block size {block_size} bytes
+    HotplugChunkAlignment { chunk_size: u64, block_size: u64 },
+    /// hotplug region size {region_size} bytes is not a multiple of chunk size {chunk_size} bytes
+    HotplugRegionAlignment { region_size: u64, chunk_size: u64 },
     /// kernel path must be non-empty
     EmptyKernelPath,
     /// disk path must be non-empty
@@ -66,6 +90,47 @@ pub enum SpecError {
     SecondRootDisk,
     /// operation is not a machine configuration command
     NotConfiguration,
+}
+
+impl MemSpec {
+    fn new(config: MemoryHotplugConfig) -> Result<Self, SpecError> {
+        let bytes = |size_mib: u32| u64::from(size_mib) << 20;
+        let region_size = bytes(config.size_mib);
+        let block_size = config
+            .block_size_mib
+            .map(bytes)
+            .unwrap_or(DEFAULT_BLOCK_SIZE);
+        let chunk_size = config
+            .chunk_size_mib
+            .map(bytes)
+            .unwrap_or(DEFAULT_CHUNK_SIZE);
+        if region_size == 0 {
+            return Err(SpecError::ZeroHotplugMemory);
+        }
+        if !block_size.is_power_of_two() {
+            return Err(SpecError::HotplugBlockSize(block_size));
+        }
+        if !chunk_size.is_power_of_two() {
+            return Err(SpecError::HotplugChunkSize(chunk_size));
+        }
+        if chunk_size < block_size || chunk_size % block_size != 0 {
+            return Err(SpecError::HotplugChunkAlignment {
+                chunk_size,
+                block_size,
+            });
+        }
+        if region_size % chunk_size != 0 {
+            return Err(SpecError::HotplugRegionAlignment {
+                region_size,
+                chunk_size,
+            });
+        }
+        Ok(Self {
+            region_size,
+            block_size,
+            chunk_size,
+        })
+    }
 }
 
 impl Default for MachineSpec {
@@ -109,8 +174,16 @@ impl MachineSpec {
 
     /// The configured disks, in configuration order.
     pub fn blocks(&self) -> impl Iterator<Item = &BlockSpec> {
-        self.devices.iter().map(|device| match device {
-            DeviceSpec::Block(block) => block,
+        self.devices.iter().filter_map(|device| match device {
+            DeviceSpec::Block(block) => Some(block),
+            DeviceSpec::Mem(_) => None,
+        })
+    }
+
+    pub fn memory_hotplug(&self) -> Option<&MemSpec> {
+        self.devices.iter().find_map(|device| match device {
+            DeviceSpec::Block(_) => None,
+            DeviceSpec::Mem(mem) => Some(mem),
         })
     }
 
@@ -129,6 +202,21 @@ impl MachineSpec {
                 }
                 next.memory_mib = size;
             }
+            VmmCommand::SetMemoryHotplug(SetMemoryHotplug(config), ()) => {
+                let mem = MemSpec::new(config)?;
+                if self.blocks().any(|block| block.id == VIRTIO_MEM_ID) {
+                    return Err(SpecError::DuplicateId(VIRTIO_MEM_ID.into()));
+                }
+                if let Some(device) = next
+                    .devices
+                    .iter_mut()
+                    .find(|device| matches!(device, DeviceSpec::Mem(_)))
+                {
+                    *device = DeviceSpec::Mem(mem);
+                } else {
+                    next.devices.push(DeviceSpec::Mem(mem));
+                }
+            }
             VmmCommand::SetMemoryBacking(SetMemoryBacking(backing), ()) => {
                 next.memory_backing = backing;
             }
@@ -145,6 +233,7 @@ impl MachineSpec {
             }
             VmmCommand::GetInstanceInfo(..)
             | VmmCommand::UpdateLogger(..)
+            | VmmCommand::ResizeMemory(..)
             | VmmCommand::Start(..)
             | VmmCommand::Pause(..)
             | VmmCommand::Resume(..)
@@ -190,6 +279,7 @@ impl MachineSpec {
 mod tests {
     use api::RawVmmOp;
     use api::lifecycle::Start;
+    use api::machine::{HotplugSizeMib, ResizeMemory};
 
     use super::*;
 
@@ -200,6 +290,234 @@ mod tests {
             read_only: false,
             root,
         })
+    }
+
+    fn memory_hotplug(size_mib: u32) -> SetMemoryHotplug {
+        SetMemoryHotplug(MemoryHotplugConfig {
+            size_mib,
+            block_size_mib: None,
+            chunk_size_mib: None,
+        })
+    }
+
+    #[test]
+    fn memory_hotplug_defaults_are_normalized_to_bytes() {
+        let spec = MachineSpec::default();
+        assert_eq!(spec.memory_hotplug(), None);
+        let next = spec.apply(memory_hotplug(256).into_vmm_command()).unwrap();
+        let mem = MemSpec {
+            region_size: 256 << 20,
+            block_size: DEFAULT_BLOCK_SIZE,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+        };
+        assert_eq!(next.memory_hotplug(), Some(&mem));
+        assert_eq!(next.devices(), [DeviceSpec::Mem(mem)]);
+        assert_eq!(next.devices()[0].id(), VIRTIO_MEM_ID);
+        assert_eq!(next.blocks().count(), 0);
+        assert_eq!(next.memory_mib(), spec.memory_mib());
+        assert_eq!(spec, MachineSpec::default());
+    }
+
+    #[test]
+    fn memory_hotplug_optional_geometry_and_large_sizes_are_normalized() {
+        for (block_size_mib, chunk_size_mib, block_size, chunk_size) in [
+            (Some(4), None, 4 << 20, DEFAULT_CHUNK_SIZE),
+            (None, Some(64), DEFAULT_BLOCK_SIZE, 64 << 20),
+            (Some(4), Some(64), 4 << 20, 64 << 20),
+        ] {
+            let spec = MachineSpec::default()
+                .apply(
+                    SetMemoryHotplug(MemoryHotplugConfig {
+                        size_mib: 256,
+                        block_size_mib,
+                        chunk_size_mib,
+                    })
+                    .into_vmm_command(),
+                )
+                .unwrap();
+            assert_eq!(
+                spec.memory_hotplug(),
+                Some(&MemSpec {
+                    region_size: 256 << 20,
+                    block_size,
+                    chunk_size,
+                })
+            );
+        }
+        for (size_mib, block_size_mib, chunk_size_mib) in
+            [(u32::MAX, 1, 1), (1 << 31, 1 << 31, 1 << 31)]
+        {
+            let spec = MachineSpec::default()
+                .apply(
+                    SetMemoryHotplug(MemoryHotplugConfig {
+                        size_mib,
+                        block_size_mib: Some(block_size_mib),
+                        chunk_size_mib: Some(chunk_size_mib),
+                    })
+                    .into_vmm_command(),
+                )
+                .unwrap();
+            assert_eq!(
+                spec.memory_hotplug(),
+                Some(&MemSpec {
+                    region_size: u64::from(size_mib) << 20,
+                    block_size: u64::from(block_size_mib) << 20,
+                    chunk_size: u64::from(chunk_size_mib) << 20,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_memory_hotplug_geometry_leaves_the_original_unchanged() {
+        let spec = MachineSpec::default()
+            .apply(memory_hotplug(256).into_vmm_command())
+            .unwrap();
+        let original = spec.clone();
+        let config = memory_hotplug(256).0;
+        for (config, error) in [
+            (
+                MemoryHotplugConfig {
+                    size_mib: 0,
+                    ..config
+                },
+                SpecError::ZeroHotplugMemory,
+            ),
+            (
+                MemoryHotplugConfig {
+                    block_size_mib: Some(0),
+                    ..config
+                },
+                SpecError::HotplugBlockSize(0),
+            ),
+            (
+                MemoryHotplugConfig {
+                    block_size_mib: Some(3),
+                    ..config
+                },
+                SpecError::HotplugBlockSize(3 << 20),
+            ),
+            (
+                MemoryHotplugConfig {
+                    chunk_size_mib: Some(0),
+                    ..config
+                },
+                SpecError::HotplugChunkSize(0),
+            ),
+            (
+                MemoryHotplugConfig {
+                    chunk_size_mib: Some(3),
+                    ..config
+                },
+                SpecError::HotplugChunkSize(3 << 20),
+            ),
+            (
+                MemoryHotplugConfig {
+                    block_size_mib: Some(128),
+                    chunk_size_mib: Some(64),
+                    ..config
+                },
+                SpecError::HotplugChunkAlignment {
+                    chunk_size: 64 << 20,
+                    block_size: 128 << 20,
+                },
+            ),
+            (
+                MemoryHotplugConfig {
+                    size_mib: 1,
+                    ..config
+                },
+                SpecError::HotplugRegionAlignment {
+                    region_size: 1 << 20,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                },
+            ),
+            (
+                MemoryHotplugConfig {
+                    size_mib: 129,
+                    ..config
+                },
+                SpecError::HotplugRegionAlignment {
+                    region_size: 129 << 20,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                },
+            ),
+        ] {
+            assert_eq!(
+                spec.apply(SetMemoryHotplug(config).into_vmm_command()),
+                Err(error)
+            );
+            assert_eq!(spec, original);
+        }
+    }
+
+    #[test]
+    fn replacing_memory_hotplug_preserves_device_order_and_disk_numbering() {
+        let spec = MachineSpec::default()
+            .apply(disk(None, true).into_vmm_command())
+            .unwrap()
+            .apply(memory_hotplug(256).into_vmm_command())
+            .unwrap()
+            .apply(disk(None, false).into_vmm_command())
+            .unwrap();
+        let next = spec
+            .apply(
+                SetMemoryHotplug(MemoryHotplugConfig {
+                    size_mib: 512,
+                    block_size_mib: Some(4),
+                    chunk_size_mib: Some(64),
+                })
+                .into_vmm_command(),
+            )
+            .unwrap();
+        let ids: Vec<_> = next.devices().iter().map(DeviceSpec::id).collect();
+        assert_eq!(ids, ["disk0", VIRTIO_MEM_ID, "disk1"]);
+        assert_eq!(next.devices()[0], spec.devices()[0]);
+        assert_eq!(next.devices()[2], spec.devices()[2]);
+        assert_eq!(
+            next.devices()
+                .iter()
+                .filter(|device| matches!(device, DeviceSpec::Mem(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            next.memory_hotplug(),
+            Some(&MemSpec {
+                region_size: 512 << 20,
+                block_size: 4 << 20,
+                chunk_size: 64 << 20,
+            })
+        );
+        assert_eq!(spec.memory_hotplug().unwrap().region_size, 256 << 20);
+        let next = next.apply(disk(None, false).into_vmm_command()).unwrap();
+        let ids: Vec<_> = next.blocks().map(|block| block.id.as_str()).collect();
+        assert_eq!(ids, ["disk0", "disk1", "disk2"]);
+    }
+
+    #[test]
+    fn memory_hotplug_id_collides_with_disks_in_both_configuration_orders() {
+        let spec = MachineSpec::default()
+            .apply(disk(Some("data"), false).into_vmm_command())
+            .unwrap()
+            .apply(disk(Some(VIRTIO_MEM_ID), false).into_vmm_command())
+            .unwrap();
+        let original = spec.clone();
+        assert_eq!(
+            spec.apply(memory_hotplug(256).into_vmm_command()),
+            Err(SpecError::DuplicateId(VIRTIO_MEM_ID.into()))
+        );
+        assert_eq!(spec, original);
+
+        let spec = MachineSpec::default()
+            .apply(memory_hotplug(256).into_vmm_command())
+            .unwrap();
+        let original = spec.clone();
+        assert_eq!(
+            spec.apply(disk(Some(VIRTIO_MEM_ID), false).into_vmm_command()),
+            Err(SpecError::DuplicateId(VIRTIO_MEM_ID.into()))
+        );
+        assert_eq!(spec, original);
     }
 
     #[test]
@@ -293,9 +611,14 @@ mod tests {
 
     #[test]
     fn non_configuration_commands_are_rejected() {
-        assert_eq!(
-            MachineSpec::default().apply(Start.into_vmm_command()),
-            Err(SpecError::NotConfiguration)
-        );
+        let spec = MachineSpec::default();
+        for command in [
+            Start.into_vmm_command(),
+            ResizeMemory(HotplugSizeMib(0)).into_vmm_command(),
+            ResizeMemory(HotplugSizeMib(128)).into_vmm_command(),
+        ] {
+            assert_eq!(spec.apply(command), Err(SpecError::NotConfiguration));
+        }
+        assert_eq!(spec, MachineSpec::default());
     }
 }

@@ -44,6 +44,13 @@ define_schema! {
             config: ".machine.memory_mib";
             route: PUT /v1/machine/memory-mib;
         }
+        machine::SetMemoryHotplug -> ApiResult<()> {
+            config: ".machine.memory_hotplug";
+            route: PUT /v1/machine/memory-hotplug;
+        }
+        machine::ResizeMemory -> ApiResult<()> {
+            route: PATCH /v1/machine/memory-hotplug;
+        }
         machine::SetMemoryBacking -> ApiResult<()> {
             config: ".machine.memory_backing";
             route: PUT /v1/machine/memory-backing;
@@ -88,36 +95,51 @@ mod tests {
 
     #[test]
     fn machine_and_lifecycle_bindings_match_the_api() {
-        for (name, config, path) in [
-            ("SetCpus", Some(".machine.cpus"), "/v1/machine/cpus"),
+        for (name, config, method, path) in [
+            ("SetCpus", Some(".machine.cpus"), "PUT", "/v1/machine/cpus"),
             (
                 "SetMemory",
                 Some(".machine.memory_mib"),
+                "PUT",
                 "/v1/machine/memory-mib",
             ),
             (
+                "SetMemoryHotplug",
+                Some(".machine.memory_hotplug"),
+                "PUT",
+                "/v1/machine/memory-hotplug",
+            ),
+            ("ResizeMemory", None, "PATCH", "/v1/machine/memory-hotplug"),
+            (
                 "SetMemoryBacking",
                 Some(".machine.memory_backing"),
+                "PUT",
                 "/v1/machine/memory-backing",
             ),
             (
                 "SetConsole",
                 Some(".machine.console"),
+                "PUT",
                 "/v1/machine/console",
             ),
-            ("SetKernel", Some(".machine.kernel"), "/v1/machine/kernel"),
-            ("AddDisk", Some(".machine.disks[]"), "/v1/disks"),
-            ("Start", None, "/v1/actions/start"),
-            ("Pause", None, "/v1/actions/pause"),
-            ("Resume", None, "/v1/actions/resume"),
-            ("Shutdown", None, "/v1/actions/shutdown"),
+            (
+                "SetKernel",
+                Some(".machine.kernel"),
+                "PUT",
+                "/v1/machine/kernel",
+            ),
+            ("AddDisk", Some(".machine.disks[]"), "PUT", "/v1/disks"),
+            ("Start", None, "PUT", "/v1/actions/start"),
+            ("Pause", None, "PUT", "/v1/actions/pause"),
+            ("Resume", None, "PUT", "/v1/actions/resume"),
+            ("Shutdown", None, "PUT", "/v1/actions/shutdown"),
         ] {
             let op = metadata::OPERATIONS
                 .iter()
                 .find(|op| op.name == name)
                 .unwrap();
             assert_eq!(op.config, config);
-            assert_eq!(op.route, Some(("PUT", path).into()));
+            assert_eq!(op.route, Some((method, path).into()));
         }
     }
 
@@ -128,6 +150,7 @@ mod tests {
             "machine": {
                 "cpus": 2,
                 "memory_mib": 1024,
+                "memory_hotplug": { "size_mib": 256, "block_size_mib": 2, "chunk_size_mib": 128 },
                 "memory_backing": "shared",
                 "console": "stdio",
                 "kernel": { "path": "/test/kernel" },
@@ -148,6 +171,9 @@ mod tests {
             vec![
                 json!({ "set-cpus": 2 }),
                 json!({ "set-memory": 1024 }),
+                json!({ "set-memory-hotplug": {
+                    "size_mib": 256, "block_size_mib": 2, "chunk_size_mib": 128
+                } }),
                 json!({ "set-memory-backing": "shared" }),
                 json!({ "set-console": "stdio" }),
                 json!({ "set-kernel": {
@@ -171,8 +197,66 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
+    fn memory_hotplug_configuration_uses_the_object_payload() {
+        let config = config::Config::parse(json!({
+            "machine": { "memory_hotplug": { "size_mib": 256 } }
+        }))
+        .unwrap();
+        let commands: Vec<_> = config
+            .commands
+            .into_iter()
+            .map(|command| serde_json::to_value(command).unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            vec![json!({ "set-memory-hotplug": { "size_mib": 256 } })]
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
     fn invalid_configuration_reports_missing_paths_and_unknown_fields() {
         for (machine, path, reason) in [
+            (
+                json!({ "memory_hotplug": {} }),
+                ".machine.memory_hotplug",
+                "missing field `size_mib`",
+            ),
+            (
+                json!({ "memory_hotplug": { "size_mib": 256, "unknown": true } }),
+                ".machine.memory_hotplug",
+                "unknown field `unknown`",
+            ),
+            (
+                json!({ "memory_hotplug": { "memory_mib": 256 } }),
+                ".machine.memory_hotplug",
+                "unknown field `memory_mib`",
+            ),
+            (
+                json!({ "memory_hotplug": { "size_mib": "256" } }),
+                ".machine.memory_hotplug",
+                "invalid type",
+            ),
+            (
+                json!({ "memory_hotplug": { "size_mib": 256, "block_size_mib": "2" } }),
+                ".machine.memory_hotplug",
+                "invalid type",
+            ),
+            (
+                json!({ "memory_hotplug": { "size_mib": 256, "chunk_size_mib": true } }),
+                ".machine.memory_hotplug",
+                "invalid type",
+            ),
+            (
+                json!({ "memory_hotplug": 256 }),
+                ".machine.memory_hotplug",
+                "invalid type",
+            ),
+            (
+                json!({ "resize_memory": 0 }),
+                ".machine.resize_memory",
+                "unknown config field",
+            ),
             (
                 json!({ "kernel": {} }),
                 ".machine.kernel",
@@ -225,6 +309,10 @@ mod tests {
                 generator.subschema_for::<machine::SetMemory>(),
             ),
             (
+                "memory_hotplug",
+                generator.subschema_for::<machine::SetMemoryHotplug>(),
+            ),
+            (
                 "memory_backing",
                 generator.subschema_for::<machine::SetMemoryBacking>(),
             ),
@@ -233,6 +321,7 @@ mod tests {
         ] {
             assert_eq!(properties[field], expected.to_value());
         }
+        assert!(properties.get("resize_memory").is_none());
         assert_eq!(properties["disks"]["type"], "array");
         assert_eq!(
             properties["disks"]["items"],

@@ -25,34 +25,80 @@ pub struct SerializedReply {
     pub fds: Fds,
 }
 
+/// Distinguishes an explicit operation rejection from failure to deliver its reply.
+#[cfg(feature = "serde")]
+#[derive(Debug)]
+pub enum SerializedReplyError {
+    /// The operation's diagnostic has already been flattened at the API boundary.
+    Operation(crate::ApiError),
+    /// The reply sender disappeared before delivering a value.
+    Disconnected(oneshot::RecvError),
+    /// Splitting descriptors or serializing the reply failed.
+    Encoding(Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[cfg(feature = "serde")]
+impl std::fmt::Display for SerializedReplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operation(error) => std::fmt::Display::fmt(error, f),
+            Self::Disconnected(error) => std::fmt::Display::fmt(error, f),
+            Self::Encoding(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl std::error::Error for SerializedReplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Operation(_) => None,
+            Self::Disconnected(error) => Some(error),
+            Self::Encoding(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<serde_json::Error> for SerializedReplyError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Encoding(error.into())
+    }
+}
+
 #[cfg(feature = "serde")]
 pub type SerializedReplyWaiter =
-    std::pin::Pin<Box<dyn Future<Output = crate::ApiResult<SerializedReply>> + Send>>;
+    std::pin::Pin<Box<dyn Future<Output = Result<SerializedReply, SerializedReplyError>> + Send>>;
 
 #[cfg(feature = "serde")]
 pub(crate) fn into_request<P, T: Send + 'static, R>(
     parameters: P,
     request: impl FnOnce(P, Reply<T>) -> R,
-    serialize: fn(T) -> crate::ApiResult<SerializedReply>,
+    serialize: fn(T) -> Result<SerializedReply, SerializedReplyError>,
 ) -> (R, SerializedReplyWaiter) {
     let (sender, receiver) = oneshot::channel();
     let request = request(parameters, sender.into());
-    let waiter = Box::pin(async move { serialize(receiver.await?) });
+    let waiter = Box::pin(async move {
+        let value = receiver.await.map_err(SerializedReplyError::Disconnected)?;
+        serialize(value)
+    });
     (request, waiter)
 }
 
 #[cfg(feature = "serde")]
 pub(crate) trait SerializeReply<T> {
-    fn serialize_reply(self, value: T) -> crate::ApiResult<SerializedReply>;
+    fn serialize_reply(self, value: T) -> Result<SerializedReply, SerializedReplyError>;
 }
 
 // Autoref selects the ordinary-reply fallback without overlapping ApiResult.
 #[cfg(feature = "serde")]
 impl<T: serde::Serialize + SplitFd> SerializeReply<T> for &PhantomData<T> {
-    fn serialize_reply(self, mut value: T) -> crate::ApiResult<SerializedReply> {
-        let fds = value.split_fd()?;
+    fn serialize_reply(self, mut value: T) -> Result<SerializedReply, SerializedReplyError> {
+        let fds = value
+            .split_fd()
+            .map_err(|error| SerializedReplyError::Encoding(error.into()))?;
         Ok(SerializedReply {
-            value: serde_json::to_value(value)?,
+            value: serde_json::to_value(value).map_err(SerializedReplyError::from)?,
             fds,
         })
     }
@@ -62,8 +108,11 @@ impl<T: serde::Serialize + SplitFd> SerializeReply<T> for &PhantomData<T> {
 impl<T: serde::Serialize + SplitFd> SerializeReply<crate::ApiResult<T>>
     for PhantomData<crate::ApiResult<T>>
 {
-    fn serialize_reply(self, value: crate::ApiResult<T>) -> crate::ApiResult<SerializedReply> {
-        (&PhantomData::<T>).serialize_reply(value?)
+    fn serialize_reply(
+        self,
+        value: crate::ApiResult<T>,
+    ) -> Result<SerializedReply, SerializedReplyError> {
+        (&PhantomData::<T>).serialize_reply(value.map_err(SerializedReplyError::Operation)?)
     }
 }
 
@@ -80,7 +129,7 @@ mod tests {
     use crate::live_upgrade::{HandoverState, LiveUpgradeState};
     use crate::{ApiError, ApiResult, RawVmmOp, VmmRequest};
 
-    fn ready(mut waiter: SerializedReplyWaiter) -> ApiResult<SerializedReply> {
+    fn ready(mut waiter: SerializedReplyWaiter) -> Result<SerializedReply, SerializedReplyError> {
         let Poll::Ready(result) = waiter
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -155,14 +204,39 @@ mod tests {
             panic!("expected HandoverState");
         };
         reply.send(Err(ApiError::msg("handover failed")));
-        assert_eq!(ready(waiter).unwrap_err(), ApiError::msg("handover failed"));
+        let SerializedReplyError::Operation(error) = ready(waiter).unwrap_err() else {
+            panic!("expected an operation rejection");
+        };
+        assert_eq!(error, ApiError::msg("handover failed"));
 
         let (request, waiter) = HandoverState {}.into_vmm_command().into_request();
         drop(request);
-        assert_eq!(
-            ready(waiter).unwrap_err(),
-            ApiError::from(oneshot::RecvError)
-        );
+        assert!(matches!(
+            ready(waiter),
+            Err(SerializedReplyError::Disconnected(_))
+        ));
+    }
+
+    #[test]
+    fn failures_with_identical_diagnostics_keep_distinct_types() {
+        let message = "machine is not started";
+        let operation = SerializedReplyError::Operation(ApiError::msg(message));
+        assert!(std::error::Error::source(&operation).is_none());
+        let SerializedReplyError::Operation(error) = operation else {
+            panic!("expected operation rejection");
+        };
+        assert_eq!(error, ApiError::msg(message));
+
+        let encoding = SerializedReplyError::Encoding(ApiError::msg(message).into());
+        assert!(std::error::Error::source(&encoding).is_some());
+        assert!(matches!(encoding, SerializedReplyError::Encoding(_)));
+
+        let disconnected = SerializedReplyError::Disconnected(oneshot::RecvError);
+        assert!(std::error::Error::source(&disconnected).is_some());
+        assert!(matches!(
+            disconnected,
+            SerializedReplyError::Disconnected(_)
+        ));
     }
 
     #[test]
@@ -172,10 +246,10 @@ mod tests {
             panic!("expected HandoverState");
         };
         reply.send(Ok(LiveUpgradeState { test_fd: None }));
-        assert_eq!(
-            ready(waiter).unwrap_err(),
-            ApiError::msg("test_fd is not bound")
-        );
+        let SerializedReplyError::Encoding(error) = ready(waiter).unwrap_err() else {
+            panic!("expected a descriptor encoding failure");
+        };
+        assert_eq!(error.to_string(), "test_fd is not bound");
     }
 
     #[test]
@@ -204,7 +278,10 @@ mod tests {
             } else {
                 PhantomData::<FailingState>.serialize_reply(state)
             };
-            assert_eq!(result.unwrap_err(), ApiError::msg("partial split failed"));
+            let SerializedReplyError::Encoding(error) = result.unwrap_err() else {
+                panic!("expected a descriptor encoding failure");
+            };
+            assert_eq!(error.to_string(), "partial split failed");
             for peer in [&mut first_peer, &mut second_peer] {
                 peer.set_nonblocking(true).unwrap();
                 assert_eq!(peer.read(&mut [0]).unwrap(), 0);
@@ -255,10 +332,14 @@ mod tests {
         let state = FailingState(LiveUpgradeState {
             test_fd: Some(socket.into()),
         });
-        let error = PhantomData::<FailingState>
+        let SerializedReplyError::Encoding(error) = PhantomData::<FailingState>
             .serialize_reply(state)
-            .unwrap_err();
+            .unwrap_err()
+        else {
+            panic!("expected a JSON encoding failure");
+        };
         assert_eq!(error.to_string(), "serialization failed");
+        assert!(error.is::<serde_json::Error>());
         peer.set_nonblocking(true).unwrap();
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }

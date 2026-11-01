@@ -5,9 +5,10 @@ use kvm_ioctls::Cap;
 
 use super::MachineEvents;
 use super::block::{AttachBlockError, BlockSnapshot, CaptureBlockError, PreparedBlock};
-use super::build::{BuildError, assemble_parked};
+use super::build::{BuildError, PreparedDevice, assemble_parked};
 use super::cleanup::PendingCleanup;
 use super::kvm_state::{self, CaptureVmError, RestoreVmError, VcpuSnapshot, VmKvmState};
+use super::mem::MemSnapshot;
 use super::plan::{DevicePlan, MachinePlan, PlanError};
 use super::platform::{
     ConsoleBackend, PlatformCaptureError, PlatformError, PlatformQuiesced, PlatformRestoreError,
@@ -24,6 +25,7 @@ use crate::vm::{Binding, CreateVmError, KvmVcpuError, KvmVm, MemSlots, create_vm
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceSnapshot {
     Block(BlockSnapshot),
+    Mem(MemSnapshot),
 }
 
 /// Same-host machine state, separate from the uniquely owned RAM and all host endpoints.
@@ -38,6 +40,8 @@ pub struct MachineSnapshot {
 
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub enum CaptureError {
+    /// whole-machine memory hotplug snapshots are not supported yet; population must be captured with RAM
+    MemoryHotplugUnsupported,
     /// capture block device {id}
     Block {
         id: String,
@@ -56,6 +60,8 @@ pub enum CaptureError {
 pub enum RebuildError {
     /// rebuilding a machine needs a tokio runtime on this thread
     NoRuntime,
+    /// whole-machine memory hotplug rebuild is not supported yet; empty population cannot replace captured state
+    MemoryHotplugUnsupported,
     /// replay the recorded machine plan
     Plan(#[from] PlanError),
     /// supplied RAM does not have the recorded layout
@@ -96,6 +102,8 @@ pub enum RebuildError {
     MissingDevice(String),
     /// snapshot has state for unplanned device {0}
     ExtraDevice(String),
+    /// snapshot device {0} has the wrong kind for its plan
+    DeviceKind(String),
     /// validate saved platform state
     PlatformState(#[from] PlatformRestoreError),
     /// prepare or signal a block device
@@ -164,6 +172,9 @@ fn capture_devices(
     parts: &Parts,
     blocks: &BTreeMap<String, QuiescedBlock>,
 ) -> Result<BTreeMap<String, DeviceSnapshot>, CaptureError> {
+    if parts.plan.memory_hotplug().is_some() || !parts.mems.is_empty() {
+        return Err(CaptureError::MemoryHotplugUnsupported);
+    }
     parts
         .blocks
         .iter()
@@ -192,14 +203,17 @@ fn capture_platform(
 impl PausedMachine {
     /// Fresh quiesce replies prove worker liveness and retain pending input while CPUs stay parked.
     pub async fn capture(&self) -> Result<MachineSnapshot, CaptureError> {
-        let (quiesced_platform, blocks) = self.parts.quiesce_devices().await;
-        let devices = capture_devices(&self.parts, &blocks)?;
-        let platform = capture_platform(&self.parts, &quiesced_platform)?;
+        if self.parts.plan.memory_hotplug().is_some() || !self.parts.mems.is_empty() {
+            return Err(CaptureError::MemoryHotplugUnsupported);
+        }
+        let (quiesced_platform, blocks, _, _) = self.parts.quiesce_devices().await;
+        let devices = capture_devices(self.parts.as_ref(), &blocks)?;
+        let platform = capture_platform(self.parts.as_ref(), &quiesced_platform)?;
         let vcpus = self.parts.vcpus.capture_state(self.parts.vm.fd())?;
         let vm = kvm_state::capture_vm_kvm(self.parts.vm.fd())?;
         // Refuse a guest-visible worker that exited while KVM state was read.
-        capture_devices(&self.parts, &blocks)?;
-        capture_platform(&self.parts, &quiesced_platform)?;
+        capture_devices(self.parts.as_ref(), &blocks)?;
+        capture_platform(self.parts.as_ref(), &quiesced_platform)?;
         Ok(MachineSnapshot {
             plan: self.parts.plan.clone(),
             vm,
@@ -216,6 +230,9 @@ fn preflight(
     host: &HostCapabilities,
 ) -> Result<(), RebuildError> {
     let plan = &snapshot.plan;
+    if plan.memory_hotplug().is_some() {
+        return Err(RebuildError::MemoryHotplugUnsupported);
+    }
     plan.replay(host)?;
     if memory.layout() != plan.memory() {
         return Err(RebuildError::MemoryLayout);
@@ -244,9 +261,12 @@ fn preflight(
     {
         return Err(RebuildError::Irqchips);
     }
-    for id in plan.devices().keys() {
-        if !snapshot.devices.contains_key(id) {
-            return Err(RebuildError::MissingDevice(id.clone()));
+    for (id, device) in plan.devices() {
+        match (device, snapshot.devices.get(id)) {
+            (_, None) => return Err(RebuildError::MissingDevice(id.clone())),
+            (DevicePlan::Block(_), Some(DeviceSnapshot::Block(_))) => {}
+            (DevicePlan::Mem(_), _) => return Err(RebuildError::MemoryHotplugUnsupported),
+            _ => return Err(RebuildError::DeviceKind(id.clone())),
         }
     }
     for id in snapshot.devices.keys() {
@@ -360,13 +380,16 @@ pub(super) async fn rebuild_with(
         .map(|(id, state)| match (&plan.devices()[&id], state) {
             (DevicePlan::Block(block), DeviceSnapshot::Block(state)) => {
                 PreparedBlock::restore(&id, block, memory.view(), state)
-                    .map(|prepared| (id, prepared))
+                    .map(|prepared| (id, PreparedDevice::Block(prepared)))
+                    .map_err(RebuildError::Block)
             }
+            (DevicePlan::Mem(_), _) => Err(RebuildError::MemoryHotplugUnsupported),
+            _ => Err(RebuildError::DeviceKind(id)),
         })
         .collect::<Result<BTreeMap<_, _>, _>>();
     let prepared = match prepared {
         Ok(prepared) => prepared,
-        Err(error) => return Err(RebuildFailure::ready(RebuildError::Block(error), memory)),
+        Err(error) => return Err(RebuildFailure::ready(error, memory)),
     };
     let (vm, bindings, slots) = match create_vm(ctx, memory) {
         Ok(created) => created,
@@ -400,16 +423,16 @@ pub(super) async fn rebuild_with(
         plan, vm, bindings, slots, vcpus, prepared, &platform, console,
     )
     .map_err(|(pending, error)| RebuildFailure::pending(RebuildError::Assembly(error), pending))?;
-    let (platform, blocks) = paused.parts.quiesce_devices().await;
-    let verified = capture_devices(&paused.parts, &blocks)
-        .and_then(|_| capture_platform(&paused.parts, &platform));
+    let (platform, blocks, mems, memory_services) = paused.parts.quiesce_devices().await;
+    let verified = capture_devices(paused.parts.as_ref(), &blocks)
+        .and_then(|_| capture_platform(paused.parts.as_ref(), &platform));
     if let Err(error) = verified {
         return Err(RebuildFailure::pending(
             RebuildError::Quiesce(error),
             paused.into_cleanup(),
         ));
     }
-    paused.record_quiesced(platform, blocks);
+    paused.record_quiesced(platform, blocks, mems, memory_services);
     for block in paused.parts.blocks.values() {
         if let Err(error) = block.reraise_pending() {
             return Err(RebuildFailure::pending(
@@ -563,6 +586,77 @@ mod tests {
             devices: BTreeMap::from([("root".into(), block)]),
         };
         (saved, memory, host)
+    }
+
+    #[test]
+    fn block_preflight_rejects_memory_device_state_before_opening_backends() {
+        for kind in [BackingKind::AnonymousPrivate, BackingKind::SharedMemfd] {
+            let (mut saved, memory, host) = fixture(kind);
+            let DeviceSnapshot::Block(block) = saved.devices.remove("root").unwrap() else {
+                panic!("fixture root is not a block device")
+            };
+            saved.devices.insert(
+                "root".into(),
+                DeviceSnapshot::Mem(MemSnapshot {
+                    transport: block.transport,
+                    state: crate::devices::virtio::mem::MemQuiesced {
+                        requested_size: 0,
+                        usable_region_size: 0,
+                        memory_revision: 0,
+                        queue: None,
+                    },
+                }),
+            );
+            assert!(matches!(preflight(&saved, &memory, &host),
+                Err(RebuildError::DeviceKind(id)) if id == "root"
+            ));
+        }
+    }
+
+    #[test]
+    fn hotplug_rebuild_preflight_refuses_without_creating_a_vm_or_losing_original_ram() {
+        use api::machine::{MemoryHotplugConfig, SetMemoryHotplug};
+
+        for kind in [BackingKind::AnonymousPrivate, BackingKind::SharedMemfd] {
+            let (mut saved, boot, host) = fixture(kind);
+            let spec = MachineSpec::default()
+                .apply(
+                    SetKernel(KernelConfig {
+                        path: "/never-opened/kernel".into(),
+                        cmdline: None,
+                        initrd: None,
+                    })
+                    .into_vmm_command(),
+                )
+                .unwrap()
+                .apply(
+                    SetMemoryHotplug(MemoryHotplugConfig {
+                        size_mib: 128,
+                        block_size_mib: None,
+                        chunk_size_mib: None,
+                    })
+                    .into_vmm_command(),
+                )
+                .unwrap();
+            saved.plan = MachinePlan::new(&spec, &host).unwrap().0;
+            let policy = *boot.policy();
+            drop(boot);
+            let memory =
+                MemoryStore::materialize(saved.plan.memory().clone(), policy, &host).unwrap();
+            let weak = Arc::downgrade(memory.view());
+            saved.vcpus.clear();
+            saved.devices.clear();
+            let error = preflight(&saved, &memory, &host).unwrap_err();
+            assert!(matches!(error, RebuildError::MemoryHotplugUnsupported));
+            let failure = RebuildFailure::ready(error, memory);
+            let RebuildMemory::Ready(memory) = failure.memory else {
+                panic!("unsupported memory snapshot retained a VM")
+            };
+            assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), memory.view()));
+            assert_eq!(memory.policy().kind, kind);
+            drop(memory);
+            assert!(weak.upgrade().is_none());
+        }
     }
 
     #[test]

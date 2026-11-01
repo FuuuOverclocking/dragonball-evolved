@@ -503,7 +503,9 @@ async fn changed_backend_is_rejected_with_ready_ram_before_assembly_on_kvm() {
         .unwrap();
         let paused = running.pause().await.map_err(|(_, error)| error).unwrap();
         let saved = paused.capture().await.unwrap();
-        let DeviceSnapshot::Block(root_state) = &saved.devices["root"];
+        let DeviceSnapshot::Block(root_state) = &saved.devices["root"] else {
+            panic!("root snapshot has the wrong device kind")
+        };
         assert!(root_state.queue.is_some());
         let memory = paused.teardown().await.unwrap();
         closed(&mut events).await;
@@ -535,6 +537,41 @@ async fn changed_backend_is_rejected_with_ready_ram_before_assembly_on_kvm() {
         drop(memory);
         assert!(weak.upgrade().is_none(), "preparation retained queued RAM");
         disk.set_len(512).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cold_build_assembly_failure_returns_pending_cleanup_on_kvm() {
+    let Some(context) = kvm() else { return };
+    let kernel = TempFile::new(&elf::image(&LOOP, true));
+    for backing in [MemoryBacking::Anonymous, MemoryBacking::Shared] {
+        let configured = spec(
+            &kernel,
+            None,
+            vec![SetMemoryBacking(backing).into_vmm_command()],
+        );
+        let (plan, policy) = MachinePlan::new(&configured, context.capabilities()).unwrap();
+        let layout = plan.memory().clone();
+        let failure = build_with(
+            plan,
+            policy,
+            &context,
+            ConsoleBackend::Captured(Captured::default()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.error,
+            BuildError::Platform(PlatformError::Spawn { .. })
+        ));
+        let BuildCleanup::Pending(pending) = failure.cleanup else {
+            panic!("cold assembly failure discarded its cleanup owner")
+        };
+        let memory = pending.wait(TIMEOUT).await.unwrap();
+        assert_eq!(memory.layout(), &layout);
+        assert_eq!(memory.policy(), &policy);
+        let weak = std::sync::Arc::downgrade(memory.view());
+        drop(memory);
+        assert!(weak.upgrade().is_none());
     }
 }
 

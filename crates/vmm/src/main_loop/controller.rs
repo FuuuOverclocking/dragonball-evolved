@@ -17,6 +17,7 @@ use std::pin::Pin;
 use api::instance_info::{InstanceInfo, VmState};
 use api::live_upgrade::LiveUpgradeState;
 use api::logger::{LoggerConfig, UpdateLogger};
+use api::machine::{HotplugSizeMib, ResizeMemory};
 use api::{ApiResult, Reply, VmmCommand, VmmRequest};
 use logger::{error_unlimited, info_unlimited, warn_unlimited};
 
@@ -24,15 +25,15 @@ use crate::VmmExitStatus;
 use crate::devices::runtime::DeviceExit;
 use crate::error::{api_error, render_chain};
 use crate::machine::{
-    BuildError, MachineEvent, MachineEvents, PauseError, PlanError, ResumeError, TeardownError,
-    VcpuError,
+    BuildError, MachineEvent, MachineEvents, MachineResizeError, PauseError, PendingCleanup,
+    PlanError, ResumeError, TeardownError, VcpuError,
 };
+use crate::memory::layout::WindowId;
 use crate::process_ctx::UpdateLoggerFn;
 use crate::spec::MachineSpec;
 use crate::vmm_server::Inbound;
 
-/// A lifecycle operation: a machine's own transition, polled by the loop
-/// until it finishes. Its waits are bounded, so it always does.
+/// A local operation, borrowed by the loop until it finishes on its own.
 pub(super) type Operation<T> = Pin<Box<dyn Future<Output = T>>>;
 
 /// Why a request is refused in the state the machine is in.
@@ -42,6 +43,8 @@ pub(super) enum Rejection {
     NotStarted,
     /// machine is already started
     AlreadyStarted,
+    /// machine is not running
+    NotRunning,
     /// machine configuration cannot change after Start
     ConfigurationFrozen,
     /// lifecycle operation in progress
@@ -60,13 +63,26 @@ pub(super) enum StartError {
     Resume(#[source] ResumeError),
     /// tear down the machine after a failed Start
     Teardown(#[source] TeardownError),
+    /// clean up the machine after a failed cold build
+    BuildCleanup {
+        #[source]
+        error: TeardownError,
+        pending: PendingCleanup,
+    },
 }
+
+// Publication cannot be promised after terminal cleanup failure.
+/// memory hotplug publication is unavailable because the machine is stopping
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
+pub(super) struct ResizeUnavailable;
 
 /// Why the vmm thread ends with an error.
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub(super) enum ExitError {
     /// vCPU {index} failed: {error}
     VcpuFailed { index: u8, error: String },
+    /// memory service for window {0} exited unexpectedly; guest RAM may no longer be CPU-mapped
+    MemoryServiceFailed(WindowId),
     /// tear down the machine
     Teardown(#[source] TeardownError),
 }
@@ -101,15 +117,24 @@ pub(super) enum Controller<R, P, F> {
     NotStarted(MachineSpec),
     Running(Live<R>),
     Paused(Live<P>),
-    /// An operation owns the machine until it finishes on its own.
+    /// The machine is retained until the operation finishes on its own.
     Busy(Busy<R, P, F>),
 }
 
-/// The lifecycle operation in flight.
+/// The operation in flight.
 pub(super) enum Busy<R, P, F> {
     Starting(Starting<R>),
     Pausing(Transition<P, F, PauseError>),
     Resuming(Transition<R, F, ResumeError>),
+    Resizing(Resizing<R>),
+}
+
+/// Publication wait; the running machine stays outside the operation future.
+pub(super) struct Resizing<R> {
+    pub(super) machine: R,
+    reply: Reply<ApiResult<()>>,
+    pub(super) events: MachineEvents,
+    pub(super) operation: Operation<Result<(), MachineResizeError>>,
 }
 
 /// Start's first resume of a machine just built.
@@ -124,7 +149,7 @@ pub(super) struct Starting<R> {
     pub(super) operation: Operation<Result<R, StartError>>,
 }
 
-/// Pause or Resume: success yields `T`, CPU failure yields teardown-only `F`.
+/// Pause or Resume: success yields `T`, failure yields teardown-only `F`.
 pub(super) struct Transition<T, F, E> {
     reply: Reply<ApiResult<()>>,
     /// Listened to while the machine moves.
@@ -150,6 +175,10 @@ pub(super) enum Exit {
     GuestReset,
     /// A vCPU failed; `error` is its rendered source chain.
     VcpuFailed { index: u8, error: String },
+    /// A retained memory service exited, possibly dropping live registrations.
+    MemoryServiceFailed(WindowId),
+    /// A memory service did not prove resume safe; its rendered error chain.
+    MemoryServiceResumeFailed(String),
     /// A failed Start could not tear down its machine; already rendered.
     StartTeardown(String),
     /// A CPU timed out, panicked or could not be joined; already rendered.
@@ -168,11 +197,18 @@ pub(super) enum Next<R, P, F> {
     Pause(Live<R>, Reply<ApiResult<()>>),
     /// Hand the paused machine to a resume.
     Resume(Live<P>, Reply<ApiResult<()>>),
-    /// Stop taking requests, let the operation in flight finish, tear down
-    /// what is left, and end the vmm thread.
+    /// Enqueue a target and wait for its publication with the machine retained.
+    Resize(Live<R>, HotplugSizeMib, Reply<ApiResult<()>>),
+    /// Stop admission and end the VMM after cleanup. CPU transitions finish
+    /// first; resize publication and teardown must be polled together.
     Exit(Controller<R, P, F>, Exit),
     /// Close admission and tear down a failed transition's sole owner.
     Terminate(Live<F>, Exit),
+    /// Cleanup failed: retain its concrete error/owner until terminal handling.
+    StartTeardown {
+        error: StartError,
+        events: MachineEvents,
+    },
 }
 
 /// What is left to tear down once no operation holds the machine.
@@ -193,6 +229,7 @@ enum Request {
     Start(Reply<ApiResult<()>>),
     Pause(Reply<ApiResult<()>>),
     Resume(Reply<ApiResult<()>>),
+    Resize(HotplugSizeMib, Reply<ApiResult<()>>),
     Shutdown(Reply<ApiResult<()>>),
     HandoverState(Reply<ApiResult<LiveUpgradeState>>),
 }
@@ -210,6 +247,10 @@ impl From<VmmRequest> for Request {
             VmmRequest::SetMemory(value, reply) => {
                 Self::Configure(VmmCommand::SetMemory(value, ()), reply)
             }
+            VmmRequest::SetMemoryHotplug(value, reply) => {
+                Self::Configure(VmmCommand::SetMemoryHotplug(value, ()), reply)
+            }
+            VmmRequest::ResizeMemory(ResizeMemory(size), reply) => Self::Resize(size, reply),
             VmmRequest::SetMemoryBacking(value, reply) => {
                 Self::Configure(VmmCommand::SetMemoryBacking(value, ()), reply)
             }
@@ -237,8 +278,57 @@ impl<R, P, F> Controller<R, P, F> {
     fn state(&self) -> VmState {
         match self {
             Self::NotStarted(_) | Self::Busy(Busy::Starting(_)) => VmState::NotStarted,
-            Self::Running(_) | Self::Busy(Busy::Pausing(_)) => VmState::Running,
+            Self::Running(_) | Self::Busy(Busy::Pausing(_) | Busy::Resizing(_)) => VmState::Running,
             Self::Paused(_) | Self::Busy(Busy::Resuming(_)) => VmState::Paused,
+        }
+    }
+}
+
+impl<R> Resizing<R> {
+    pub(super) fn new(
+        running: Live<R>,
+        reply: Reply<ApiResult<()>>,
+        operation: Operation<Result<(), MachineResizeError>>,
+    ) -> Self {
+        Self {
+            machine: running.machine,
+            reply,
+            events: running.events,
+            operation,
+        }
+    }
+
+    /// Transfer the original owner into teardown without cancelling publication.
+    pub(super) fn into_shutdown(
+        self,
+    ) -> (
+        R,
+        MachineEvents,
+        Reply<ApiResult<()>>,
+        Operation<Result<(), MachineResizeError>>,
+    ) {
+        let Self {
+            machine,
+            events,
+            reply,
+            operation,
+        } = self;
+        (machine, events, reply, operation)
+    }
+
+    fn finish(self, result: Result<(), MachineResizeError>) -> Live<R> {
+        let (machine, events, reply, _operation) = self.into_shutdown();
+        reply_resized(reply, result);
+        Live { machine, events }
+    }
+}
+
+pub(super) fn reply_resized(reply: Reply<ApiResult<()>>, result: Result<(), MachineResizeError>) {
+    match result {
+        Ok(()) => reply.send(Ok(())),
+        Err(error) => {
+            warn_unlimited!("{}", render_chain(&error));
+            reply.send(Err(api_error(&error)));
         }
     }
 }
@@ -259,9 +349,11 @@ impl<R> Starting<R> {
         }
     }
 
-    /// Answers the Start. Hands back the running machine with its events, or
-    /// the spec of a machine that did not start and is gone.
-    fn finish(self, result: Result<R, StartError>) -> Result<Live<R>, MachineSpec> {
+    /// Answers Start without discarding an error that may still own cleanup.
+    fn finish(
+        self,
+        result: Result<R, StartError>,
+    ) -> Result<Live<R>, (MachineSpec, MachineEvents, StartError)> {
         let Self {
             spec,
             reply,
@@ -276,7 +368,7 @@ impl<R> Starting<R> {
             Err(error) => {
                 warn_unlimited!("{}", render_chain(&error));
                 reply.send(Err(api_error(&error)));
-                Err(spec)
+                Err((spec, events, error))
             }
         }
     }
@@ -379,6 +471,14 @@ pub(super) fn on_request<R, P, F>(
             Controller::Paused(paused) => Next::Resume(paused, reply),
             busy @ Controller::Busy(_) => refuse(busy, reply, Rejection::InProgress),
         },
+        Request::Resize(size, reply) => match controller {
+            not_started @ Controller::NotStarted(_) => {
+                refuse(not_started, reply, Rejection::NotStarted)
+            }
+            Controller::Running(running) => Next::Resize(running, size, reply),
+            paused @ Controller::Paused(_) => refuse(paused, reply, Rejection::NotRunning),
+            busy @ Controller::Busy(_) => refuse(busy, reply, Rejection::InProgress),
+        },
         Request::Shutdown(reply) => {
             // Accepted, not done: tearing down comes after, and how it went
             // shows only in the exit status.
@@ -415,7 +515,7 @@ pub(super) fn on_detached<R, P, F>(controller: Controller<R, P, F>) -> Next<R, P
         }
         started @ (Controller::Running(_)
         | Controller::Paused(_)
-        | Controller::Busy(Busy::Pausing(_) | Busy::Resuming(_))) => {
+        | Controller::Busy(Busy::Pausing(_) | Busy::Resuming(_) | Busy::Resizing(_))) => {
             warn_detached();
             Next::Stay(started)
         }
@@ -439,19 +539,17 @@ pub(super) fn on_event<R, P, F>(controller: Controller<R, P, F>, event: Event) -
             Next::Exit(controller, Exit::VcpuFailed { index, error })
         }
         Event::Device(exit) => {
-            // Its supervisor has logged why. A local failure: the guest runs on.
-            warn_unlimited!(
-                "device {} has exited; the machine runs on without it",
-                exit.name
-            );
+            // Its supervisor has logged why. The concrete loop checks retained
+            // memory service handles independently; task names cannot decide
+            // whether this is a local device fault or a lost RAM dependency.
+            warn_unlimited!("device {} has exited", exit.name);
             Next::Stay(controller)
         }
     }
 }
 
-/// Hands a machine just built to its first resume, or answers why it could
-/// not be built. Nothing of a failed build is left, so the same spec can be
-/// fixed and started again.
+/// Starts the first resume or pending cold-build cleanup. An immediate error
+/// must have no remaining owner; only that case may be retried at once.
 pub(super) fn on_built<R, P, F>(
     spec: MachineSpec,
     reply: Reply<ApiResult<()>>,
@@ -474,19 +572,19 @@ pub(super) fn on_started<R, P, F>(
     result: Result<R, StartError>,
 ) -> Next<R, P, F> {
     let detached = starting.detached;
-    let teardown = match &result {
-        Err(error @ StartError::Teardown(_)) => Some(render_chain(error)),
-        Ok(_) | Err(StartError::Plan(_) | StartError::Build(_) | StartError::Resume(_)) => None,
-    };
     match starting.finish(result) {
-        Err(spec) if teardown.is_some() => Next::Exit(
-            Controller::NotStarted(spec),
-            Exit::StartTeardown(teardown.unwrap()),
-        ),
         Ok(running) => Next::Stay(Controller::Running(running)),
-        // Nobody is left to start it again.
-        Err(spec) if detached => Next::Exit(Controller::NotStarted(spec), Exit::Detached),
-        Err(spec) => Next::Stay(Controller::NotStarted(spec)),
+        Err((_, events, error @ (StartError::Teardown(_) | StartError::BuildCleanup { .. }))) => {
+            Next::StartTeardown { error, events }
+        }
+        Err((spec, _, StartError::Plan(_) | StartError::Build(_) | StartError::Resume(_))) => {
+            if detached {
+                // Nobody is left to start it again.
+                Next::Exit(Controller::NotStarted(spec), Exit::Detached)
+            } else {
+                Next::Stay(Controller::NotStarted(spec))
+            }
+        }
     }
 }
 
@@ -511,10 +609,26 @@ pub(super) fn on_resumed<R, P, F>(
     let failure = result
         .as_ref()
         .err()
-        .map(|(_, error)| transition_failure(error, &error.0));
+        .map(|(_, error)| resume_failure(error));
     match resuming.finish(result) {
         Ok(running) => Next::Stay(Controller::Running(running)),
-        Err(failed) => Next::Terminate(failed, failure.expect("failed CPU transition")),
+        Err(failed) => Next::Terminate(failed, failure.expect("failed resume transition")),
+    }
+}
+
+pub(super) fn on_resized<R, P, F>(
+    resizing: Resizing<R>,
+    result: Result<(), MachineResizeError>,
+) -> Next<R, P, F> {
+    Next::Stay(Controller::Running(resizing.finish(result)))
+}
+
+pub(super) fn resume_failure(error: &ResumeError) -> Exit {
+    match error {
+        ResumeError::Vcpus(vcpu) => transition_failure(error, vcpu),
+        ResumeError::MemoryServiceTimedOut(_) | ResumeError::MemoryServiceExited(_) => {
+            Exit::MemoryServiceResumeFailed(render_chain(error))
+        }
     }
 }
 
@@ -528,9 +642,8 @@ pub(super) fn transition_failure(error: &dyn Error, vcpu: &VcpuError) -> Exit {
     }
 }
 
-/// Lets the operation in flight, if any, finish on its own and answer its
-/// request, then hands back the machine left to tear down. The VMM is
-/// stopping, so a Start that fails is not offered again.
+/// Settles non-resize operations for decision specs. Resize needs the loop's
+/// concurrent shutdown path; cleanup failures need on_started's terminal path.
 #[cfg(test)]
 pub(super) async fn settle<R, P, F>(controller: Controller<R, P, F>) -> Settled<R, P, F> {
     match controller {
@@ -541,7 +654,19 @@ pub(super) async fn settle<R, P, F>(controller: Controller<R, P, F>) -> Settled<
             let result = (&mut starting.operation).await;
             match starting.finish(result) {
                 Ok(running) => Settled::Running(running.machine),
-                Err(_) => Settled::Nothing,
+                Err((_, _, StartError::Plan(_) | StartError::Build(_) | StartError::Resume(_))) => {
+                    Settled::Nothing
+                }
+                Err((
+                    _,
+                    _,
+                    error @ (StartError::Teardown(_) | StartError::BuildCleanup { .. }),
+                )) => {
+                    panic!(
+                        "cleanup failure requires terminal handling: {}",
+                        render_chain(&error)
+                    )
+                }
             }
         }
         Controller::Busy(Busy::Pausing(mut pausing)) => {
@@ -558,6 +683,9 @@ pub(super) async fn settle<R, P, F>(controller: Controller<R, P, F>) -> Settled<
                 Err(failed) => Settled::Failed(failed.machine),
             }
         }
+        Controller::Busy(Busy::Resizing(_)) => {
+            panic!("resize requires concurrent teardown and publication polling")
+        }
     }
 }
 
@@ -572,7 +700,11 @@ pub(super) fn exit_status(exit: Exit, teardown: Result<(), TeardownError>) -> Vm
         Exit::VcpuFailed { index, error } => {
             VmmExitStatus::Error(render_chain(&ExitError::VcpuFailed { index, error }))
         }
+        Exit::MemoryServiceFailed(window) => {
+            VmmExitStatus::Error(render_chain(&ExitError::MemoryServiceFailed(window)))
+        }
         Exit::StartTeardown(error)
+        | Exit::MemoryServiceResumeFailed(error)
         | Exit::TransitionFailed(error)
         | Exit::TransitionExited(error) => VmmExitStatus::Error(error),
     }
@@ -590,12 +722,16 @@ mod tests {
     use api::instance_info::GetInstanceInfo;
     use api::lifecycle::{Pause, Resume, Shutdown, Start};
     use api::live_upgrade::HandoverState;
-    use api::machine::{ConsoleConfig, MemorySizeMib, SetConsole, SetCpus, SetMemory, VcpuCount};
+    use api::machine::{
+        ConsoleConfig, MemoryHotplugConfig, MemorySizeMib, SetConsole, SetCpus, SetMemory,
+        SetMemoryHotplug, VcpuCount,
+    };
     use api::{ApiError, RawVmmOp};
     use tokio::sync::mpsc;
 
     use super::*;
     use crate::devices::runtime::DeviceRuntime;
+    use crate::devices::virtio::mem::ResizeError;
     use crate::spec::SpecError;
 
     /// A running machine, as far as the decisions can tell.
@@ -695,6 +831,25 @@ mod tests {
         (finish, answer, Controller::Busy(Busy::Resuming(resuming)))
     }
 
+    fn mock_resize() -> (
+        oneshot::Sender<Result<(), MachineResizeError>>,
+        Answer,
+        Fake,
+    ) {
+        let (finish, operation) = operation();
+        let (reply, answer) = make_reply();
+        let resizing = Resizing::new(live(Running(1)), reply, operation);
+        (finish, answer, Controller::Busy(Busy::Resizing(resizing)))
+    }
+
+    fn hotplug() -> SetMemoryHotplug {
+        SetMemoryHotplug(MemoryHotplugConfig {
+            size_mib: 128,
+            block_size_mib: Some(2),
+            chunk_size_mib: Some(8),
+        })
+    }
+
     fn stay(next: Next<Running, Paused, FakeFailed>) -> Fake {
         match next {
             Next::Stay(controller) => controller,
@@ -747,6 +902,11 @@ mod tests {
         let mut add = |name, (request, answer)| writes.push((name, request, answer));
         add("SetCpus", make_request(SetCpus(VcpuCount(2))));
         add("SetMemory", make_request(SetMemory(MemorySizeMib(32))));
+        add("SetMemoryHotplug", make_request(hotplug()));
+        add(
+            "ResizeMemory",
+            make_request(ResizeMemory(HotplugSizeMib(32))),
+        );
         add(
             "SetMemoryBacking",
             make_request(api::machine::SetMemoryBacking(
@@ -792,6 +952,73 @@ mod tests {
             let (request, answer) = make_request(Start);
             stay(on_request(controller, request, INSTANCE));
             assert_eq!(answer.try_recv(), refused(Rejection::AlreadyStarted));
+        }
+    }
+
+    #[test]
+    fn memory_hotplug_configuration_applies_only_before_start() {
+        let spec = MachineSpec::default();
+        let configured = spec.apply(hotplug().into_vmm_command()).unwrap();
+        let (request, answer) = make_request(hotplug());
+        let controller = stay(on_request(Fake::NotStarted(spec), request, INSTANCE));
+        assert_eq!(answer.try_recv(), Ok(Ok(())));
+        let Controller::NotStarted(spec) = controller else {
+            panic!("configuration started the machine")
+        };
+        assert_eq!(spec, configured);
+
+        let (request, answer) = make_request(SetMemoryHotplug(MemoryHotplugConfig {
+            size_mib: 0,
+            ..hotplug().0
+        }));
+        let controller = stay(on_request(Fake::NotStarted(spec), request, INSTANCE));
+        assert_eq!(
+            answer.try_recv(),
+            Ok(Err(api_error(&SpecError::ZeroHotplugMemory)))
+        );
+        let Controller::NotStarted(spec) = controller else {
+            panic!()
+        };
+        assert_eq!(spec, configured);
+
+        for controller in [
+            Fake::Running(live(Running(1))),
+            Fake::Paused(live(Paused(1))),
+        ] {
+            let state = controller.state();
+            let (request, answer) = make_request(hotplug());
+            let controller = stay(on_request(controller, request, INSTANCE));
+            assert_eq!(answer.try_recv(), refused(Rejection::ConfigurationFrozen));
+            assert_eq!(controller.state(), state);
+        }
+    }
+
+    #[test]
+    fn resize_requests_take_only_a_running_machine_and_preserve_the_target() {
+        for (controller, rejection) in [
+            (
+                Fake::NotStarted(MachineSpec::default()),
+                Rejection::NotStarted,
+            ),
+            (Fake::Paused(live(Paused(7))), Rejection::NotRunning),
+        ] {
+            let state = controller.state();
+            let (request, answer) = make_request(ResizeMemory(HotplugSizeMib(32)));
+            let controller = stay(on_request(controller, request, INSTANCE));
+            assert_eq!(answer.try_recv(), refused(rejection));
+            assert_eq!(controller.state(), state);
+        }
+        for size in [0, 32, u32::MAX] {
+            let (request, answer) = make_request(ResizeMemory(HotplugSizeMib(size)));
+            let next = on_request(Fake::Running(live(Running(7))), request, INSTANCE);
+            match &next {
+                Next::Resize(running, target, _) => {
+                    assert_eq!(running.machine, Running(7));
+                    assert_eq!(*target, HotplugSizeMib(size));
+                }
+                _ => panic!("ResizeMemory did not take the running machine"),
+            }
+            assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
         }
     }
 
@@ -854,6 +1081,7 @@ mod tests {
         let (_start, _, starting) = mock_start();
         let (_pause, _, pausing) = mock_pause();
         let (_resume, _, resuming) = mock_resume();
+        let (_resize, _, resizing) = mock_resize();
         for controller in [
             Fake::NotStarted(MachineSpec::default()),
             Fake::Running(live(Running(1))),
@@ -861,6 +1089,7 @@ mod tests {
             starting,
             pausing,
             resuming,
+            resizing,
         ] {
             let state = controller.state();
             let (request, answer) = make_request(Shutdown);
@@ -877,10 +1106,12 @@ mod tests {
         let (_start, _, starting) = mock_start();
         let (_pause, _, pausing) = mock_pause();
         let (_resume, _, resuming) = mock_resume();
+        let (_resize, _, resizing) = mock_resize();
         for (controller, stable) in [
             (starting, VmState::NotStarted),
             (pausing, VmState::Running),
             (resuming, VmState::Paused),
+            (resizing, VmState::Running),
         ] {
             let (controller, state) = info(controller);
             assert_eq!(state, stable);
@@ -893,8 +1124,9 @@ mod tests {
         let (_start, start_answer, starting) = mock_start();
         let (_pause, pause_answer, pausing) = mock_pause();
         let (_resume, resume_answer, resuming) = mock_resume();
+        let (_resize, resize_answer, resizing) = mock_resize();
         let mut kept = Vec::new();
-        for mut controller in [starting, pausing, resuming] {
+        for mut controller in [starting, pausing, resuming, resizing] {
             for (name, request, answer) in writes() {
                 controller = stay(on_request(controller, request, INSTANCE));
                 assert_eq!(answer.try_recv(), refused(Rejection::InProgress), "{name}");
@@ -907,7 +1139,7 @@ mod tests {
             ApiError::msg("lifecycle operation in progress")
         );
         // The operations in flight have not answered: nothing finished them.
-        for answer in [start_answer, pause_answer, resume_answer] {
+        for answer in [start_answer, pause_answer, resume_answer, resize_answer] {
             assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
         }
     }
@@ -919,24 +1151,27 @@ mod tests {
             ..INSTANCE
         };
         let (_pause, _, pausing) = mock_pause();
-        let (request, answer) = make_request(UpdateLogger(LoggerConfig::default()));
-        let controller = stay(on_request(pausing, request, instance));
-        // The error shows the update ran, and carries its whole chain.
-        assert_eq!(
-            answer.try_recv(),
-            Ok(Err(ApiError::msg(
-                "apply the logger configuration: target is gone"
-            )))
-        );
-        let (request, answer) = make_request(UpdateLogger(LoggerConfig::default()));
-        let controller = stay(on_request(controller, request, INSTANCE));
-        assert_eq!(answer.try_recv(), Ok(Ok(())));
-        let (request, answer) = make_request(HandoverState {});
-        stay(on_request(controller, request, INSTANCE));
-        assert_eq!(
-            answer.try_recv().unwrap().unwrap_err(),
-            api_error(&Rejection::HandoverUnsupported)
-        );
+        let (_resize, _, resizing) = mock_resize();
+        for controller in [pausing, resizing] {
+            let (request, answer) = make_request(UpdateLogger(LoggerConfig::default()));
+            let controller = stay(on_request(controller, request, instance));
+            // The error shows the update ran, and carries its whole chain.
+            assert_eq!(
+                answer.try_recv(),
+                Ok(Err(ApiError::msg(
+                    "apply the logger configuration: target is gone"
+                )))
+            );
+            let (request, answer) = make_request(UpdateLogger(LoggerConfig::default()));
+            let controller = stay(on_request(controller, request, INSTANCE));
+            assert_eq!(answer.try_recv(), Ok(Ok(())));
+            let (request, answer) = make_request(HandoverState {});
+            stay(on_request(controller, request, INSTANCE));
+            assert_eq!(
+                answer.try_recv().unwrap().unwrap_err(),
+                api_error(&Rejection::HandoverUnsupported)
+            );
+        }
     }
 
     #[tokio::test(flavor = "local")]
@@ -958,6 +1193,294 @@ mod tests {
     }
 
     #[tokio::test(flavor = "local")]
+    async fn resize_completion_returns_the_original_machine_and_events_even_on_failure() {
+        for (result, expected) in [
+            (Ok(()), Ok(())),
+            (
+                Err(MachineResizeError::from(ResizeError::Interrupt(
+                    io::Error::other("interrupt target is gone"),
+                ))),
+                Err(ApiError::msg(
+                    "enqueue the memory hotplug target: inject the virtio-mem configuration interrupt: interrupt target is gone",
+                )),
+            ),
+        ] {
+            let (sender, events) = events();
+            let (reply, answer) = make_reply();
+            let (finish, operation) = operation();
+            let mut resizing = Resizing::new(
+                Live {
+                    machine: Running(7),
+                    events,
+                },
+                reply,
+                operation,
+            );
+            assert!(
+                poll_fn(|cx| Poll::Ready(resizing.operation.as_mut().poll(cx).is_pending())).await
+            );
+            assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
+            finish.send(result).unwrap_or_else(|_| panic!());
+            let result = (&mut resizing.operation).await;
+            let Controller::Running(mut running) = stay(on_resized(resizing, result)) else {
+                panic!("resize lost the running machine")
+            };
+            assert_eq!(running.machine, Running(7));
+            assert_eq!(answer.try_recv(), Ok(expected));
+            sender.send(MachineEvent::GuestReset).unwrap();
+            assert!(matches!(
+                running.events.machine.try_recv(),
+                Ok(MachineEvent::GuestReset)
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn shutdown_starts_teardown_to_finalize_a_stalled_resize_without_cancelling_it() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Owner(Rc<Cell<usize>>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        type Owned = Controller<Owner, (), ()>;
+
+        for cancel_waiter in [false, true] {
+            let drops = Rc::new(Cell::new(0));
+            let stopped = Rc::new(Cell::new(0));
+            let (reply, answer) = make_reply();
+            let answer = if cancel_waiter {
+                drop(answer);
+                None
+            } else {
+                Some(answer)
+            };
+            let (finish, operation) = operation();
+            let controller = Owned::Busy(Busy::Resizing(Resizing::new(
+                live(Owner(drops.clone())),
+                reply,
+                operation,
+            )));
+            let Next::Stay(controller) = on_detached(controller) else {
+                panic!("detach abandoned the accepted resize")
+            };
+            let (request, shutdown_answer) = make_request(Shutdown);
+            let Next::Exit(Controller::Busy(Busy::Resizing(resizing)), why) =
+                on_request(controller, request, INSTANCE)
+            else {
+                panic!("shutdown lost the resize owner")
+            };
+            assert_eq!(shutdown_answer.try_recv(), Ok(Ok(())));
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let mut stopping = pin!(super::super::shutdown_resize(resizing, why, |owner| {
+                assert!(Rc::ptr_eq(&owner.0, &drops));
+                let stopped = stopped.clone();
+                Box::pin(async move {
+                    stopped.set(stopped.get() + 1);
+                    // CPU stop happens before waiting for stalled memory. Service
+                    // cleanup then releases the worker's accepted request.
+                    wait.await.unwrap();
+                    finish
+                        .send(Err(MachineResizeError::from(ResizeError::Stopped)))
+                        .unwrap_or_else(|_| panic!("accepted resize was cancelled"));
+                    drop(owner);
+                    Ok::<_, ((), TeardownError)>(())
+                })
+            }));
+            assert!(poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_pending())).await);
+            assert_eq!((stopped.get(), drops.get()), (1, 0));
+            if let Some(answer) = &answer {
+                assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
+            }
+            release.send(()).unwrap();
+            assert_eq!(stopping.await, VmmExitStatus::Ok);
+            assert_eq!(drops.get(), 1);
+            if let Some(answer) = answer {
+                assert_eq!(
+                    answer.try_recv(),
+                    Ok(Err(api_error(&MachineResizeError::from(
+                        ResizeError::Stopped
+                    ),)))
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn resize_publication_before_or_after_shutdown_is_not_replaced_by_its_ack() {
+        // Publication before Shutdown, after Shutdown, in cleanup's final poll,
+        // and after successful cleanup must all produce the real resize result.
+        for publication in 0..4 {
+            let (sender, events) = events();
+            let (reply, answer) = make_reply();
+            let (finish, operation) = operation();
+            let mut finish = Some(finish);
+            if publication == 0 {
+                finish
+                    .take()
+                    .unwrap()
+                    .send(Ok(()))
+                    .unwrap_or_else(|_| panic!());
+            }
+            let resizing = Resizing::new(
+                Live {
+                    machine: Running(7),
+                    events,
+                },
+                reply,
+                operation,
+            );
+            let (request, shutdown_answer) = make_request(Shutdown);
+            let (controller, why) = exit(on_request(
+                Fake::Busy(Busy::Resizing(resizing)),
+                request,
+                INSTANCE,
+            ));
+            assert_eq!(shutdown_answer.try_recv(), Ok(Ok(())));
+            assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
+            let Controller::Busy(Busy::Resizing(resizing)) = controller else {
+                panic!()
+            };
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let during_cleanup = if publication == 2 {
+                finish.take()
+            } else {
+                None
+            };
+            let mut stopping = pin!(super::super::shutdown_resize(resizing, why, |machine| {
+                assert_eq!(machine, Running(7));
+                Box::pin(async move {
+                    wait.await.unwrap();
+                    if let Some(finish) = during_cleanup {
+                        finish.send(Ok(())).unwrap_or_else(|_| panic!());
+                    }
+                    // These arrive AFTER the event arm's final poll. Fatal must
+                    // win over both reset and the accepted Shutdown.
+                    sender
+                        .send(MachineEvent::VcpuFailed {
+                            index: 1,
+                            error: "final-poll fault".into(),
+                        })
+                        .unwrap();
+                    sender.send(MachineEvent::GuestReset).unwrap();
+                    Ok::<_, ((), TeardownError)>(())
+                })
+            }));
+            assert!(poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_pending())).await);
+            if publication == 0 {
+                assert_eq!(answer.try_recv(), Ok(Ok(())));
+            } else {
+                assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
+            }
+            if publication == 1 {
+                finish
+                    .take()
+                    .unwrap()
+                    .send(Ok(()))
+                    .unwrap_or_else(|_| panic!());
+                assert!(poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_pending())).await);
+                assert_eq!(answer.try_recv(), Ok(Ok(())));
+            }
+            release.send(()).unwrap();
+            if publication == 3 {
+                assert!(poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_pending())).await);
+                assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
+                finish
+                    .take()
+                    .unwrap()
+                    .send(Ok(()))
+                    .unwrap_or_else(|_| panic!());
+            }
+            assert_eq!(
+                stopping.await,
+                VmmExitStatus::Error("vCPU 1 failed: final-poll fault".into())
+            );
+            if publication >= 2 {
+                assert_eq!(answer.try_recv(), Ok(Ok(())));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn resize_cleanup_failure_is_terminal_without_waiting_for_or_faking_publication() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Owner(Rc<Cell<usize>>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        for published_in_final_poll in [false, true] {
+            let owner_drops = Rc::new(Cell::new(0));
+            let operation_drops = Rc::new(Cell::new(0));
+            let guard = Owner(operation_drops.clone());
+            let (finish, wait) = tokio::sync::oneshot::channel::<Result<(), MachineResizeError>>();
+            let mut finish = Some(finish);
+            let operation = Box::pin(async move {
+                let _guard = guard;
+                wait.await.unwrap()
+            });
+            let (reply, answer) = make_reply();
+            let resizing = Resizing::new(live(Owner(owner_drops.clone())), reply, operation);
+            let (release, cleanup_wait) = tokio::sync::oneshot::channel();
+            let publication = if published_in_final_poll {
+                finish.take()
+            } else {
+                None
+            };
+            let mut stopping = pin!(super::super::shutdown_resize(
+                resizing,
+                Exit::Shutdown,
+                |owner| {
+                    let operation_drops = operation_drops.clone();
+                    Box::pin(async move {
+                        cleanup_wait.await.unwrap();
+                        assert_eq!(operation_drops.get(), 0, "resize future was cancelled");
+                        if let Some(publication) = publication {
+                            publication.send(Ok(())).unwrap();
+                        }
+                        Err((
+                            owner,
+                            TeardownError::MemoryServiceTimedOut(crate::memory::layout::WindowId(
+                                1,
+                            )),
+                        ))
+                    })
+                }
+            ));
+            assert!(poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_pending())).await);
+            assert_eq!((owner_drops.get(), operation_drops.get()), (0, 0));
+            assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
+            release.send(()).unwrap();
+            assert_eq!(
+                stopping.await,
+                exit_status(
+                    Exit::Shutdown,
+                    Err(TeardownError::MemoryServiceTimedOut(
+                        crate::memory::layout::WindowId(1)
+                    )),
+                )
+            );
+            let expected = if published_in_final_poll {
+                Ok(())
+            } else {
+                Err(api_error(&ResizeUnavailable))
+            };
+            assert_eq!(answer.try_recv(), Ok(expected));
+            assert_eq!((owner_drops.get(), operation_drops.get()), (1, 1));
+            // Terminal disposal of the client future cannot retract worker ownership.
+            if let Some(finish) = finish {
+                assert!(finish.send(Ok(())).is_err());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "local")]
     async fn a_start_settling_on_the_way_out_answers_and_leaves_its_machine() {
         let (finish, answer, starting) = mock_start();
         let mut settling = pin!(settle(starting));
@@ -968,7 +1491,7 @@ mod tests {
 
         // One that fails has torn its machine down itself.
         let (finish, answer, starting) = mock_start();
-        let error = StartError::Resume(ResumeError(VcpuError::TimedOut(0)));
+        let error = StartError::Resume(ResumeError::Vcpus(VcpuError::TimedOut(0)));
         finish.send(Err(error)).unwrap_or_else(|_| panic!());
         assert_eq!(settle(starting).await, Settled::Nothing);
         assert_eq!(
@@ -982,20 +1505,25 @@ mod tests {
     #[test]
     fn machine_events_stop_the_vmm_and_device_exits_do_not() {
         let (_pause, _, pausing) = mock_pause();
+        let (_resize, _, resizing) = mock_resize();
         for controller in [
             Fake::Running(live(Running(1))),
             Fake::Paused(live(Paused(1))),
             pausing,
+            resizing,
         ] {
             let state = controller.state();
-            let controller = stay(on_event(
-                controller,
-                Event::Device(DeviceExit {
-                    name: "console-input".into(),
-                    result: Ok(()),
-                }),
-            ));
-            assert_eq!(controller.state(), state);
+            let mut controller = controller;
+            for name in ["console-input", "memory-service"] {
+                controller = stay(on_event(
+                    controller,
+                    Event::Device(DeviceExit {
+                        name: name.into(),
+                        result: Ok(()),
+                    }),
+                ));
+                assert_eq!(controller.state(), state);
+            }
             let (controller, why) = exit(on_event(
                 controller,
                 Event::Machine(MachineEvent::GuestReset),
@@ -1056,7 +1584,7 @@ mod tests {
         let Controller::Busy(Busy::Resuming(resuming)) = resuming else {
             unreachable!()
         };
-        let failed = (FakeFailed(2), ResumeError(VcpuError::Exited(0)));
+        let failed = (FakeFailed(2), ResumeError::Vcpus(VcpuError::Exited(0)));
         let (failed, why) = terminate(on_resumed(resuming, Err(failed)));
         assert_eq!(failed.machine, FakeFailed(2));
         assert!(matches!(why, Exit::TransitionExited(_)));
@@ -1082,20 +1610,125 @@ mod tests {
     }
 
     #[test]
+    fn memory_resume_failures_are_fatal_and_transfer_only_teardown_ownership() {
+        for error in [
+            ResumeError::MemoryServiceExited(WindowId(73)),
+            ResumeError::MemoryServiceTimedOut(WindowId(73)),
+        ] {
+            let expected = render_chain(&error);
+            let (_, answer, resuming) = mock_resume();
+            let Controller::Busy(Busy::Resuming(resuming)) = resuming else {
+                unreachable!()
+            };
+            let (failed, why) = terminate(on_resumed(resuming, Err((FakeFailed(7), error))));
+            assert_eq!(failed.machine, FakeFailed(7));
+            assert_eq!(why, Exit::MemoryServiceResumeFailed(expected.clone()));
+            assert_eq!(answer.try_recv(), Ok(Err(ApiError::msg(expected.clone()))));
+            assert_eq!(exit_status(why, Ok(())), VmmExitStatus::Error(expected));
+        }
+    }
+
+    #[test]
     fn losing_every_client_ends_only_a_vmm_without_a_guest() {
         let (_, why) = exit(on_detached(Fake::NotStarted(MachineSpec::default())));
         assert_eq!(why, Exit::Detached);
         let (_pause, _, pausing) = mock_pause();
         let (_resume, _, resuming) = mock_resume();
+        let (_resize, _, resizing) = mock_resize();
         for controller in [
             Fake::Running(live(Running(1))),
             Fake::Paused(live(Paused(1))),
             pausing,
             resuming,
+            resizing,
         ] {
             let state = controller.state();
             assert_eq!(stay(on_detached(controller)).state(), state);
         }
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn cold_build_cleanup_remains_starting_until_ram_is_released_even_without_a_waiter() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct FreshRam(Rc<Cell<usize>>);
+        impl Drop for FreshRam {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        for cancel_waiter in [false, true] {
+            let drops = Rc::new(Cell::new(0));
+            let ram = FreshRam(drops.clone());
+            let (release, wait) = tokio::sync::oneshot::channel();
+            let operation = Box::pin(async move {
+                wait.await.unwrap();
+                drop(ram);
+                Err(StartError::Build(BuildError::NoRuntime))
+            });
+            let (reply, answer) = make_reply();
+            let answer = if cancel_waiter {
+                drop(answer);
+                None
+            } else {
+                Some(answer)
+            };
+            let events = super::super::closed_events();
+            let mut controller: Fake = on_built(spec_with_kernel(), reply, Ok((operation, events)));
+            let Controller::Busy(Busy::Starting(starting)) = &mut controller else {
+                panic!()
+            };
+            assert!(starting.events.machine.is_closed());
+            assert!(starting.events.devices.next().await.is_none());
+            {
+                let mut next_event = pin!(super::super::next_event(&mut starting.events));
+                assert!(poll_fn(|cx| Poll::Ready(next_event.as_mut().poll(cx).is_pending())).await);
+            }
+            let Controller::Busy(Busy::Starting(mut starting)) = controller else {
+                panic!()
+            };
+            assert!(
+                poll_fn(|cx| Poll::Ready(starting.operation.as_mut().poll(cx).is_pending())).await
+            );
+            assert_eq!(drops.get(), 0);
+            if let Some(answer) = &answer {
+                assert_eq!(answer.try_recv(), Err(oneshot::TryRecvError::Empty));
+            }
+            release.send(()).unwrap();
+            let result = (&mut starting.operation).await;
+            assert_eq!(drops.get(), 1);
+            let controller = stay(on_started(starting, result));
+            let Controller::NotStarted(spec) = controller else {
+                panic!("successful cold cleanup did not preserve the retry spec")
+            };
+            assert_eq!(spec, spec_with_kernel());
+            if let Some(answer) = answer {
+                assert_eq!(
+                    answer.try_recv(),
+                    Ok(Err(api_error(&StartError::Build(BuildError::NoRuntime))))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_start_cleanup_failure_has_no_retryable_controller_state() {
+        let (_, answer, controller) = mock_start();
+        let Controller::Busy(Busy::Starting(starting)) = controller else {
+            panic!()
+        };
+        let Next::StartTeardown { error, events: _ } =
+            on_started(starting, Err(StartError::Teardown(TeardownError::VmHeld)))
+        else {
+            panic!("cleanup failure re-entered NotStarted")
+        };
+        assert!(matches!(error, StartError::Teardown(TeardownError::VmHeld)));
+        assert_eq!(answer.try_recv(), Ok(Err(api_error(&error))));
+        assert!(matches!(
+            exit_status(Exit::StartTeardown(render_chain(&error)), Ok(())),
+            VmmExitStatus::Error(_)
+        ));
     }
 
     #[test]
@@ -1131,7 +1764,7 @@ mod tests {
             panic!("a built machine did not start");
         };
         drop(finish);
-        let error = StartError::Resume(ResumeError(VcpuError::Exited(0)));
+        let error = StartError::Resume(ResumeError::Vcpus(VcpuError::Exited(0)));
         let controller = stay(on_started(starting, Err(error)));
         assert_eq!(
             answer.try_recv(),
@@ -1168,7 +1801,7 @@ mod tests {
         let Controller::Busy(Busy::Starting(starting)) = stay(on_detached(starting)) else {
             panic!("losing every client abandoned the start");
         };
-        let error = StartError::Resume(ResumeError(VcpuError::TimedOut(0)));
+        let error = StartError::Resume(ResumeError::Vcpus(VcpuError::TimedOut(0)));
         let (controller, why) = exit(on_started(starting, Err(error)));
         assert!(matches!(controller, Controller::NotStarted(_)));
         assert_eq!(why, Exit::Detached);

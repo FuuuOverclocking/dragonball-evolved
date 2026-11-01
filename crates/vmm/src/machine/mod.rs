@@ -6,6 +6,7 @@ mod boot;
 mod build;
 mod cleanup;
 mod kvm_state;
+mod mem;
 pub mod plan;
 mod platform;
 mod snapshot;
@@ -18,9 +19,10 @@ use tokio::sync::mpsc;
 
 pub use self::block::{AttachBlockError, BlockSnapshot, CaptureBlockError, RestoreBlockQueueError};
 pub use self::boot::BootDataError;
-pub use self::build::{BuildError, build};
+pub use self::build::{BuildCleanup, BuildError, BuildFailure, build};
 pub use self::cleanup::PendingCleanup;
 pub use self::kvm_state::{CaptureVmError, RestoreVmError, VcpuSnapshot, VmKvmState};
+pub use self::mem::{AttachMemError, MachineResizeError, MemSnapshot};
 pub use self::plan::{MachinePlan, PlanError};
 pub use self::platform::{
     PlatformCaptureError, PlatformError, PlatformQuiesced, PlatformRestoreError, PlatformSnapshot,
@@ -30,8 +32,8 @@ pub use self::snapshot::{
     rebuild,
 };
 pub use self::state::{
-    FailedMachine, Machine, PauseError, PausedMachine, QuiescedBlock, QuiescedDevice, ResumeError,
-    TeardownError,
+    FailedMachine, Machine, PauseError, PausedMachine, QuiescedBlock, QuiescedDevice, QuiescedMem,
+    ResumeError, TeardownError,
 };
 pub use self::vcpu::{
     CaptureStep, CaptureVcpuError, ConfigureVcpuError, RestoreStep, RestoreVcpuError, SetupStep,

@@ -4,34 +4,38 @@
 
 mod controller;
 
-use std::future::pending;
+use std::future::{pending, poll_fn};
+use std::task::Poll;
+use std::time::Duration;
 
 use api::{ApiResult, Reply};
 use logger::warn_unlimited;
 use tokio::select;
 
 use self::controller::{
-    Busy, Controller, Event, Exit, Instance, Live, Next, StartError, Transition,
+    Busy, Controller, Event, Exit, Instance, Live, Next, Resizing, StartError, Transition,
 };
 use crate::VmmExitStatus;
-use crate::error::render_chain;
+use crate::error::{api_error, render_chain};
 use crate::machine::{
-    FailedMachine, Machine, MachineEvents, MachinePlan, PauseError, PausedMachine, ResumeError,
-    TeardownError, build,
+    BuildCleanup, BuildFailure, FailedMachine, Machine, MachineEvents, MachinePlan,
+    MachineResizeError, PauseError, PausedMachine, ResumeError, TeardownError, build,
 };
+use crate::memory::layout::WindowId;
 use crate::process_ctx::ProcessCtx;
 use crate::spec::MachineSpec;
 use crate::vmm_server::{Inbound, VmmServer};
 
 type State = Controller<Machine, PausedMachine, FailedMachine>;
 
-/// Completion variants carry exactly the machine type their operation returns.
+/// Completion variants carry their operation's concrete result type.
 enum Input {
     Inbound(Inbound),
     Event(Event),
     Started(Result<Machine, StartError>),
     Paused(Result<PausedMachine, (FailedMachine, PauseError)>),
     Resumed(Result<Machine, (FailedMachine, ResumeError)>),
+    Resized(Result<(), MachineResizeError>),
 }
 
 pub(crate) async fn run(server: VmmServer, ctx: &ProcessCtx) -> VmmExitStatus {
@@ -47,26 +51,66 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
     let mut server = Some(server);
     let mut stopping = None;
     loop {
-        // On exit, an operation still owns its machine until it finishes.
-        // Keep selecting events meanwhile, but never take another request.
+        // Service exit can drop the only live hotplug RAM registrations. Check
+        // actual owners before waiting, regardless of which event woke the loop.
+        // During Start/Pause/Resume the future retains its owner; do not cancel
+        // it. Check again at loop entry once it returns a usable machine.
+        if stopping.is_none()
+            && let Some(window) = failed_memory_service(&controller)
+        {
+            server = None;
+            stopping = Some(Exit::MemoryServiceFailed(window));
+        }
+        // CPU transitions remain noncancelable. Resize instead needs CPU/service
+        // teardown to release stalled memory before publication can settle.
         if let Some(exit) = stopping.take() {
-            match &controller {
-                Controller::Busy(_) => stopping = Some(exit),
-                Controller::NotStarted(_) | Controller::Running(_) | Controller::Paused(_) => {
-                    return teardown(controller, exit).await;
+            controller = match controller {
+                Controller::Busy(Busy::Resizing(resizing)) => {
+                    return shutdown_resize(resizing, exit, |machine| {
+                        Box::pin(async move { machine.teardown().await.map(drop) })
+                    })
+                    .await;
                 }
-            }
+                busy @ Controller::Busy(_) => {
+                    stopping = Some(exit);
+                    busy
+                }
+                state @ (Controller::NotStarted(_)
+                | Controller::Running(_)
+                | Controller::Paused(_)) => return teardown(state, exit).await,
+            };
         }
         let input = next_input(&mut controller, &mut server).await;
+        // Also check the concrete owner returned by a transition, before a
+        // simultaneous reset starts stopping. Once stopping, service Stop is
+        // expected and must not be reclassified as a lost RAM dependency.
+        if stopping.is_none()
+            && let Some(window) = failed_memory_service(&controller).or_else(|| match &input {
+                Input::Started(Ok(machine)) | Input::Resumed(Ok(machine)) => {
+                    machine.failed_memory_service()
+                }
+                Input::Paused(Ok(machine)) => machine.failed_memory_service(),
+                Input::Inbound(_)
+                | Input::Event(_)
+                | Input::Started(Err(_))
+                | Input::Paused(Err(_))
+                | Input::Resumed(Err(_))
+                | Input::Resized(_) => None,
+            })
+        {
+            server = None;
+            stopping = Some(Exit::MemoryServiceFailed(window));
+        }
         // The operation can enqueue an event during its final poll, AFTER
         // the event arm was polled. Consume it before dropping Start's events
         // or moving straight from completion to teardown.
         match &input {
-            Input::Started(_) | Input::Paused(_) | Input::Resumed(_) => {
+            Input::Started(_) | Input::Paused(_) | Input::Resumed(_) | Input::Resized(_) => {
                 let events = match &mut controller {
                     Controller::Busy(Busy::Starting(starting)) => &mut starting.events,
                     Controller::Busy(Busy::Pausing(pausing)) => &mut pausing.events,
                     Controller::Busy(Busy::Resuming(resuming)) => &mut resuming.events,
+                    Controller::Busy(Busy::Resizing(resizing)) => &mut resizing.events,
                     Controller::NotStarted(_) | Controller::Running(_) | Controller::Paused(_) => {
                         unreachable!("completion while not Busy")
                     }
@@ -80,13 +124,13 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
             Input::Inbound(_) | Input::Event(_) => {}
         }
         // Start remains retryable after successful cleanup. If already exiting,
-        // however, a reset must not hide a CPU timeout/panic/join failure.
+        // however, a reset must not hide a fatal CPU or memory dependency failure.
         if let Input::Started(Err(StartError::Resume(error))) = &input
             && stopping.is_some()
         {
             stopping = Some(prefer_exit(
                 stopping.take(),
-                controller::transition_failure(error, &error.0),
+                controller::resume_failure(error),
             ));
         }
         let next = match (controller, input) {
@@ -101,14 +145,30 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
             (Controller::Busy(Busy::Resuming(resuming)), Input::Resumed(result)) => {
                 controller::on_resumed(resuming, result)
             }
+            (Controller::Busy(Busy::Resizing(resizing)), Input::Resized(result)) => {
+                controller::on_resized(resizing, result)
+            }
             // next_input only polls the operation belonging to this state.
             (
                 Controller::NotStarted(_) | Controller::Running(_) | Controller::Paused(_),
-                Input::Started(_) | Input::Paused(_) | Input::Resumed(_),
+                Input::Started(_) | Input::Paused(_) | Input::Resumed(_) | Input::Resized(_),
             )
-            | (Controller::Busy(Busy::Starting(_)), Input::Paused(_) | Input::Resumed(_))
-            | (Controller::Busy(Busy::Pausing(_)), Input::Started(_) | Input::Resumed(_))
-            | (Controller::Busy(Busy::Resuming(_)), Input::Started(_) | Input::Paused(_)) => {
+            | (
+                Controller::Busy(Busy::Starting(_)),
+                Input::Paused(_) | Input::Resumed(_) | Input::Resized(_),
+            )
+            | (
+                Controller::Busy(Busy::Pausing(_)),
+                Input::Started(_) | Input::Resumed(_) | Input::Resized(_),
+            )
+            | (
+                Controller::Busy(Busy::Resuming(_)),
+                Input::Started(_) | Input::Paused(_) | Input::Resized(_),
+            )
+            | (
+                Controller::Busy(Busy::Resizing(_)),
+                Input::Started(_) | Input::Paused(_) | Input::Resumed(_),
+            ) => {
                 unreachable!("completion from a different operation")
             }
         };
@@ -125,6 +185,18 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
                     Box::pin(machine.resume())
                 })))
             }
+            Next::Resize(mut running, size, reply) => match running.machine.resize_memory(size) {
+                Ok(resized) => {
+                    let operation: controller::Operation<Result<(), MachineResizeError>> =
+                        Box::pin(async move { resized.await.map_err(MachineResizeError::from) });
+                    Controller::Busy(Busy::Resizing(Resizing::new(running, reply, operation)))
+                }
+                Err(error) => {
+                    warn_unlimited!("{}", render_chain(&error));
+                    reply.send(Err(api_error(&error)));
+                    Controller::Running(running)
+                }
+            },
             Next::Terminate(Live { machine, events }, exit) => {
                 // A failed transition cannot enter any serving state.
                 // Close admission before polling its teardown, retaining events.
@@ -143,6 +215,19 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
                 )
                 .await;
             }
+            Next::StartTeardown { error, mut events } => {
+                drop(server.take());
+                let exit = prefer_exit(stopping.take(), Exit::StartTeardown(render_chain(&error)));
+                let exit = drain_machine_events(&mut events, exit);
+                let status = controller::exit_status(exit, Ok(()));
+                // No retry/serving state: release the retained owner by RAII only
+                // at terminal handling. Live tasks still own their VM/bindings.
+                match error {
+                    StartError::BuildCleanup { pending, .. } => drop(pending),
+                    error => drop(error),
+                }
+                return status;
+            }
             Next::Exit(state, exit) => {
                 // Dropping the receiver closes admission and drops queued replies.
                 server = None;
@@ -154,36 +239,80 @@ async fn serve(server: VmmServer, ctx: &ProcessCtx, mut controller: State) -> Vm
     }
 }
 
+/// Only stable states and resize keep a machine outside an operation future.
+fn failed_memory_service(state: &State) -> Option<WindowId> {
+    match state {
+        Controller::Running(running) => running.machine.failed_memory_service(),
+        Controller::Paused(paused) => paused.machine.failed_memory_service(),
+        Controller::Busy(Busy::Resizing(resizing)) => resizing.machine.failed_memory_service(),
+        Controller::NotStarted(_)
+        | Controller::Busy(Busy::Starting(_) | Busy::Pausing(_) | Busy::Resuming(_)) => None,
+    }
+}
+
 fn start(spec: MachineSpec, reply: Reply<ApiResult<()>>, ctx: &ProcessCtx) -> State {
     // The documented synchronous exception on vmm-main: reading kernel/initrd
     // and building the parked machine. It has not run any guest code yet.
     let built = MachinePlan::new(&spec, ctx.kvm_ctx.capabilities())
         .map_err(StartError::Plan)
-        .and_then(|(plan, policy)| build(plan, policy, &ctx.kvm_ctx).map_err(StartError::Build));
-    controller::on_built(
-        spec,
-        reply,
-        built.map(|(paused, events)| {
-            let operation: controller::Operation<Result<Machine, StartError>> =
-                Box::pin(async move {
-                    match paused.resume().await {
-                        Ok(running) => Ok(running),
-                        Err((failed, error)) => {
-                            // A failed first resume is retryable, but only after
-                            // tearing down its sole failure owner. Never cancel this.
-                            warn_unlimited!("failed Start: {}", render_chain(&error));
-                            failed
-                                .teardown()
-                                .await
-                                .map_err(|(_pending, error)| error)
-                                .map_err(StartError::Teardown)?;
-                            Err(StartError::Resume(error))
+        .and_then(|(plan, policy)| match build(plan, policy, &ctx.kvm_ctx) {
+            Ok((paused, events)) => {
+                let operation: controller::Operation<Result<Machine, StartError>> =
+                    Box::pin(async move {
+                        match paused.resume().await {
+                            Ok(running) => Ok(running),
+                            Err((failed, error)) => {
+                                // A failed first resume is retryable, but only after
+                                // tearing down its sole failure owner. Never cancel this.
+                                warn_unlimited!("failed Start: {}", render_chain(&error));
+                                failed
+                                    .teardown()
+                                    .await
+                                    .map_err(|(_pending, error)| error)
+                                    .map_err(StartError::Teardown)?;
+                                Err(StartError::Resume(error))
+                            }
                         }
-                    }
-                });
-            (operation, events)
-        }),
-    )
+                    });
+                Ok((operation, events))
+            }
+            Err(BuildFailure {
+                error,
+                cleanup: BuildCleanup::Unstarted,
+            }) => Err(StartError::Build(error)),
+            Err(BuildFailure {
+                error,
+                cleanup: BuildCleanup::Pending(pending),
+            }) => {
+                let operation: controller::Operation<Result<Machine, StartError>> =
+                    Box::pin(async move {
+                        warn_unlimited!("failed cold build: {}", render_chain(&error));
+                        // Same CPU + device grace as machine teardown; this wait
+                        // belongs to Starting, never the synchronous build shell.
+                        match pending.wait(Duration::from_secs(4)).await {
+                            Ok(memory) => {
+                                drop(memory);
+                                Err(StartError::Build(error))
+                            }
+                            Err((pending, error)) => {
+                                Err(StartError::BuildCleanup { error, pending })
+                            }
+                        }
+                    });
+                Ok((operation, closed_events()))
+            }
+        });
+    controller::on_built(spec, reply, built)
+}
+
+/// Partial cold builds have no executing guest and return no event streams.
+/// Close both sources for real; next_event parks once both are closed.
+fn closed_events() -> MachineEvents {
+    let (sender, machine) = tokio::sync::mpsc::unbounded_channel();
+    drop(sender);
+    let (runtime, devices) = crate::devices::runtime::DeviceRuntime::new();
+    drop(runtime);
+    MachineEvents { machine, devices }
 }
 
 /// Events precede completions and requests. In particular a reset is not
@@ -222,6 +351,14 @@ async fn next_input(state: &mut State, server: &mut Option<VmmServer>) -> Input 
                 inbound = next_inbound(server) => Input::Inbound(inbound),
             }
         }
+        Controller::Busy(Busy::Resizing(resizing)) => {
+            select! {
+                biased;
+                event = next_event(&mut resizing.events) => Input::Event(event),
+                result = &mut resizing.operation => Input::Resized(result),
+                inbound = next_inbound(server) => Input::Inbound(inbound),
+            }
+        }
     }
 }
 
@@ -249,6 +386,10 @@ fn prefer_exit(prior: Option<Exit>, next: Exit) -> Exit {
         (Some(prior @ Exit::StartTeardown(_)), _) => prior,
         (_, fatal @ Exit::VcpuFailed { .. }) => fatal,
         (Some(prior @ Exit::VcpuFailed { .. }), _) => prior,
+        (_, fatal @ (Exit::MemoryServiceFailed(_) | Exit::MemoryServiceResumeFailed(_))) => fatal,
+        (Some(prior @ (Exit::MemoryServiceFailed(_) | Exit::MemoryServiceResumeFailed(_))), _) => {
+            prior
+        }
         (_, failure @ Exit::TransitionFailed(_)) => failure,
         (Some(prior @ Exit::TransitionFailed(_)), _) => prior,
         (Some(reset @ Exit::GuestReset), Exit::TransitionExited(_)) => reset,
@@ -268,8 +409,69 @@ fn machine_exit(event: crate::machine::MachineEvent) -> Exit {
     }
 }
 
+fn drain_machine_events(events: &mut MachineEvents, mut exit: Exit) -> Exit {
+    while let Ok(event) = events.machine.try_recv() {
+        exit = prefer_exit(Some(exit), machine_exit(event));
+    }
+    exit
+}
+
+// Teardown must run to settle a stalled resize without dropping its reply.
+async fn shutdown_resize<R, C>(
+    resizing: Resizing<R>,
+    mut exit: Exit,
+    teardown: impl FnOnce(R) -> controller::Operation<Result<(), (C, TeardownError)>>,
+) -> VmmExitStatus {
+    let (machine, mut events, reply, mut resize) = resizing.into_shutdown();
+    let mut cleanup = teardown(machine);
+    let mut reply = Some(reply);
+    let mut cleaned = false;
+    loop {
+        select! {
+            biased;
+            event = next_event(&mut events) => match event {
+                Event::Machine(event) => exit = prefer_exit(Some(exit), machine_exit(event)),
+                Event::Device(device) => warn_unlimited!("device {} exited during teardown", device.name),
+            },
+            result = &mut resize, if reply.is_some() => {
+                controller::reply_resized(reply.take().unwrap(), result);
+                if cleaned {
+                    break;
+                }
+            },
+            result = &mut cleanup, if !cleaned => match result {
+                Ok(()) => {
+                    cleaned = true;
+                    if reply.is_none() {
+                        break;
+                    }
+                }
+                Err((pending, error)) => {
+                    // Cleanup's final poll may have just resolved publication.
+                    // Observe it once without waiting on an unresponsive worker.
+                    if let Some(reply) = reply.take() {
+                        match poll_fn(|cx| Poll::Ready(resize.as_mut().poll(cx))).await {
+                            Poll::Ready(result) => controller::reply_resized(reply, result),
+                            Poll::Pending => reply.send(Err(api_error(&controller::ResizeUnavailable))),
+                        }
+                    }
+                    exit = drain_machine_events(&mut events, exit);
+                    let status = controller::exit_status(exit, Err(error));
+                    // Retain both accepted-command future and cleanup owner through
+                    // terminal error handling. RAII requests stop; it is not a
+                    // cleanup proof, and never leaks the whole CleanupParts.
+                    drop((pending, resize, cleanup));
+                    return status;
+                }
+            },
+        }
+    }
+    exit = drain_machine_events(&mut events, exit);
+    controller::exit_status(exit, Ok(()))
+}
+
 async fn teardown(state: State, exit: Exit) -> VmmExitStatus {
-    // Busy is settled by the serving loop, which keeps observing events.
+    // Non-resize Busy is settled by the loop, which keeps observing events.
     let (operation, events): (controller::Operation<_>, _) = match state {
         Controller::NotStarted(_) => return controller::exit_status(exit, Ok(())),
         Controller::Running(Live { machine, events }) => (
@@ -317,9 +519,7 @@ async fn poll_teardown(
         }
     };
     // Same final-poll race as a lifecycle completion above.
-    while let Ok(event) = events.machine.try_recv() {
-        exit = prefer_exit(Some(exit), machine_exit(event));
-    }
+    exit = drain_machine_events(&mut events, exit);
     controller::exit_status(exit, result)
 }
 
@@ -356,8 +556,8 @@ mod tests {
             },
         ] {
             let exited = matches!(vcpu, VcpuError::Exited(_));
-            let error = ResumeError(vcpu);
-            let failure = controller::transition_failure(&error, &error.0);
+            let error = ResumeError::Vcpus(vcpu);
+            let failure = controller::resume_failure(&error);
             for merged in [
                 prefer_exit(Some(Exit::GuestReset), failure.clone()),
                 prefer_exit(Some(failure.clone()), Exit::GuestReset),
@@ -378,6 +578,46 @@ mod tests {
                 VmmExitStatus::Error(_),
             ));
         }
+    }
+
+    #[test]
+    fn memory_service_failure_cannot_be_hidden_by_shutdown_reset_or_exited_cpu_fallback() {
+        let window = WindowId(73);
+        for failure in [
+            Exit::MemoryServiceFailed(window),
+            controller::resume_failure(&ResumeError::MemoryServiceExited(window)),
+            controller::resume_failure(&ResumeError::MemoryServiceTimedOut(window)),
+        ] {
+            for benign in [
+                Exit::Shutdown,
+                Exit::Detached,
+                Exit::GuestReset,
+                Exit::TransitionExited("an exited CPU without its event".into()),
+            ] {
+                for merged in [
+                    prefer_exit(Some(benign.clone()), failure.clone()),
+                    prefer_exit(Some(failure.clone()), benign),
+                ] {
+                    assert_eq!(merged, failure);
+                    assert!(matches!(
+                        controller::exit_status(merged, Ok(())),
+                        VmmExitStatus::Error(_)
+                    ));
+                }
+            }
+            let vcpu = Exit::VcpuFailed {
+                index: 1,
+                error: "actual KVM failure".into(),
+            };
+            assert_eq!(prefer_exit(Some(failure.clone()), vcpu.clone()), vcpu);
+            assert_eq!(prefer_exit(Some(vcpu.clone()), failure), vcpu);
+        }
+        assert_eq!(
+            controller::exit_status(Exit::MemoryServiceFailed(window), Ok(())),
+            VmmExitStatus::Error(
+                "memory service for window 73 exited unexpectedly; guest RAM may no longer be CPU-mapped".into()
+            )
+        );
     }
 
     #[tokio::test(flavor = "local")]
@@ -432,7 +672,7 @@ mod tests {
                     );
                     Err((
                         FakeFailed(drops),
-                        ResumeError(crate::machine::VcpuError::TimedOut(0)),
+                        ResumeError::Vcpus(crate::machine::VcpuError::TimedOut(0)),
                     ))
                 })
             },
@@ -529,13 +769,31 @@ mod tests {
         for (event, error, expected) in [
             (
                 crate::machine::MachineEvent::GuestReset,
-                StartError::Resume(ResumeError(crate::machine::VcpuError::Exited(0))),
+                StartError::Resume(ResumeError::Vcpus(crate::machine::VcpuError::Exited(0))),
                 VmmExitStatus::Ok,
             ),
             (
                 crate::machine::MachineEvent::GuestReset,
-                StartError::Resume(ResumeError(crate::machine::VcpuError::TimedOut(0))),
+                StartError::Resume(ResumeError::Vcpus(crate::machine::VcpuError::TimedOut(0))),
                 VmmExitStatus::Error("resume the vCPUs: vCPU 0 did not answer in time".into()),
+            ),
+            (
+                crate::machine::MachineEvent::GuestReset,
+                StartError::Resume(ResumeError::MemoryServiceExited(WindowId(73))),
+                VmmExitStatus::Error("memory service for window 73 exited before the vCPUs could resume".into()),
+            ),
+            (
+                crate::machine::MachineEvent::GuestReset,
+                StartError::Resume(ResumeError::MemoryServiceTimedOut(WindowId(73))),
+                VmmExitStatus::Error("memory service for window 73 did not resume in time".into()),
+            ),
+            (
+                crate::machine::MachineEvent::VcpuFailed {
+                    index: 0,
+                    error: "fault during failed memory resume".into(),
+                },
+                StartError::Resume(ResumeError::MemoryServiceExited(WindowId(73))),
+                VmmExitStatus::Error("vCPU 0 failed: fault during failed memory resume".into()),
             ),
             (
                 crate::machine::MachineEvent::GuestReset,
@@ -547,7 +805,7 @@ mod tests {
                     index: 0,
                     error: "injected fault".into(),
                 },
-                StartError::Resume(ResumeError(crate::machine::VcpuError::Exited(0))),
+                StartError::Resume(ResumeError::Vcpus(crate::machine::VcpuError::Exited(0))),
                 VmmExitStatus::Error("vCPU 0 failed: injected fault".into()),
             ),
         ] {

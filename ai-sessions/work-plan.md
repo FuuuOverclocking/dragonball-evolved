@@ -445,8 +445,18 @@ POC 回答了“这样写能不能成立、边界在哪里”。已经成立并�
     - 最终审查后前台复跑 anonymous/shared 都 PASS，日志 `/work/dbe-kernel/p6bc-lifecycle-reviewed.{stdout,stderr}`（stderr 空）；驱动器 `/work/dbe-kernel/p6bc-protocol-runner`。普通双 CPU、只读 ext4、无 initrd 的 CLI 再次输出 `DBE_LINUX_OK rootfs` 并正常 reboot（退出 0），日志 `p6bc-cli-root.{stdout,stderr}`。
     - 发现驱动器最初假定 used.idx 就绪时 IRQ 已到达；本地 split-ring 规范要求先写 used 再通知，故改为 guest 等待 VRING 位，仍严格检查 IRQ 位与次数，未改设备顺序。部分 chunk 的 unplugged block 仍可被 CPU 访问，已明确观察，不宣称完全拦截非法访问。
     - workspace 构建、格式和 diff 空白检查通过；遵循 `/verify` 未运行测试/typecheck/clippy/API CI。失败解绑、补偿失败与清理重试的确定性规格留给 CI，本次未人为破坏 VM fd 来模拟这些失败。
-  - [ ] P6d：配置/ResizeMemory API、按 kind 装配及生命周期。
-  - [ ] P6e：Population 快照和真实 Linux grow/shrink/zero/regrow 验收。
+  - [x] P6d：配置/ResizeMemory API、按 kind 装配及生命周期。
+    - 已接入 `.machine.memory_hotplug`、PUT/PATCH `/v1/machine/memory-hotplug`：配置仅未启动可改，resize 仅 Running 接受；零目标有效，几何、容量、payload 和状态错误明确拒绝。配置替换不增加第二个设备，`virtio-mem0` 与磁盘 ID 冲突时拒绝；plan 记录一个 Object/Window、4 GiB 以上固定 aperture 和 MMIO/GSI grant，root-first/mem-last，new/replay 校验完整 chunk slot 预算。
+    - PreparedMem/AttachedMem 与按 ID/kind 的装配接通；服务 handle 在后续注册/线程失败前进入 PendingCleanup。pause 为 CPU→设备→服务，resume 为服务→设备→CPU。主循环保留 resize 应答并 select；Shutdown 时同时推进 CPU/服务 teardown 和已接收 resize 的结算，避免停滞请求阻止开始关机，不撤回已接收命令。
+    - 修复审查发现的清理所有者遗忘路径：冷 build 返回 `BuildFailure { error, cleanup: BuildCleanup }`，PendingCleanup 显式交回，主循环清理成功才允许重试；清理失败只走终止边界。移除整机 shell 的永久 forget；公开错误携带真实 owner，不强行包装成 Sync/anyhow。
+    - 实际 REST 探测修复两个边界：领域拒绝此前被当作 HTTP 500，现用 SerializedReplyError 区分操作拒绝（400）与丢失应答/编码/FD 失败（500）；serde 默认接受 `[384]` 结构体，现 hotplug 配置仅接受对象。旧 REST 规格同步更新；GET 同路径按现有路由返回 405。
+    - 最终 CLI/Unix REST 日志：`/work/dbe-kernel/p6d-anonymous-1793510290397392933/`、`p6d-shared-1793510323611988496/`，总驱动日志 `p6d-driver-service-gate.{stdout,stderr}`。真实 Linux 7.3、双 CPU、只读 rootfs-drained.ext4、无 initrd，两种 backing 的 MemTotal 均为 218408→349480→480552 KiB，shrink→zero 回到基线，regrow 再生效；触页使用 guest RAM tmpfs，不写磁盘。shared aperture RSS 为 259524→131028→0 KiB；anonymous VMA 与 boot RAM 合并，只记录合并 RSS（触页 368584、zero 109276 KiB），不冒称独立 aperture RSS。
+    - 运行中/暂停时错误 resize、错误 payload/配置、丢弃 HTTP 等待者后目标仍收敛、暂停串口输入延迟到 Resume，以及不同 4/8 MiB 扇区读取引起 vda read_ios/read_sectors 增长均通过。anonymous 最终 guest reboot、shared PATCH/Shutdown 竞态和无 hotplug CLI 都退出 0。Shutdown 竞态未证明请求当时仍停滞，停滞关机的确定性规格留给 CI，不冒称已做该故障注入。
+    - 公开库冷装配故障驱动器 `p6d-cleanup-runner` 临时限制进程自身线程数，真实 service 已启动后 CPU0 线程 EAGAIN，返回 PendingCleanup；恢复限额后 wait 交还完整 RAM，VM/vCPU fd 和 vmm-io 消失，随后冷 build 成功、teardown 保留原 RAM 身份。日志 `p6d-cleanup-runner/p6d-cleanup-2.{stdout,stderr}`；本次零期限 wait 直接成功，未声称观察到该路径的超时保留。
+    - 已有无 hotplug 的 Linux Block capture/teardown/rebuild/resume 两种 backing 回归通过，最终日志 `p5c3-anonymous-1793510329173560374/`、`p5c3-shared-1793510373046723496/`。hotplug 机器 capture/rebuild 当前明确拒绝，避免漏存 Population，留给 P6e。
+    - 内存服务恢复必须取得 ACK 且 handle 仍存活；超时/退出返回明确 ResumeError 和原 FailedMachine，不恢复 CPU。主循环通过真实服务所有者检测异常退出并终止 guest，不靠可能与磁盘碰撞的任务名分类。新失败门的确定性规格留给 CI，本次未主动制造服务 panic/恢复超时；正常 Linux pause/resume 已在收紧后重新通过。
+    - workspace 构建、格式/diff 检查和 schema 导出通过；生成物在已忽略的 `dist/schema/`，未强行纳入版本控制。遵循 `/verify`，未运行测试/typecheck/clippy/API CI，新增确定性规格留给 CI。
+  - [ ] P6e：Population 整机快照、两种 backing 热插拔状态 round-trip 和剩余失败清理探测；Linux grow/shrink/zero/regrow 的公开接口首轮验收已在 P6d 完成。
   - 启动方式：先提交计划，再由不重叠子代理编写 P6a，主会话检查实际 diff 和公共 KVM 运行结果；保持没有 hotplug 配置的 VMM 可启动。
 - [ ] P7 快照持久化
 
