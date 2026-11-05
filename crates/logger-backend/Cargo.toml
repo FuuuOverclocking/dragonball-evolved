@@ -1,0 +1,18 @@
+[package]
+name = "logger-backend"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+api.workspace = true
+displaydoc.workspace = true
+libc.workspace = true
+log.workspace = true
+oneshot.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+logger.workspace = true

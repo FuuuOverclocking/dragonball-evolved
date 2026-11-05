@@ -1,0 +1,16 @@
+# Build
+/target
+/dist
+
+# Python
+__pycache__/
+
+# Editors
+.vscode/
+
+# AI tools
+.claude/
+.qoder/
+
+# Specifications and code for reference
+/.references

@@ -1,0 +1,304 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use api::config::Config;
+use api::logger::{CrashTarget, Format, LevelFilter, Target};
+use clap::{Parser, Subcommand};
+
+use crate::{VERSION_LONG, config};
+
+/// Start a Dragonball VMM instance.
+///
+/// Pass boot sources to launch directly, or use --api-sock to set up a Unix socket for REST API control.
+#[derive(Debug, Parser)]
+#[command(
+    version = VERSION_LONG,
+    args_conflicts_with_subcommands = true,
+)]
+struct Cli {
+    #[command(subcommand)]
+    subcommand: Option<SubCommand>,
+
+    /// Set the config file path (JSON or TOML). CLI args and env vars will override these settings.
+    #[arg(short = 'c', long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// The ID of the dragonball instance, default to a random string.
+    #[arg(long, value_name = "id", env = "DRAGONBALL_ID")]
+    id: Option<String>,
+
+    /// Launch an API server and specify the path to the api socket.
+    #[arg(long, env, value_name = "PATH")]
+    api_sock: Option<PathBuf>,
+
+    /// Specify the path to the KVM device.
+    #[arg(long, env, value_name = "PATH")]
+    kvm_dev: Option<PathBuf>,
+
+    /// The lowest level a record has to reach to be logged: off, error, warn, info, debug or trace. Default: info.
+    #[arg(
+        long,
+        env,
+        value_name = "LEVEL",
+        value_parser = |value: &str| LevelFilter::try_from(value.to_owned()),
+    )]
+    log_level: Option<LevelFilter>,
+
+    /// Where log records go: stderr or file=<path>. Default: stderr.
+    #[arg(
+        long,
+        env,
+        value_name = "TARGET",
+        value_parser = |value: &str| Target::try_from(value.to_owned()),
+    )]
+    log_target: Option<Target>,
+
+    /// Where crash records go: same_as_log, stderr or file=<path>. Default: same_as_log.
+    #[arg(
+        long,
+        env,
+        value_name = "TARGET",
+        value_parser = |value: &str| CrashTarget::try_from(value.to_owned()),
+    )]
+    log_crash_target: Option<CrashTarget>,
+
+    /// How a log line is laid out: text or json. Default: text.
+    #[arg(
+        long,
+        env,
+        value_name = "FORMAT",
+        value_parser = |value: &str| serde_json::from_value::<Format>(value.into()),
+    )]
+    log_format: Option<Format>,
+
+    /// Whether a log line carries the thread id. Default: true.
+    #[arg(long, env, value_name = "BOOL")]
+    log_show_tid: Option<bool>,
+
+    /// Whether a log line carries the thread name. Default: true.
+    #[arg(long, env, value_name = "BOOL")]
+    log_show_thread_name: Option<bool>,
+
+    /// Whether a log line carries the target, i.e. the module that logged it. Default: true.
+    #[arg(long, env, value_name = "BOOL")]
+    log_show_target: Option<bool>,
+
+    /// Whether a log line carries the source file and line. Default: true.
+    #[arg(long, env, value_name = "BOOL")]
+    log_show_file_line: Option<bool>,
+
+    /// Whether a log line carries the instance id. Default: true.
+    #[arg(long, env, value_name = "BOOL")]
+    log_show_id: Option<bool>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SubCommand {
+    /// Load a configuration and print process settings and commands without starting a VMM.
+    CheckConfig {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+}
+
+pub fn parse() -> Result<(Config, Option<SubCommand>)> {
+    let cli = Cli::parse();
+
+    if let Some(subcommand) = cli.subcommand {
+        return Ok((Config::default(), Some(subcommand)));
+    }
+
+    let mut config = cli
+        .config
+        .as_deref()
+        .map(config::load)
+        .transpose()
+        .context("parse config file")?
+        .unwrap_or_default();
+
+    patch_config(cli, &mut config);
+    apply_defaults(&mut config);
+    Ok((config, None))
+}
+
+fn patch_config(cli: Cli, cfg: &mut Config) {
+    let dragonball = &mut cfg.dragonball;
+    dragonball.id = cli.id.or(dragonball.id.take());
+    dragonball.api_sock = cli.api_sock.or(dragonball.api_sock.take());
+    dragonball.kvm_dev = cli.kvm_dev.or(dragonball.kvm_dev.take());
+
+    let logger = &mut dragonball.logger;
+    logger.level = cli.log_level.or(logger.level.take());
+    logger.target = cli.log_target.or(logger.target.take());
+    logger.crash_target = cli.log_crash_target.or(logger.crash_target.take());
+    logger.format = cli.log_format.or(logger.format.take());
+    logger.show_tid = cli.log_show_tid.or(logger.show_tid.take());
+    logger.show_thread_name = cli.log_show_thread_name.or(logger.show_thread_name.take());
+    logger.show_target = cli.log_show_target.or(logger.show_target.take());
+    logger.show_file_line = cli.log_show_file_line.or(logger.show_file_line.take());
+    logger.show_id = cli.log_show_id.or(logger.show_id.take());
+}
+
+fn apply_defaults(cfg: &mut Config) {
+    cfg.dragonball
+        .id
+        .get_or_insert_with(|| names::Generator::default().next().unwrap());
+    cfg.dragonball.kvm_dev.get_or_insert("/dev/kvm".into());
+
+    let logger = &mut cfg.dragonball.logger;
+    logger.level.get_or_insert(LevelFilter::Info);
+    logger.target.get_or_insert(Target::Stderr);
+    logger.crash_target.get_or_insert(CrashTarget::SameAsLog);
+    logger.format.get_or_insert(Format::Text);
+    logger.show_tid.get_or_insert(true);
+    logger.show_thread_name.get_or_insert(true);
+    logger.show_target.get_or_insert(true);
+    logger.show_file_line.get_or_insert(true);
+    logger.show_id.get_or_insert(true);
+}
+
+pub trait ParsedConfig {
+    fn id(&self) -> &str;
+    fn kvm_dev(&self) -> &Path;
+}
+
+impl ParsedConfig for Config {
+    fn id(&self) -> &str {
+        // OK to unwrap, because set in `fn apply_defaults`.
+        self.dragonball.id.as_deref().unwrap()
+    }
+
+    fn kvm_dev(&self) -> &Path {
+        // OK to unwrap, because set in `fn apply_defaults`.
+        self.dragonball.kvm_dev.as_deref().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use api::config::ProcessConfig;
+    use api::logger::LoggerConfig;
+    use clap::{CommandFactory, FromArgMatches};
+
+    use super::*;
+
+    fn parse_cli(args: impl IntoIterator<Item = &'static str>) -> Result<Cli, clap::Error> {
+        let matches = Cli::command()
+            .mut_args(|arg| arg.env(None::<&str>))
+            .try_get_matches_from(args)?;
+        Cli::from_arg_matches(&matches)
+    }
+
+    #[test]
+    fn command_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn schema_command_is_not_available() {
+        assert!(parse_cli(["dragonball-evolved", "schema", "export"]).is_err());
+    }
+
+    #[test]
+    fn check_config_parses_path() {
+        let cli = parse_cli(["dragonball-evolved", "check-config", "missing.toml"]).unwrap();
+        let Some(SubCommand::CheckConfig { path }) = cli.subcommand else {
+            panic!("expected configuration check");
+        };
+        assert_eq!(path, PathBuf::from("missing.toml"));
+    }
+
+    #[test]
+    fn check_config_rejects_missing_path_and_runtime_options() {
+        for args in [
+            vec!["dragonball-evolved", "check-config"],
+            vec![
+                "dragonball-evolved",
+                "check-config",
+                "vm.toml",
+                "--id",
+                "vm",
+            ],
+            vec![
+                "dragonball-evolved",
+                "--id",
+                "vm",
+                "check-config",
+                "vm.toml",
+            ],
+            vec![
+                "dragonball-evolved",
+                "--config",
+                "base.toml",
+                "check-config",
+                "vm.toml",
+            ],
+        ] {
+            assert!(parse_cli(args).is_err());
+        }
+    }
+
+    #[test]
+    fn run_without_subcommand_applies_defaults() {
+        let cli = parse_cli(["dragonball-evolved"]).unwrap();
+        assert!(cli.subcommand.is_none());
+
+        let mut config = Config::default();
+        patch_config(cli, &mut config);
+        apply_defaults(&mut config);
+
+        assert!(!config.id().is_empty());
+        assert_eq!(config.kvm_dev(), Path::new("/dev/kvm"));
+        assert_eq!(config.dragonball.logger.level, Some(LevelFilter::Info));
+        assert_eq!(config.dragonball.logger.target, Some(Target::Stderr));
+        assert_eq!(config.dragonball.logger.format, Some(Format::Text));
+    }
+
+    #[test]
+    fn cli_patch_defaults_and_accessors_work_together() {
+        let mut config = Config {
+            dragonball: ProcessConfig {
+                id: Some("from-file".into()),
+                api_sock: None,
+                kvm_dev: None,
+                logger: LoggerConfig {
+                    level: Some(LevelFilter::Warn),
+                    show_tid: Some(true),
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        let args = parse_cli([
+            "dragonball-evolved",
+            "--api-sock",
+            "/tmp/dragonball.sock",
+            "--log-target",
+            "stderr",
+            "--log-show-tid",
+            "false",
+        ])
+        .unwrap();
+
+        patch_config(args, &mut config);
+        apply_defaults(&mut config);
+
+        assert_eq!(config.dragonball.id.as_deref(), Some("from-file"));
+        assert_eq!(
+            config.dragonball.api_sock.as_deref(),
+            Some(Path::new("/tmp/dragonball.sock"))
+        );
+        assert_eq!(
+            config.dragonball.kvm_dev.as_deref(),
+            Some(Path::new("/dev/kvm"))
+        );
+
+        let logger = config.dragonball.logger;
+        assert_eq!(logger.level, Some(LevelFilter::Warn));
+        assert_eq!(logger.target, Some(Target::Stderr));
+        assert_eq!(logger.show_tid, Some(false));
+        assert_eq!(logger.show_id, Some(true));
+    }
+}

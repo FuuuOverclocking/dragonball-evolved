@@ -1,0 +1,18 @@
+[package]
+name = "api"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+api-macros = { path = "macros" }
+oneshot = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+request = ["dep:oneshot"]
+schema = ["serde", "dep:schemars"]
+serde = ["dep:serde", "dep:serde_json"]
