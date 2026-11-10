@@ -3,16 +3,14 @@ use std::os::fd::OwnedFd;
 use crate::helpers::fd::{Fds, MergeFd, SplitFd};
 use crate::{ApiError, ApiResult};
 
+#[api_macros::api_type]
 #[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HandoverState {}
 
+#[api_macros::api_type]
 #[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LiveUpgradeState {
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[serde(skip)]
     pub test_fd: Option<OwnedFd>,
 }
 

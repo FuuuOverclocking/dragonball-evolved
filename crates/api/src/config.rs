@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
+use api_macros::api_type;
+
 use crate::VmmCommand;
 use crate::logger::LoggerConfig;
 
+#[api_type(deserialize = false, schema = false)]
 #[derive(Debug, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Config {
     pub dragonball: ProcessConfig,
     pub commands: Vec<VmmCommand>,
@@ -40,10 +42,9 @@ pub fn schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
 }
 
 /// Process-level config.
+#[api_type]
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default, deny_unknown_fields)]
 pub struct ProcessConfig {
     /// The ID of the dragonball instance, default to a random string.
     pub id: Option<String>,

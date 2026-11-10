@@ -1,16 +1,16 @@
 use std::path::PathBuf;
 
+use api_macros::api_type;
+
+#[api_type]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(transparent))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(transparent)]
 pub struct UpdateLogger(pub LoggerConfig);
 
 /// Logger configuration. Omitted fields leave their current values unchanged.
+#[api_type]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggerConfig {
     /// Lowest enabled log level: off, error, warn, info, debug or trace (case-insensitive).
     pub level: Option<LevelFilter>,
@@ -32,19 +32,12 @@ pub struct LoggerConfig {
     pub show_id: Option<bool>,
 }
 
+#[api_type]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "serde",
-    serde(rename_all = "lowercase", try_from = "String")
-)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(
-    feature = "schema",
-    schemars(
-        with = "String",
-        extend("pattern" = "^([Oo][Ff][Ff]|[Ee][Rr][Rr][Oo][Rr]|[Ww][Aa][Rr][Nn]|[Ii][Nn][Ff][Oo]|[Dd][Ee][Bb][Uu][Gg]|[Tt][Rr][Aa][Cc][Ee])$")
-    )
+#[serde(rename_all = "lowercase", try_from = "String")]
+#[schemars(
+    with = "String",
+    extend("pattern" = "^([Oo][Ff][Ff]|[Ee][Rr][Rr][Oo][Rr]|[Ww][Aa][Rr][Nn]|[Ii][Nn][Ff][Oo]|[Dd][Ee][Bb][Uu][Gg]|[Tt][Rr][Aa][Cc][Ee])$")
 )]
 pub enum LevelFilter {
     #[default]
@@ -73,10 +66,9 @@ impl TryFrom<String> for LevelFilter {
 }
 
 /// How a line is laid out.
+#[api_type]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
 pub enum Format {
     #[default]
     Text,
@@ -84,14 +76,10 @@ pub enum Format {
 }
 
 /// Where lines go: `stderr` or `file=<path>`.
+#[api_type(serialize = false)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "String"))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(
-    feature = "schema",
-    schemars(with = "String", extend("pattern" = r"^(stderr|file=[\s\S]+)$"))
-)]
+#[serde(try_from = "String")]
+#[schemars(with = "String", extend("pattern" = r"^(stderr|file=[\s\S]+)$"))]
 pub enum Target {
     Stderr,
     File(PathBuf),
@@ -129,16 +117,12 @@ impl serde::Serialize for Target {
 }
 
 /// Where crash records go: `same_as_log`, `stderr` or `file=<path>`.
+#[api_type(serialize = false)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "String"))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[cfg_attr(
-    feature = "schema",
-    schemars(
-        with = "String",
-        extend("pattern" = r"^(same_as_log|stderr|file=[\s\S]+)$")
-    )
+#[serde(try_from = "String")]
+#[schemars(
+    with = "String",
+    extend("pattern" = r"^(same_as_log|stderr|file=[\s\S]+)$")
 )]
 pub enum CrashTarget {
     /// Track whatever the normal log target is.

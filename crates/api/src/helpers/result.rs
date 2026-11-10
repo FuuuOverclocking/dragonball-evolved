@@ -1,18 +1,18 @@
 use std::error::Error as StdError;
 use std::{fmt, ops};
 
+use api_macros::api_type;
+
 pub type ApiResult<T, E = ApiError> = std::result::Result<T, E>;
 
 /// An API error containing the original error's display message, not its source chain.
+#[api_type]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(transparent))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(transparent)]
 pub struct ApiError(Message);
 
+#[api_type]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct Message {
     error: String,
 }
