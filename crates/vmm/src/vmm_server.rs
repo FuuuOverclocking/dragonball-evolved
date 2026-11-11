@@ -6,10 +6,18 @@ use anyhow::{Context, Result, anyhow};
 use api::{RawVmmOp, VmmRequest};
 use tokio::sync::mpsc;
 
+use crate::VmmExitStatus;
+
 /// The vmm thread's end of the request channel.
 pub(crate) struct VmmServer {
     /// `None` once `Detached` has been reported.
     rx: Option<mpsc::UnboundedReceiver<VmmRequest>>,
+}
+
+impl VmmServer {
+    pub(crate) fn new(rx: mpsc::UnboundedReceiver<VmmRequest>) -> Self {
+        Self { rx: Some(rx) }
+    }
 }
 
 /// Cloneable VMM request sender; clones share a single-use join handle and keep the request channel open.
@@ -20,23 +28,14 @@ pub struct VmmClient {
 }
 
 impl VmmClient {
-    fn take_thread_handle(&self) -> Result<thread::JoinHandle<VmmExitStatus>> {
-        self.thread_handle
+    pub async fn join_vmm_thread_async(&self) -> Result<VmmExitStatus> {
+        let handle = self
+            .thread_handle
             .lock()
             .map_err(|e| anyhow!("lock vmm thread handle: {e}"))?
             .take()
-            .context("vmm thread handle was already taken")
-    }
+            .context("vmm thread handle was already taken")?;
 
-    /// Blocks for exit without requesting shutdown; errors on a poisoned/taken handle or a panicked VMM thread.
-    pub fn join_vmm_thread(&self) -> Result<VmmExitStatus> {
-        let handle = self.take_thread_handle()?;
-        handle.join().map_err(|_| anyhow!("vmm thread panicked"))
-    }
-
-    /// Like [`Self::join_vmm_thread`] via Tokio's blocking pool; once started, cancellation forfeits the result.
-    pub async fn async_join_vmm_thread(&self) -> Result<VmmExitStatus> {
-        let handle = self.take_thread_handle()?;
         tokio::task::spawn_blocking(move || {
             handle.join().map_err(|_| anyhow!("vmm thread panicked"))
         })
@@ -53,6 +52,11 @@ impl VmmClient {
         self.tx
             .send(request)
             .map_err(|_| anyhow!("vmm server is no longer running"))
+    }
+
+    pub fn call_drop_response<Req: RawVmmOp>(&self, request: Req) -> Result<()> {
+        let (op, _) = request.into_vmm_request();
+        self.send(op)
     }
 
     /// Blocks for a typed reply; channel failures are outer errors, while operation results stay in `Resp`.

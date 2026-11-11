@@ -1,5 +1,6 @@
 mod process_ctx;
 mod vmm_server;
+mod lifecycle;
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,6 +11,7 @@ use tokio::sync::mpsc;
 pub use crate::process_ctx::ProcessCtx;
 pub use crate::vmm_server::VmmClient;
 use crate::vmm_server::VmmServer;
+pub use crate::lifecycle::VmmExitStatus;
 
 pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -26,6 +28,6 @@ pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
 }
 
 #[tokio::main(flavor = "local")]
-async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> Result<()> {
+async fn vmm_main(mut server: VmmServer, ctx: ProcessCtx) -> VmmExitStatus {
     todo!()
 }

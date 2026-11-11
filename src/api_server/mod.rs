@@ -24,6 +24,8 @@ pub fn start(api_sock: impl AsRef<Path>, vmm_client: VmmClient) -> Result<ApiSer
     };
 
     let task = async move {
+        info_unlimited!("API server started, listening on {}", sock.display());
+
         let res = hyper_uds::server::serve(listener, service, shutdown_fut)
             .await
             .context("api server serve");

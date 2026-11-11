@@ -26,42 +26,60 @@ async fn main() -> Result<()> {
     let vmm_client2 = vmm_client.clone();
     tokio::task::spawn_local(async move {
         shutdown_signal.await;
-        let _ = vmm_client2.call_async(api::lifecycle::Shutdown).await;
+        vmm_client2
+            .call_drop_response(api::lifecycle::ShutdownVmm)
+            .ok();
     });
 
-    // Configure VMM. Start it if appropriate.
-    if let Err(error) = configure(&vmm_client, std::mem::take(&mut cfg.commands)).await {
-        let _ = vmm_client.call_async(api::lifecycle::Shutdown).await;
-        let _ = vmm_client.async_join_vmm_thread().await;
-        return Err(error);
-    }
-
-    // Start API server if the API socket path is provided.
-    let api_server = if let Some(sock) = &cfg.dragonball.api_sock {
-        info_unlimited!("API server started, listening on {}", sock.display());
-        Some(api_server::start(sock, vmm_client.clone()).context("start api server")?)
-    } else {
-        None
+    // Configure VMM (start if some conditions are met), then start API server if `api_sock` provided.
+    let setup = async {
+        configure(&vmm_client, std::mem::take(&mut cfg.commands)).await?;
+        cfg.dragonball
+            .api_sock
+            .as_ref()
+            .map(|sock| api_server::start(sock, vmm_client.clone()))
+            .transpose()
+            .context("start api server")
+    };
+    let api_server = match setup.await {
+        Ok(server) => server,
+        Err(e) => {
+            vmm_client
+                .call_drop_response(api::lifecycle::ShutdownVmm)
+                .ok();
+            vmm_client
+                .join_vmm_thread_async()
+                .await
+                .expect("Failed to join vmm thread");
+            return Err(e);
+        }
     };
 
     // Wait for the VMM thread to finish.
-    let exit_result = vmm_client
-        .async_join_vmm_thread()
+    let exit_status = vmm_client
+        .join_vmm_thread_async()
         .await
         .context("join vmm thread");
 
     // Gracefully shutdown the API server if it was started.
     if let Some(api_server) = api_server {
-        api_server
-            .graceful_shutdown()
-            .await
-            .context("api server graceful shutdown")?;
+        if let Err(e) = api_server.graceful_shutdown().await {
+            error_unlimited!("Error during API server graceful shutdown: {e}")
+        }
     }
 
-    match exit_result? {
-        vmm::VmmExitStatus::Ok => Ok(()),
-        vmm::VmmExitStatus::Error(error) => anyhow::bail!("{error}"),
-    }
+    exit_status?.context("vmm exit")
+}
+
+fn make_process_ctx(cfg: &api::config::Config) -> Result<ProcessCtx> {
+    Ok(ProcessCtx {
+        id: cfg.id().to_owned(),
+        version: VERSION.to_owned(),
+        kvm_ctx: KvmContext::from_dev_path(cfg.kvm_dev()).context("init kvm context")?,
+        update_logger: |cfg| {
+            logger_backend::update(logger_backend::Config::from_api(cfg, None)).map_err(Into::into)
+        },
+    })
 }
 
 async fn configure(client: &vmm::VmmClient, commands: Vec<api::VmmCommand>) -> Result<()> {
@@ -83,15 +101,4 @@ async fn configure(client: &vmm::VmmClient, commands: Vec<api::VmmCommand>) -> R
             .map_err(|error| anyhow::anyhow!("Start: {error}"))?;
     }
     Ok(())
-}
-
-fn make_process_ctx(cfg: &api::config::Config) -> Result<ProcessCtx> {
-    Ok(ProcessCtx {
-        id: cfg.id().to_owned(),
-        version: VERSION.to_owned(),
-        kvm_ctx: KvmContext::from_dev_path(cfg.kvm_dev()).context("init kvm context")?,
-        update_logger: |cfg| {
-            logger_backend::update(logger_backend::Config::from_api(cfg, None)).map_err(Into::into)
-        },
-    })
 }
