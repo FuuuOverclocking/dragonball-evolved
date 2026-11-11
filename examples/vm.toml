@@ -10,9 +10,9 @@ kvm_dev = "/dev/my_kvm"
 cpus = 2
 memory_mib = 1024
 console = "stdio"
-
-[machine.kernel]
-path = "/path/to/pvh-vmlinux"
+[machine.boot]
+kernel = "/path/to/pvh-vmlinux"
+cmdline = ""
 
 [[machine.disks]]
 id = "rootfs"
