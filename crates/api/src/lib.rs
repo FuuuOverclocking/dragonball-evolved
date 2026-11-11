@@ -1,9 +1,12 @@
 pub mod helpers;
 
+pub mod boot;
 pub mod config;
+pub mod disk;
 pub mod instance_info;
 pub mod live_upgrade;
 pub mod logger;
+pub mod machine;
 
 use api_macros::define_schema;
 
@@ -31,6 +34,26 @@ define_schema! {
         }
         logger::UpdateLogger -> ApiResult<()> {
             route: PATCH /v1/logger;
+        }
+        machine::SetCpus -> ApiResult<()> {
+            config: ".machine.cpus";
+            route: PUT /v1/machine/cpus;
+        }
+        machine::SetMemoryMib -> ApiResult<()> {
+            config: ".machine.memory_mib";
+            route: PUT /v1/machine/memory-mib;
+        }
+        machine::SetConsole -> ApiResult<()> {
+            config: ".machine.console";
+            route: PUT /v1/machine/console;
+        }
+        boot::SetBoot -> ApiResult<()> {
+            config: ".machine.boot";
+            route: PUT /v1/machine/boot;
+        }
+        disk::AddDisk -> ApiResult<()> {
+            config: ".machine.disks[]";
+            route: POST /v1/machine/disks;
         }
         live_upgrade::HandoverState -> ApiResult<live_upgrade::LiveUpgradeState> {
             route: POST /v1/live-upgrade/handover-state;
