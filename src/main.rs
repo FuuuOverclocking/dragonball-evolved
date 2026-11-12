@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     let exit_status = vmm_client
         .join_vmm_thread_async()
         .await
-        .context("join vmm thread");
+        .expect("Failed to join VMM thread");
 
     // Gracefully shutdown the API server if it was started.
     if let Some(api_server) = api_server {
@@ -68,7 +68,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    exit_status?.context("vmm exit")
+    info_unlimited!("VMM exited with {exit_status:?}");
+    exit_status
 }
 
 fn make_process_ctx(cfg: &api::config::Config) -> Result<ProcessCtx> {
