@@ -2,6 +2,8 @@ use std::error::Error;
 
 use api::logger::LoggerConfig;
 
+use crate::KvmContext;
+
 pub(crate) type UpdateLoggerFn = fn(LoggerConfig) -> Result<(), Box<dyn Error + Send + Sync>>;
 
 pub struct ProcessCtx {

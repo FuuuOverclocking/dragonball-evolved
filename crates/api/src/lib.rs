@@ -4,6 +4,7 @@ pub mod boot;
 pub mod config;
 pub mod disk;
 pub mod instance_info;
+pub mod lifecycle;
 pub mod live_upgrade;
 pub mod logger;
 pub mod machine;
@@ -29,6 +30,15 @@ pub trait RawVmmOp {
 
 define_schema! {
     VmmOp {
+        lifecycle::Build -> ApiResult<()> {
+            route: POST /v1/build-vm;
+        }
+        lifecycle::Start -> ApiResult<()> {
+            route: POST /v1/start-vm;
+        }
+        lifecycle::ShutdownVmm -> ApiResult<()> {
+            route: POST /v1/shutdown-vmm;
+        }
         instance_info::GetInstanceInfo -> instance_info::InstanceInfo {
             route: GET /v1/;
         }
@@ -37,23 +47,23 @@ define_schema! {
         }
         machine::SetCpus -> ApiResult<()> {
             config: ".machine.cpus";
-            route: PUT /v1/machine/cpus;
+            route: PUT /v1/cpus;
         }
         machine::SetMemoryMib -> ApiResult<()> {
             config: ".machine.memory_mib";
-            route: PUT /v1/machine/memory-mib;
+            route: PUT /v1/memory-mib;
         }
         machine::SetConsole -> ApiResult<()> {
             config: ".machine.console";
-            route: PUT /v1/machine/console;
+            route: PUT /v1/console;
         }
         boot::SetBoot -> ApiResult<()> {
             config: ".machine.boot";
-            route: PUT /v1/machine/boot;
+            route: PUT /v1/boot;
         }
         disk::AddDisk -> ApiResult<()> {
             config: ".machine.disks[]";
-            route: POST /v1/machine/disks;
+            route: POST /v1/disks;
         }
         live_upgrade::HandoverState -> ApiResult<live_upgrade::LiveUpgradeState> {
             route: POST /v1/live-upgrade/handover-state;

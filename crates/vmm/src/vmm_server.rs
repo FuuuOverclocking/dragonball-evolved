@@ -10,13 +10,12 @@ use crate::VmmExitStatus;
 
 /// The vmm thread's end of the request channel.
 pub(crate) struct VmmServer {
-    /// `None` once `Detached` has been reported.
-    rx: Option<mpsc::UnboundedReceiver<VmmRequest>>,
+    rx: mpsc::UnboundedReceiver<VmmRequest>,
 }
 
 impl VmmServer {
     pub(crate) fn new(rx: mpsc::UnboundedReceiver<VmmRequest>) -> Self {
-        Self { rx: Some(rx) }
+        Self { rx }
     }
 }
 

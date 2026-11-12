@@ -22,10 +22,7 @@ pub fn start(api_sock: impl AsRef<Path>, vmm_client: VmmClient) -> Result<ApiSer
         let vmm_client = vmm_client.clone();
         async move { Ok(service::service(vmm_client, req).await) }
     };
-
     let task = async move {
-        info_unlimited!("API server started, listening on {}", sock.display());
-
         let res = hyper_uds::server::serve(listener, service, shutdown_fut)
             .await
             .context("api server serve");
@@ -46,6 +43,8 @@ pub fn start(api_sock: impl AsRef<Path>, vmm_client: VmmClient) -> Result<ApiSer
                 .block_on(task)
         })
         .context("spawn api server thread")?;
+
+    info_unlimited!("API server started, listening on {}", api_sock.display());
 
     Ok(ApiServer {
         _remove_api_sock_guard,

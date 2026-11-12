@@ -1,3 +1,4 @@
+mod kvm_context;
 mod process_ctx;
 mod vmm_server;
 mod lifecycle;
@@ -8,6 +9,7 @@ use std::thread;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
+pub use crate::kvm_context::KvmContext;
 pub use crate::process_ctx::ProcessCtx;
 pub use crate::vmm_server::VmmClient;
 use crate::vmm_server::VmmServer;
