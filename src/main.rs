@@ -31,18 +31,17 @@ async fn main() -> Result<()> {
             .ok();
     });
 
-    // Configure VMM (start if some conditions are met), then start API server if `api_sock` provided.
+    // Configure VMM (start if boot source is given). Then start API server if `api_sock` provided.
     let setup = async {
-        configure(&vmm_client, std::mem::take(&mut cfg.commands)).await?;
-        cfg.dragonball
-            .api_sock
-            .as_ref()
-            .map(|sock| api_server::start(sock, vmm_client.clone()))
-            .transpose()
-            .context("start api server")
+        configure_vmm(&vmm_client, std::mem::take(&mut cfg.commands)).await?;
+        if let Some(api_sock) = cfg.dragonball.api_sock.as_ref() {
+            let server = api_server::start(sock, vmm_client.clone()).context("start api server")?;
+            return Ok(Some(server));
+        }
+        Ok(None)
     };
     let api_server = match setup.await {
-        Ok(server) => server,
+        Ok(s) => s,
         Err(e) => {
             vmm_client
                 .call_drop_response(api::lifecycle::ShutdownVmm)
@@ -83,7 +82,7 @@ fn make_process_ctx(cfg: &api::config::Config) -> Result<ProcessCtx> {
     })
 }
 
-async fn configure(client: &vmm::VmmClient, commands: Vec<api::VmmCommand>) -> Result<()> {
+async fn configure_vmm(client: &vmm::VmmClient, commands: Vec<api::VmmCommand>) -> Result<()> {
     let auto_start = commands
         .iter()
         .any(|command| matches!(command, api::VmmCommand::SetKernel(_, ())));
