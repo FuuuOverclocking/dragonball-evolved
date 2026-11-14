@@ -12,10 +12,13 @@
 
 当前 codebase 已提供 vmm 外壳. 考虑 scope 隐含的需求, 让我们来调研和设计 VMM 的生命周期和内存管理, 注意两方面:
 1. 类型驱动建模
-2. 设计必须有真实需求支撑
+2. 设计有真实需求支撑
+3. 从简到繁, 分阶段做, 用户来推动阶段
 
 期望的产出内容:
 - crates/vmm/src/{lifecycle.rs, memory.rs}: 纯类型无过程, 接受伪代码, 允许细节待定
 - ai-sessions/{lifecycle.md, memory.md}: 文档, 还可以用网页来**辅助**说明状态变迁
 
 可以自由使用 git 分支 `ai-explore/` 和 `.qoder/worktrees/` 来探索, 但不要查看仓库的历史.
+
+InstanceInfo 中的 VmState 可以随意修改.

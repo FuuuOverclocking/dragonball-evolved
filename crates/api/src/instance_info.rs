@@ -14,13 +14,25 @@ pub struct InstanceInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VmState {
-    /// Vm not started (yet)
+    /// No VM yet; configuration ops are accepted.
     #[default]
-    NotStarted,
+    Configuring,
 
-    /// Vm is Paused
+    /// VM built, vCPUs parked at the boot entry; the guest has not run.
+    Built,
+
+    /// The guest is running.
+    Running,
+
+    /// Waiting for every vCPU to park.
+    Pausing,
+
+    /// Every vCPU is parked.
     Paused,
 
-    /// Vm is running
-    Running,
+    /// Waiting for every vCPU thread to exit.
+    Stopping,
+
+    /// VM resources are released; the VMM is exiting.
+    Stopped,
 }

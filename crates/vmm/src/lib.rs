@@ -1,7 +1,8 @@
 mod kvm_context;
+mod lifecycle;
+mod memory;
 mod process_ctx;
 mod vmm_server;
-mod lifecycle;
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,10 +11,10 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 pub use crate::kvm_context::KvmContext;
+pub use crate::lifecycle::VmmExitStatus;
 pub use crate::process_ctx::ProcessCtx;
 pub use crate::vmm_server::VmmClient;
 use crate::vmm_server::VmmServer;
-pub use crate::lifecycle::VmmExitStatus;
 
 pub fn start(ctx: ProcessCtx) -> Result<VmmClient> {
     let (tx, rx) = mpsc::unbounded_channel();

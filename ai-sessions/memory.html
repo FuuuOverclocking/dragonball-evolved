@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Guest 内存 M1: 交互演示</title>
+<style>
+  :root { --fg:#222; --muted:#777; --cur:#2b6cb0; --ok:#2f855a; --err:#c53030; --warn:#b7791f; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif; color: var(--fg); background: #fafafa; }
+  header { padding: 14px 20px; border-bottom: 1px solid #e2e2e2; background: #fff; }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  main { display: grid; grid-template-columns: 1fr; gap: 16px; padding: 16px 20px; max-width: 1180px; }
+  section { background: #fff; border: 1px solid #e2e2e2; border-radius: 8px; padding: 12px 14px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  h3 { font-size: 13px; margin: 12px 0 4px; color: #444; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 6px 0; }
+  button { font: inherit; padding: 3px 10px; border: 1px solid #bbb; border-radius: 5px; background: #fff; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--cur); color: var(--cur); }
+  button:disabled { opacity: .4; cursor: default; }
+  .mono, td.mono { font-family: ui-monospace, monospace; font-size: 12.5px; }
+  .muted { color: var(--muted); }
+  .bar { position: relative; height: 34px; border: 1px solid #ccc; border-radius: 4px; background: repeating-linear-gradient(45deg, #fff, #fff 5px, #f1f1f1 5px, #f1f1f1 10px); margin: 4px 0 18px; }
+  .seg { position: absolute; top: 0; bottom: 0; overflow: hidden; white-space: nowrap; font-size: 11px; padding: 0 3px; line-height: 34px; border-right: 1px solid rgba(0,0,0,.25); color: #111; }
+  .tick { position: absolute; top: 36px; font-size: 10px; color: var(--muted); transform: translateX(-50%); white-space: nowrap; }
+  .k-BootRam { background: #9ae6b4; } .k-HotplugRam { background: #c6f6d5; } .k-PciMmio32 { background: #bee3f8; }
+  .k-PciEcam { background: #d6bcfa; } .k-PciMmio64 { background: #90cdf4; } .k-Platform { background: #feb2b2; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #eee; vertical-align: top; }
+  .err { color: var(--err); } .ok { color: var(--ok); } .warn { color: var(--warn); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .onion { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .layer { border: 2px solid #ccc; border-radius: 8px; padding: 10px 10px 6px; transition: all .25s; color: #aaa; min-width: 120px; }
+  .layer > .name { font-family: ui-monospace, monospace; font-size: 12px; margin-bottom: 6px; }
+  .layer.on { color: var(--fg); border-color: var(--cur); background: rgba(43,108,176,.05); }
+  .layer.leak { border-color: var(--warn); background: rgba(183,121,31,.08); color: var(--fg); }
+  .layer.future { border-style: dashed; }
+  .side { min-width: 260px; flex: 1; }
+  .steps { margin: 0; padding-left: 20px; }
+  .steps li { color: var(--muted); }
+  .steps li.done { color: var(--fg); }
+  .steps li.cur { color: var(--cur); font-weight: 600; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .pill { display: inline-block; padding: 0 6px; border-radius: 9px; font-size: 11.5px; border: 1px solid #ccc; }
+  .pill.g { border-color: var(--ok); color: var(--ok); } .pill.h { border-color: var(--warn); color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Guest 内存 M1: 交互演示</h1>
+  <p>辅助说明 <code>ai-sessions/memory.md</code>. 地址常量是草案值, 见 memory.md 第 3, 7 节.</p>
+</header>
+<main>
+  <section>
+    <h2>1. 地址图: <span class="mono">AddressMap::plan(MapRequest, PhysBits)</span></h2>
+    <div class="row">
+      <label>启动 RAM <input type="range" id="ram" min="0" max="40" value="13"> <b id="ramLabel" class="mono"></b></label>
+      <label>PhysBits <select id="bits"><option>36</option><option>39</option><option>40</option><option selected>46</option><option>48</option><option>52</option></select></label>
+      <span id="planStatus"></span>
+    </div>
+    <h3>[0, 4 GiB), 线性</h3>
+    <div class="bar" id="barLow"></div>
+    <h3>[0, 1 &lt;&lt; phys_bits), 线性 (4 GiB 以下的小窗口在这个比例下看不见)</h3>
+    <div class="bar" id="barAll"></div>
+    <div class="cols">
+      <div>
+        <h3>窗口 (进快照, 恢复时 <span class="mono">AddressMap::replay</span>)</h3>
+        <table><thead><tr><th>kind</th><th>start</th><th>end</th><th>size</th></tr></thead><tbody id="windows"></tbody></table>
+      </div>
+      <div>
+        <h3>E820 = <span class="mono">e820(&amp;layout, &amp;ledger)</span>, 推导而非存储</h3>
+        <table><thead><tr><th>type</th><th>start</th><th>end</th><th>size</th></tr></thead><tbody id="e820"></tbody></table>
+        <p class="note">账本里的授予: LegacyHole (reserved), BootInfo, Cmdline, Kernel (Fixed, 按 ELF), Initrd 与 AcpiTables (top_down). 只有 LegacyHole 和 AcpiTables 会切开 RAM 条目.</p>
+      </div>
+    </div>
+    <p class="note">试试: PhysBits 选 36 (64 GiB 地址空间), 把 RAM 拉到 64 GiB 以上, <span class="mono">plan</span> 返回 <span class="mono">AddressSpaceExhausted</span>. 同样的检查也发生在 <span class="mono">replay</span>: 在 46 位主机上做的 64 GiB 快照, 不能在 36 位主机上恢复.</p>
+  </section>
+
+  <section>
+    <h2>2. 一个区域的添加与移除: <span class="mono">GuestMemory::commit</span></h2>
+    <div class="row">
+      <button id="next">下一步</button>
+      <button id="remove">开始移除</button>
+      <button id="drop">模拟: 未 unregister 就 drop (panic 展开)</button>
+      <label><input type="checkbox" id="failReg"> 注入失败: register 返回错误</label>
+      <button id="resetOnion">重置</button>
+    </div>
+    <div class="onion">
+      <div class="layer future" id="L-dma"><div class="name">(M3) DmaMapped</div>
+        <div class="layer" id="L-reg"><div class="name">Registered { slot }</div>
+          <div class="layer" id="L-backed"><div class="name">Backed { mapping: Arc&lt;..&gt; }</div>
+            <div class="muted mono" style="font-size:11px">host mmap</div>
+          </div>
+        </div>
+      </div>
+      <div class="side">
+        <ol class="steps" id="steps"></ol>
+        <h3>状态</h3>
+        <table class="mono" id="onionState"></table>
+      </div>
+    </div>
+    <p class="note">外层按值持有内层: 注册需要先有 <span class="mono">Backed</span>; 槽存在时映射被 <span class="mono">Registered</span> 拿着, 拿不出来释放. 移除只能由外向内剥. 失败时 <span class="mono">Failed&lt;T&gt;</span> 原样交回输入, <span class="mono">layout</span> 不变 (P7).</p>
+  </section>
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// Pure model
+// ---------------------------------------------------------------------------
+const Mem = (() => {
+  const KiB = 1024, MiB = 1024 * KiB, GiB = 1024 * MiB;
+  const C = {
+    MMIO32_START: 0xC000_0000, ECAM_START: 0xE000_0000, ECAM_SIZE: 256 * MiB,
+    IOAPIC: 0xFEC0_0000, LAPIC: 0xFEE0_0000, KVM_TSS: 0xFFFB_D000,
+    RAM_64BIT_START: 4 * GiB, LEGACY_HOLE: 0x9_FC00, HIMEM: 0x10_0000,
+  };
+  const alignUp = (x, a) => Math.ceil(x / a) * a;
+  const alignDown = (x, a) => Math.floor(x / a) * a;
+  const w = (kind, start, end, label) => ({ kind, start, end, label: label ?? kind });
+
+  // Mirrors AddressMap::plan. Numbers above 2^53 are not needed below 52 bits.
+  function plan(ram, bits) {
+    const top = 2 ** bits;
+    const low = Math.min(ram, C.MMIO32_START);
+    const high = ram - low;
+    const windows = [w('BootRam', 0, low, 'BootRam (low)')];
+    windows.push(w('PciMmio32', C.MMIO32_START, C.ECAM_START));
+    windows.push(w('PciEcam', C.ECAM_START, C.ECAM_START + C.ECAM_SIZE));
+    windows.push(w('Platform', C.IOAPIC, C.IOAPIC + 0x1000, 'IoApic'));
+    windows.push(w('Platform', C.LAPIC, C.LAPIC + 0x1000, 'LocalApic'));
+    windows.push(w('Platform', C.KVM_TSS, C.KVM_TSS + 0x3000, 'KvmTss'));
+    let end = C.RAM_64BIT_START;
+    if (high > 0) { windows.push(w('BootRam', end, end + high, 'BootRam (high)')); end += high; }
+    const mmio64 = alignUp(end, GiB);
+    if (mmio64 >= top) return { error: { AddressSpaceExhausted: { needed: mmio64 + GiB, available: top } } };
+    windows.push(w('PciMmio64', mmio64, top));
+    return { windows };
+  }
+
+  // Boot grants for a sample kernel/initrd, mirroring GpaLedger::grant.
+  function bootGrants(lowEnd) {
+    const initrd = 16 * MiB, acpi = 64 * KiB;
+    const initrdStart = alignDown(lowEnd - initrd, 2 * MiB);
+    const acpiStart = alignDown(initrdStart - acpi, 4 * KiB);
+    return [
+      { owner: 'BootInfo', start: 0x6000, end: 0x7000 },
+      { owner: 'Cmdline', start: 0x2_0000, end: 0x3_0000 },
+      { owner: 'LegacyHole', start: C.LEGACY_HOLE, end: C.HIMEM },
+      { owner: 'Kernel', start: C.HIMEM, end: C.HIMEM + 24 * MiB },
+      { owner: 'AcpiTables', start: acpiStart, end: acpiStart + acpi },
+      { owner: 'Initrd', start: initrdStart, end: initrdStart + initrd },
+    ].filter((g) => g.end <= lowEnd && g.start >= 0);
+  }
+
+  // Mirrors e820(): RAM regions minus grants the guest must not reuse.
+  function e820(windows, grants) {
+    const KIND = { LegacyHole: 'Reserved', AcpiTables: 'Acpi' };
+    const cut = grants.filter((g) => KIND[g.owner]).sort((a, b) => a.start - b.start);
+    const out = [];
+    for (const r of windows.filter((x) => x.kind === 'BootRam')) {
+      let cur = r.start;
+      for (const g of cut) {
+        if (g.end <= r.start || g.start >= r.end) continue;
+        if (g.start > cur) out.push({ type: 'Ram', start: cur, end: g.start });
+        out.push({ type: KIND[g.owner], start: g.start, end: g.end });
+        cur = g.end;
+      }
+      if (cur < r.end) out.push({ type: 'Ram', start: cur, end: r.end });
+    }
+    return out;
+  }
+
+  const ADD = ['apply', 'back', 'register', 'publish'];
+  const REMOVE = ['apply', 'unpublish', 'unregister', 'drop'];
+  const onionInitial = () => ({ mode: 'add', done: 0, layout: false, backed: false, registered: false, published: false, leaked: false, msg: '' });
+
+  // One step of commit(Add) or commit(Remove).
+  function onionStep(s, failRegister) {
+    const steps = s.mode === 'add' ? ADD : REMOVE;
+    if (s.done >= steps.length) return s;
+    const name = steps[s.done];
+    const next = { ...s, done: s.done + 1, msg: '' };
+    if (s.mode === 'add') {
+      if (name === 'apply') { next.pendingLayout = true; next.msg = 'layout.apply(Add): 纯函数, 检查不重叠和窗口归属, 得到新 layout 值 (还没写回)'; }
+      if (name === 'back') { next.backed = true; next.msg = 'back(): mmap, 得到 Backed'; }
+      if (name === 'register') {
+        if (failRegister) {
+          return { ...onionInitial(), msg: 'register 失败: Failed<Backed> 交回, 丢弃 Backed (未注册, munmap 安全). layout 未写回, 与开始前相同.' };
+        }
+        next.registered = true; next.msg = 'Backed::register(): KVM_MR_CREATE, Backed 被移入 Registered';
+      }
+      if (name === 'publish') { next.published = true; next.layout = true; next.pendingLayout = false; next.msg = '发布新视图给设备; 写回 layout 与 realized. commit 完成.'; }
+    } else {
+      if (name === 'apply') { next.pendingLayout = true; next.msg = 'layout.apply(Remove): 得到不含该区域的新 layout 值'; }
+      if (name === 'unpublish') { next.published = false; next.msg = '发布不含该区域的视图. 仍持有旧视图的设备靠 Arc 保活映射, 不会悬空.'; }
+      if (name === 'unregister') { next.registered = false; next.msg = 'Registered::unregister(): KVM_MR_DELETE, 交回 (Backed, SlotId)'; }
+      if (name === 'drop') { next.backed = false; next.layout = false; next.pendingLayout = false; next.msg = '丢弃 Backed: 最后一个 Arc 释放后 munmap. 写回 layout. commit 完成.'; }
+    }
+    return next;
+  }
+
+  function onionRemove(s) {
+    if (!(s.mode === 'add' && s.done === ADD.length && s.layout)) return s;
+    return { ...s, mode: 'remove', done: 0, msg: '' };
+  }
+
+  function onionDrop(s) {
+    if (!s.registered) return s;
+    return { ...s, registered: false, leaked: true, published: false,
+      msg: 'Registered 被直接 drop: 槽可能还在, 所以泄漏映射 (mem::forget 一个 Arc), 而不是 munmap. 泄漏安全, munmap 不安全.' };
+  }
+
+  return { plan, bootGrants, e820, onionInitial, onionStep, onionRemove, onionDrop, ADD, REMOVE, GiB, MiB, KiB };
+})();
+
+if (typeof module !== 'undefined') module.exports = Mem;
+
+// ---------------------------------------------------------------------------
+// View
+// ---------------------------------------------------------------------------
+if (typeof document !== 'undefined') {
+  const $ = (id) => document.getElementById(id);
+  const RAM_STEPS = [128, 256, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096, 6144, 8192, 12288, 16384, 24576, 32768,
+    49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 786432, 1048576, 1572864, 2097152, 3145728, 4194304,
+    6291456, 8388608, 12582912, 16777216, 25165824, 33554432, 50331648, 67108864, 100663296, 134217728, 201326592]
+    .map((mib) => mib * Mem.MiB);
+
+  const hex = (x) => '0x' + x.toString(16).toUpperCase().replace(/\B(?=([0-9A-F]{4})+$)/g, '_');
+  const size = (b) => {
+    for (const [u, v] of [['TiB', 2 ** 40], ['GiB', 2 ** 30], ['MiB', 2 ** 20], ['KiB', 2 ** 10]]) if (b >= v) return `${+(b / v).toFixed(2)} ${u}`;
+    return `${b} B`;
+  };
+
+  function drawBar(bar, windows, lo, hi, ticks) {
+    bar.innerHTML = '';
+    const span = hi - lo;
+    for (const win of windows) {
+      const s = Math.max(win.start, lo), e = Math.min(win.end, hi);
+      if (e <= s) continue;
+      const d = document.createElement('div');
+      d.className = `seg k-${win.kind}`;
+      d.style.left = `${((s - lo) / span) * 100}%`;
+      d.style.width = `max(2px, ${((e - s) / span) * 100}%)`;
+      d.title = `${win.label}: ${hex(win.start)} - ${hex(win.end)} (${size(win.end - win.start)})`;
+      d.textContent = win.label;
+      bar.appendChild(d);
+    }
+    for (const [x, label] of ticks) {
+      const t = document.createElement('div');
+      t.className = 'tick';
+      t.style.left = `${((x - lo) / span) * 100}%`;
+      t.textContent = label;
+      bar.appendChild(t);
+    }
+  }
+
+  function renderMap() {
+    const ram = RAM_STEPS[+$('ram').value];
+    const bits = +$('bits').value;
+    $('ramLabel').textContent = size(ram);
+    const r = Mem.plan(ram, bits);
+    if (r.error) {
+      const e = r.error.AddressSpaceExhausted;
+      $('planStatus').innerHTML = `<span class="err mono">Err(AddressSpaceExhausted { needed: ${size(e.needed)}, available: ${size(e.available)} })</span>`;
+      ['barLow', 'barAll', 'windows', 'e820'].forEach((id) => ($(id).innerHTML = ''));
+      return;
+    }
+    $('planStatus').innerHTML = '<span class="ok mono">Ok(AddressMap)</span>';
+    const G = Mem.GiB;
+    drawBar($('barLow'), r.windows, 0, 4 * G, [[0, '0'], [3 * G, '3G'], [3.5 * G, '3.5G'], [4 * G, '4G']]);
+    const top = 2 ** bits;
+    drawBar($('barAll'), r.windows, 0, top, [[0, '0'], [top / 2, size(top / 2)], [top, size(top)]]);
+    $('windows').innerHTML = r.windows.map((x) =>
+      `<tr><td>${x.label}</td><td class="mono">${hex(x.start)}</td><td class="mono">${hex(x.end)}</td><td>${size(x.end - x.start)}</td></tr>`).join('');
+    const lowEnd = r.windows[0].end;
+    const rows = Mem.e820(r.windows, Mem.bootGrants(lowEnd));
+    $('e820').innerHTML = rows.map((x) =>
+      `<tr><td>${x.type}</td><td class="mono">${hex(x.start)}</td><td class="mono">${hex(x.end)}</td><td>${size(x.end - x.start)}</td></tr>`).join('');
+  }
+
+  let onion;
+  function renderOnion() {
+    $('L-backed').className = `layer${onion.backed ? (onion.leaked ? ' leak' : ' on') : ''}`;
+    $('L-reg').className = `layer${onion.registered ? ' on' : ''}`;
+    const steps = onion.mode === 'add' ? Mem.ADD : Mem.REMOVE;
+    const title = onion.mode === 'add' ? 'commit(Add)' : 'commit(Remove)';
+    $('steps').innerHTML = `<li style="list-style:none;margin-left:-20px" class="mono">${title}</li>` + steps.map((s, i) =>
+      `<li class="${i < onion.done ? 'done' : i === onion.done ? 'cur' : ''}">${s}</li>`).join('');
+    const pill = (b, t, f) => (b ? `<span class="pill g">${t}</span>` : `<span class="pill">${f}</span>`);
+    $('onionState').innerHTML = [
+      ['layout (记录)', pill(onion.layout, '含该区域', '不含') + (onion.pendingLayout ? ' <span class="warn">(新值待写回)</span>' : '')],
+      ['KVM 槽 (主机)', onion.leaked ? '<span class="pill h">可能仍在</span>' : pill(onion.registered, 'slot 7', '无')],
+      ['设备视图', pill(onion.published, '含该区域', '不含')],
+      ['host mmap', onion.leaked ? '<span class="pill h">泄漏 (仍映射)</span>' : pill(onion.backed, '已映射', '无')],
+      ['说明', `<span style="font-family:system-ui">${onion.msg || '-'}</span>`],
+    ].map(([k, v]) => `<tr><td class="muted">${k}</td><td>${v}</td></tr>`).join('');
+    const finished = onion.done >= steps.length;
+    $('next').disabled = finished || onion.leaked;
+    $('remove').disabled = !(onion.mode === 'add' && finished && onion.layout);
+    $('drop').disabled = !onion.registered;
+  }
+
+  $('ram').oninput = renderMap;
+  $('bits').onchange = renderMap;
+  $('next').onclick = () => { onion = Mem.onionStep(onion, $('failReg').checked); renderOnion(); };
+  $('remove').onclick = () => { onion = Mem.onionRemove(onion); renderOnion(); };
+  $('drop').onclick = () => { onion = Mem.onionDrop(onion); renderOnion(); };
+  $('resetOnion').onclick = () => { onion = Mem.onionInitial(); renderOnion(); };
+
+  renderMap();
+  onion = Mem.onionInitial();
+  renderOnion();
+}
+</script>
+</body>
+</html>

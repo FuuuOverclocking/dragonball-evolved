@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>VMM 生命周期 L1: 交互演示</title>
+<style>
+  :root { --bg:#fafafa; --fg:#222; --muted:#777; --line:#bbb; --cur:#2b6cb0; --cur-bg:#ebf4ff; --edge:#e53e3e; --ok:#2f855a; --err:#c53030; --defer:#b7791f; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif; color: var(--fg); background: var(--bg); }
+  header { padding: 14px 20px; border-bottom: 1px solid #e2e2e2; background: #fff; }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(520px, 1.25fr) minmax(360px, 1fr); gap: 16px; padding: 16px 20px; }
+  section { background: #fff; border: 1px solid #e2e2e2; border-radius: 8px; padding: 12px 14px; }
+  h2 { font-size: 14px; margin: 0 0 8px; }
+  svg { width: 100%; height: auto; display: block; }
+  .node rect { fill: #fff; stroke: #888; stroke-width: 1.2; rx: 8; }
+  .node text { font-size: 14px; text-anchor: middle; dominant-baseline: middle; }
+  .node.cur rect { fill: var(--cur-bg); stroke: var(--cur); stroke-width: 2.5; }
+  .node.cur text { font-weight: 600; fill: var(--cur); }
+  .node.transient rect { stroke-dasharray: 5 3; }
+  .edge path { fill: none; stroke: var(--line); stroke-width: 1.4; marker-end: url(#arrow); }
+  .edge text { font-size: 11px; fill: #555; text-anchor: middle; dominant-baseline: middle; }
+  .edge .lbg { fill: #fff; }
+  .edge.last path { stroke: var(--edge); stroke-width: 2.5; marker-end: url(#arrow-hot); }
+  .edge.last text { fill: var(--edge); font-weight: 600; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+  button { font: inherit; padding: 3px 10px; border: 1px solid #bbb; border-radius: 5px; background: #fff; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--cur); color: var(--cur); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.op { font-family: ui-monospace, monospace; }
+  select { font: inherit; }
+  .muted { color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 2px 8px; font-family: ui-monospace, monospace; font-size: 13px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid #eee; vertical-align: top; }
+  td.mono, .mono { font-family: ui-monospace, monospace; }
+  .ok { color: var(--ok); } .err { color: var(--err); } .defer { color: var(--defer); }
+  .vcpu { display: grid; grid-template-columns: 64px 140px 1fr; align-items: center; gap: 6px; padding: 3px 0; border-bottom: 1px dashed #eee; }
+  .status { font-family: ui-monospace, monospace; font-size: 12px; }
+  .log { max-height: 300px; overflow: auto; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .wide { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>VMM 生命周期 L1: 交互演示</h1>
+  <p>辅助说明 <code>ai-sessions/lifecycle.md</code>. 页面里的规则是第 4 节转移表的直译, 不是实现. 虚线框是过渡阶段.</p>
+</header>
+<main>
+  <section>
+    <h2>阶段图</h2>
+    <svg id="graph" viewBox="0 0 770 510"></svg>
+  </section>
+
+  <section>
+    <h2>API 操作</h2>
+    <div class="row">
+      <button class="op" data-op="SetCpus">SetCpus</button>
+      <select id="cpus"><option>1</option><option selected>2</option><option>3</option><option>4</option></select>
+      <button class="op" data-op="SetBoot">SetBoot</button>
+    </div>
+    <div class="row">
+      <button class="op" data-op="Build">Build</button>
+      <button class="op" data-op="Start">Start</button>
+      <button class="op" data-op="Pause">Pause</button>
+      <button class="op" data-op="Resume">Resume</button>
+      <button class="op" data-op="ShutdownVmm">ShutdownVmm</button>
+    </div>
+    <div class="row"><label><input type="checkbox" id="buildFails"> 模拟 build 失败 (例如内核文件不存在)</label></div>
+
+    <h2 style="margin-top:12px">vCPU 上报</h2>
+    <div id="vcpus"></div>
+    <div class="row">
+      <button id="allParked">全部 Parked</button>
+      <button id="allExited">全部 Exited</button>
+      <button id="reset">重置</button>
+    </div>
+
+    <h2 style="margin-top:12px">决策层状态</h2>
+    <div class="kv" id="state"></div>
+    <div class="row" style="margin-top:8px">
+      <button id="perm">检验: 本次 tally 的上报按所有顺序折叠, 结论是否相同 (P2)</button>
+    </div>
+    <div id="permResult" class="note"></div>
+  </section>
+
+  <section class="wide">
+    <h2>事件与回复</h2>
+    <div class="log">
+      <table>
+        <thead><tr><th>#</th><th>输入</th><th>阶段</th><th>决策</th><th>回复</th></tr></thead>
+        <tbody id="log"></tbody>
+      </table>
+    </div>
+    <p class="note">试试: SetBoot → Start → Pause → 只让 vCPU 0 Parked → 此时再发一次 Pause (Join, 两个请求都推迟) → vCPU 1 上报 PowerOff (Stop 胜过 Parked, 两个等待者都收到错误) → 全部 Exited.</p>
+  </section>
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// Pure model: a direct transcription of lifecycle.md section 4.
+// ---------------------------------------------------------------------------
+const Model = (() => {
+  const RANK = { GuestReset: 0, GuestPowerOff: 1, HostRequest: 2, GuestCrash: 3, VcpuFault: 4 };
+
+  const reason = (name, vcpu) => (name === 'VcpuFault' ? { name, vcpu } : { name });
+  const cmp = (a, b) => (RANK[a.name] - RANK[b.name]) || ((a.vcpu ?? -1) - (b.vcpu ?? -1));
+  const join = (a, b) => (a == null ? b : b == null ? a : cmp(a, b) >= 0 ? a : b);
+  const fmtReason = (r) => (r == null ? '-' : r.name === 'VcpuFault' ? `VcpuFault{vcpu: ${r.vcpu}, ThreadGone}` : r.name);
+
+  const initial = () => ({
+    phase: 'Configuring',
+    draft: { cpus: null, boot: false },
+    vcpus: [],
+    awaiting: [],
+    stop: null,
+    waiters: [],
+    tallyStart: null,
+    tallyKind: null,
+    tallyReports: [],
+  });
+
+  const RULES = {
+    Configuring: (op) => ({ SetCpus: 'Edit', SetBoot: 'Edit', Build: 'Build', Start: 'BuildThenStart',
+      Pause: 'Reject(NotBuilt)', Resume: 'Reject(NotBuilt)', ShutdownVmm: 'Exit' })[op],
+    Built: (op) => ({ SetCpus: 'Reject(ConfigFrozen)', SetBoot: 'Reject(ConfigFrozen)', Build: 'Done', Start: 'Start',
+      Pause: 'Reject(NotBuilt)', Resume: 'Reject(NotBuilt)', ShutdownVmm: 'Stop' })[op],
+    Running: (op) => ({ SetCpus: 'Reject(ConfigFrozen)', SetBoot: 'Reject(ConfigFrozen)', Build: 'Reject(AlreadyStarted)',
+      Start: 'Done', Pause: 'Pause', Resume: 'Done', ShutdownVmm: 'Stop' })[op],
+    Pausing: (op) => ({ SetCpus: 'Reject(ConfigFrozen)', SetBoot: 'Reject(ConfigFrozen)', Build: 'Reject(AlreadyStarted)',
+      Start: 'Reject(Busy)', Pause: 'Join', Resume: 'Reject(Busy)', ShutdownVmm: 'Stop' })[op],
+    Paused: (op) => ({ SetCpus: 'Reject(ConfigFrozen)', SetBoot: 'Reject(ConfigFrozen)', Build: 'Reject(AlreadyStarted)',
+      Start: 'Reject(UseResume)', Pause: 'Done', Resume: 'Resume', ShutdownVmm: 'Stop' })[op],
+    Stopping: (op) => (op === 'ShutdownVmm' ? 'Done' : 'Reject(ShuttingDown)'),
+    Stopped: () => 'Ignored (loop ended)',
+  };
+
+  // Tally folds. Each returns a new tally; neither depends on arrival order.
+  const pauseRecord = (t, vcpu, report) => {
+    if (report === 'Parked') return { ...t, awaiting: t.awaiting.filter((v) => v !== vcpu) };
+    if (report === 'Exited') return { ...t, stop: join(t.stop, reason('VcpuFault', vcpu)) };
+    return { ...t, stop: join(t.stop, reason(report.stop, vcpu)) };
+  };
+  const pauseVerdict = (t) => (t.stop ? 'Stop' : t.awaiting.length === 0 ? 'Parked' : 'Pending');
+  const exitRecord = (t, vcpu, report) => {
+    if (report === 'Exited') return { ...t, awaiting: t.awaiting.filter((v) => v !== vcpu) };
+    if (report === 'Parked') return t;
+    return { ...t, stop: join(t.stop, reason(report.stop, vcpu)) };
+  };
+  const exitVerdict = (t) => (t.awaiting.length === 0 ? 'Exited' : 'Pending');
+
+  const ok = (id) => ({ id, kind: 'ok', text: 'Ok' });
+  const err = (id, text) => ({ id, kind: 'err', text });
+
+  const enterStopping = (m, why, replies) => {
+    const s = { ...m, phase: 'Stopping', awaiting: [...m.vcpus], stop: why, waiters: [], tallyKind: 'exit' };
+    s.tallyStart = { awaiting: [...s.awaiting], stop: s.stop };
+    s.tallyReports = [];
+    return { m: s, replies };
+  };
+
+  function stepOp(m, id, op, env) {
+    const d = RULES[m.phase](op);
+    const same = (replies) => ({ m, decision: d, replies });
+    if (d.startsWith('Reject')) return same([err(id, d.slice(7, -1))]);
+    if (d === 'Done') return same([ok(id)]);
+    if (d.startsWith('Ignored')) return same([]);
+    switch (`${m.phase}:${d}`) {
+      case 'Configuring:Edit': {
+        const draft = op === 'SetCpus' ? { ...m.draft, cpus: env.cpus } : { ...m.draft, boot: true };
+        return { m: { ...m, draft }, decision: d, replies: [ok(id)] };
+      }
+      case 'Configuring:Build':
+      case 'Configuring:BuildThenStart': {
+        if (!m.draft.boot) return same([err(id, 'validate: MissingBoot')]);
+        if (env.buildFails) return same([err(id, 'build failed; draft kept')]);
+        const n = m.draft.cpus ?? 1;
+        const vcpus = Array.from({ length: n }, (_, i) => i);
+        const phase = d === 'Build' ? 'Built' : 'Running';
+        return { m: { ...m, phase, vcpus }, decision: d, replies: [ok(id)], edge: `Configuring>${phase}` };
+      }
+      case 'Configuring:Exit':
+        return { m: { ...m, phase: 'Stopped', stop: reason('HostRequest') }, decision: d, replies: [ok(id)], edge: 'Configuring>Stopped' };
+      case 'Built:Start':
+        return { m: { ...m, phase: 'Running' }, decision: d, replies: [ok(id)], edge: 'Built>Running' };
+      case 'Running:Pause': {
+        const s = { ...m, phase: 'Pausing', awaiting: [...m.vcpus], stop: null, waiters: [id], tallyKind: 'pause' };
+        s.tallyStart = { awaiting: [...s.awaiting], stop: null };
+        s.tallyReports = [];
+        return { m: s, decision: d, replies: [{ id, kind: 'defer', text: 'deferred' }], edge: 'Running>Pausing' };
+      }
+      case 'Pausing:Join':
+        return { m: { ...m, waiters: [...m.waiters, id] }, decision: d, replies: [{ id, kind: 'defer', text: 'deferred' }] };
+      case 'Paused:Resume':
+        return { m: { ...m, phase: 'Running' }, decision: d, replies: [ok(id)], edge: 'Paused>Running' };
+      default: {
+        // Stop from Built, Running, Pausing or Paused.
+        const replies = [ok(id), ...m.waiters.map((w) => err(w, 'stopped before pause settled'))];
+        const r = enterStopping(m, reason('HostRequest'), replies);
+        return { ...r, decision: d, edge: `${m.phase}>Stopping` };
+      }
+    }
+  }
+
+  function stepVcpu(m, vcpu, report) {
+    const label = typeof report === 'string' ? report : `Stop(${report.stop})`;
+    const absorb = { m, decision: 'absorb', replies: [] };
+    switch (m.phase) {
+      case 'Running':
+      case 'Built':
+      case 'Paused': {
+        if (report === 'Parked') return absorb;
+        const why = report === 'Exited' ? reason('VcpuFault', vcpu) : reason(report.stop, vcpu);
+        const r = enterStopping(m, why, []);
+        return { ...r, decision: `stray_report -> stop(${fmtReason(why)})`, edge: `${m.phase}>Stopping` };
+      }
+      case 'Pausing': {
+        const t = pauseRecord({ awaiting: m.awaiting, stop: m.stop }, vcpu, report);
+        const v = pauseVerdict(t);
+        const m2 = { ...m, ...t, tallyReports: [...m.tallyReports, { vcpu, report }] };
+        if (v === 'Pending') return { m: m2, decision: `tally.record(${label}) -> Pending`, replies: [] };
+        if (v === 'Parked') {
+          return { m: { ...m2, phase: 'Paused', waiters: [], stop: null }, decision: 'verdict Parked(AllParked) -> settle',
+            replies: m.waiters.map(ok), edge: 'Pausing>Paused' };
+        }
+        const r = enterStopping(m2, t.stop, m.waiters.map((w) => err(w, `stopped: ${fmtReason(t.stop)}`)));
+        return { ...r, decision: `verdict Stop(${fmtReason(t.stop)})`, edge: 'Pausing>Stopping' };
+      }
+      case 'Stopping': {
+        const t = exitRecord({ awaiting: m.awaiting, stop: m.stop }, vcpu, report);
+        const m2 = { ...m, ...t, tallyReports: [...m.tallyReports, { vcpu, report }] };
+        if (exitVerdict(t) === 'Pending') return { m: m2, decision: `tally.record(${label}) -> Pending`, replies: [] };
+        return { m: { ...m2, phase: 'Stopped' }, decision: `verdict Exited(AllExited, ${fmtReason(t.stop)}) -> reap`, replies: [],
+          edge: 'Stopping>Stopped' };
+      }
+      default:
+        return absorb;
+    }
+  }
+
+  function step(m, input, env = {}) {
+    return input.kind === 'op' ? stepOp(m, input.id, input.op, env) : stepVcpu(m, input.vcpu, input.report);
+  }
+
+  // P2: fold the reports of the current tally in every order and collect distinct verdicts.
+  function permutationCheck(m) {
+    if (!m.tallyStart) return null;
+    const reports = m.tallyReports;
+    if (reports.length > 7) return { tooMany: true };
+    const isPause = m.tallyKind === 'pause';
+    const seen = new Set();
+    let count = 0;
+    const permute = (rest, acc) => {
+      if (rest.length === 0) {
+        let t = { ...m.tallyStart };
+        for (const { vcpu, report } of acc) t = isPause ? pauseRecord(t, vcpu, report) : exitRecord(t, vcpu, report);
+        const verdict = isPause ? pauseVerdict(t) : exitVerdict(t);
+        seen.add(`${verdict} | awaiting=[${[...t.awaiting].sort()}] | reason=${fmtReason(t.stop)}`);
+        count += 1;
+        return;
+      }
+      rest.forEach((x, i) => permute([...rest.slice(0, i), ...rest.slice(i + 1)], [...acc, x]));
+    };
+    permute(reports, []);
+    return { count, outcomes: [...seen] };
+  }
+
+  return { initial, step, permutationCheck, fmtReason, join, reason, RANK };
+})();
+
+if (typeof module !== 'undefined') module.exports = Model;
+
+// ---------------------------------------------------------------------------
+// View
+// ---------------------------------------------------------------------------
+if (typeof document !== 'undefined') {
+  const NODES = {
+    Configuring: [110, 70], Built: [380, 70], Paused: [640, 70],
+    Running: [380, 200], Pausing: [640, 200],
+    Stopping: [380, 340], Stopped: [380, 460],
+  };
+  const TRANSIENT = new Set(['Pausing', 'Stopping']);
+  // [from, to, label, control point or null, label t, label dy]
+  const EDGES = [
+    ['Configuring', 'Built', 'Build', null, 0.5, -10],
+    ['Configuring', 'Running', 'Start', null, 0.5, 0],
+    ['Configuring', 'Stopped', 'ShutdownVmm', [110, 470], 0.5, 0],
+    ['Built', 'Running', 'Start', null, 0.5, 0],
+    ['Running', 'Pausing', 'Pause', null, 0.3, -12],
+    ['Pausing', 'Paused', 'all Parked', null, 0.5, 0],
+    ['Paused', 'Running', 'Resume', null, 0.45, 0],
+    ['Built', 'Stopping', 'stop', [170, 205], 0.5, 0],
+    ['Running', 'Stopping', 'stop', null, 0.5, 0],
+    ['Pausing', 'Stopping', 'stop', null, 0.35, 0],
+    ['Paused', 'Stopping', 'stop', null, 0.72, 0],
+    ['Stopping', 'Stopped', 'all Exited', null, 0.5, 0],
+  ];
+  const HW = 72, HH = 22;
+
+  const border = ([cx, cy], [tx, ty]) => {
+    const dx = tx - cx, dy = ty - cy;
+    const t = Math.min(dx ? HW / Math.abs(dx) : Infinity, dy ? HH / Math.abs(dy) : Infinity);
+    return [cx + dx * t, cy + dy * t];
+  };
+  const quad = (p0, c, p1, t) => [0, 1].map((k) => (1 - t) ** 2 * p0[k] + 2 * (1 - t) * t * c[k] + t * t * p1[k]);
+
+  const svg = document.getElementById('graph');
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag, attrs, parent) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+    parent.appendChild(e);
+    return e;
+  };
+
+  const defs = el('defs', {}, svg);
+  for (const [id, color] of [['arrow', '#999'], ['arrow-hot', '#e53e3e']]) {
+    const mk = el('marker', { id, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }, defs);
+    el('path', { d: 'M0,0 L10,5 L0,10 z', fill: color }, mk);
+  }
+
+  const edgeEls = {};
+  for (const [from, to, label, ctrl, lt, ldy] of EDGES) {
+    const a = NODES[from], b = NODES[to];
+    const c = ctrl ?? [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    const p0 = border(a, c), p1 = border(b, c);
+    const g = el('g', { class: 'edge' }, svg);
+    el('path', { d: `M${p0[0]},${p0[1]} Q${c[0]},${c[1]} ${p1[0]},${p1[1]}` }, g);
+    const [lx, ly] = quad(p0, c, p1, lt);
+    const w = label.length * 6.4 + 8;
+    el('rect', { class: 'lbg', x: lx - w / 2, y: ly + ldy - 8, width: w, height: 16, rx: 3 }, g);
+    const t = el('text', { x: lx, y: ly + ldy }, g);
+    t.textContent = label;
+    edgeEls[`${from}>${to}`] = g;
+  }
+  // Self loop for Configure.
+  {
+    const [x, y] = NODES.Configuring;
+    const g = el('g', { class: 'edge' }, svg);
+    el('path', { d: `M${x - 30},${y - HH} C${x - 50},${y - 70} ${x + 50},${y - 70} ${x + 30},${y - HH}` }, g);
+    const t = el('text', { x: x + 40, y: y - 48, style: 'text-anchor: start' }, g);
+    t.textContent = 'Set* / AddDisk';
+    edgeEls['Configuring>Configuring'] = g;
+  }
+  const nodeEls = {};
+  for (const [name, [x, y]] of Object.entries(NODES)) {
+    const g = el('g', { class: `node${TRANSIENT.has(name) ? ' transient' : ''}` }, svg);
+    el('rect', { x: x - HW, y: y - HH, width: HW * 2, height: HH * 2 }, g);
+    const t = el('text', { x, y }, g);
+    t.textContent = name;
+    nodeEls[name] = g;
+  }
+
+  let model, nextId, seq, lastEdge;
+  const logBody = document.getElementById('log');
+
+  function reset() {
+    model = Model.initial();
+    nextId = 1; seq = 0; lastEdge = null;
+    logBody.innerHTML = '';
+    document.getElementById('permResult').textContent = '';
+    render();
+  }
+
+  function apply(input, inputText) {
+    const before = model.phase;
+    const env = { cpus: Number(document.getElementById('cpus').value), buildFails: document.getElementById('buildFails').checked };
+    const r = Model.step(model, input, env);
+    model = r.m;
+    if (input.kind === 'op' && input.op === 'SetCpus' && before === 'Configuring') r.decision = `Edit(SetCpus(${env.cpus}))`;
+    lastEdge = r.edge ?? (before === 'Configuring' && r.decision?.startsWith('Edit') ? 'Configuring>Configuring' : null);
+    seq += 1;
+    const tr = document.createElement('tr');
+    const replies = r.replies.map((x) => `<span class="${x.kind}">#${x.id} ${x.text}</span>`).join('<br>') || '<span class="muted">-</span>';
+    const phase = before === model.phase ? before : `${before} → <b>${model.phase}</b>`;
+    tr.innerHTML = `<td>${seq}</td><td class="mono">${inputText}</td><td>${phase}</td><td class="mono">${r.decision}</td><td class="mono">${replies}</td>`;
+    logBody.prepend(tr);
+    document.getElementById('permResult').textContent = '';
+    render();
+  }
+
+  function sendOp(op) {
+    const id = nextId++;
+    const text = op === 'SetCpus' ? `Op(#${id}, SetCpus(${document.getElementById('cpus').value}))` : `Op(#${id}, ${op})`;
+    apply({ kind: 'op', id, op }, text);
+  }
+  function sendVcpu(vcpu, report) {
+    const label = typeof report === 'string' ? report : `Stop(${report.stop})`;
+    apply({ kind: 'vcpu', vcpu, report }, `Vcpu(${vcpu}, ${label})`);
+  }
+
+  function vcpuStatus(v) {
+    const awaiting = model.awaiting.includes(v);
+    switch (model.phase) {
+      case 'Built': return 'parked (boot entry)';
+      case 'Running': return 'in KVM_RUN';
+      case 'Pausing': return awaiting ? 'kicked, awaiting' : 'parked';
+      case 'Paused': return 'parked';
+      case 'Stopping': return awaiting ? 'told to exit' : 'exited';
+      default: return 'exited';
+    }
+  }
+
+  function render() {
+    for (const [name, g] of Object.entries(nodeEls)) g.classList.toggle('cur', name === model.phase);
+    for (const [k, g] of Object.entries(edgeEls)) g.classList.toggle('last', k === lastEdge);
+
+    const box = document.getElementById('vcpus');
+    box.innerHTML = '';
+    if (model.vcpus.length === 0) box.innerHTML = '<div class="muted">尚未 build, 没有 vCPU 线程.</div>';
+    const live = ['Built', 'Running', 'Pausing', 'Paused', 'Stopping'].includes(model.phase);
+    for (const v of model.vcpus) {
+      const awaiting = model.awaiting.includes(v);
+      const inGuest = model.phase === 'Running' || (['Pausing', 'Stopping'].includes(model.phase) && awaiting);
+      const row = document.createElement('div');
+      row.className = 'vcpu';
+      const st = vcpuStatus(v);
+      row.innerHTML = `<span class="mono">vCPU ${v}</span><span class="status">${st}</span><span></span>`;
+      const btns = row.lastChild;
+      const gone = st === 'exited';
+      const add = (text, report, enabled) => {
+        const b = document.createElement('button');
+        b.textContent = text;
+        b.disabled = !enabled || gone || !live;
+        b.onclick = () => sendVcpu(v, report);
+        btns.appendChild(b);
+      };
+      add('Parked', 'Parked', true);
+      add('Exited', 'Exited', true);
+      add('Reset', { stop: 'GuestReset' }, inGuest);
+      add('PowerOff', { stop: 'GuestPowerOff' }, inGuest);
+      add('Crash', { stop: 'GuestCrash' }, inGuest);
+      box.appendChild(row);
+    }
+
+    const s = document.getElementById('state');
+    const transient = TRANSIENT.has(model.phase);
+    const rows = [
+      ['phase', model.phase],
+      ['draft', `cpus=${model.draft.cpus ?? '-'}, boot=${model.draft.boot ? 'Some' : 'None'}`],
+      ['awaiting', transient ? `{${model.awaiting.join(', ')}}` : '-'],
+      [model.phase === 'Stopping' || model.phase === 'Stopped' ? 'reason' : 'stop', Model.fmtReason(model.stop)],
+      ['waiters', model.phase === 'Pausing' ? `[${model.waiters.map((w) => '#' + w).join(', ')}]` : '-'],
+    ];
+    s.innerHTML = rows.map(([k, v]) => `<div>${k}</div><div>${v}</div>`).join('');
+    document.getElementById('perm').disabled = !(transient || (model.tallyReports?.length > 0));
+    document.getElementById('allParked').disabled = model.phase !== 'Pausing';
+    document.getElementById('allExited').disabled = model.phase !== 'Stopping';
+  }
+
+  document.querySelectorAll('button[data-op]').forEach((b) => (b.onclick = () => sendOp(b.dataset.op)));
+  document.getElementById('reset').onclick = reset;
+  document.getElementById('allParked').onclick = () => [...model.awaiting].forEach((v) => model.phase === 'Pausing' && sendVcpu(v, 'Parked'));
+  document.getElementById('allExited').onclick = () => [...model.awaiting].forEach((v) => model.phase === 'Stopping' && sendVcpu(v, 'Exited'));
+  document.getElementById('perm').onclick = () => {
+    const r = Model.permutationCheck(model);
+    const out = document.getElementById('permResult');
+    if (!r) { out.textContent = '当前没有 tally.'; return; }
+    if (r.tooMany) { out.textContent = '上报超过 7 条, 不穷举.'; return; }
+    out.innerHTML = `${model.tallyReports.length} 条上报, ${r.count} 种顺序, 得到 <b>${r.outcomes.length}</b> 种结论:<br>` +
+      r.outcomes.map((o) => `<span class="mono">${o}</span>`).join('<br>');
+  };
+
+  reset();
+}
+</script>
+</body>
+</html>
